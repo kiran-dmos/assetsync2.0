@@ -59,7 +59,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.4',
+    'version' => '0.1.5',
 ];
 
 foreach ($expectations as $key => $expected) {
@@ -97,6 +97,16 @@ if (($menu['icon'] ?? null) !== 'ti ti-refresh') {
 
 if (($menu['links']['fieldmapping'] ?? null) !== '/plugins/assetsync20/front/fieldmapping.php') {
     throw new RuntimeException('Field Mapping menu link is incorrect.');
+}
+
+if (($menu['links']['entitysyncroutes'] ?? null) !== '/plugins/assetsync20/front/entitysyncroutes.php') {
+    throw new RuntimeException('Entity Sync Routes menu link is incorrect.');
+}
+
+$installedValues = Config::getConfigurationValues('plugin:assetsync20');
+
+if (!array_key_exists('entity_sync_routes', $installedValues)) {
+    throw new RuntimeException('Entity sync routes config key should be installed.');
 }
 
 $connections = \GlpiPlugin\Assetsync20\GlpiBConnection::loadAll();
@@ -359,6 +369,184 @@ if ($activeCount !== 2) {
     throw new RuntimeException('Multiple GLPI B connections should be allowed to be active.');
 }
 
+$routeFromInput = \GlpiPlugin\Assetsync20\EntitySyncRoute::fromInput([
+    'id' => ' normalized-route ',
+    'name' => ' Warehouse route ',
+    'glpi_b_connection_id' => ' production ',
+    'glpi_a_source_entity_id' => ' 10 ',
+    'glpi_a_source_entity_name' => ' <b>Parent Entity</b> ',
+    'glpi_b_target_entity_id' => ' 100 ',
+    'glpi_b_target_entity_name' => ' <i>Target Entity</i> ',
+    'asset_types' => ['Computer', 'InvalidType', 'Printer'],
+    'include_child_entities' => '1',
+    'active' => '1',
+]);
+
+if ($routeFromInput !== [
+    'id' => 'normalized-route',
+    'name' => 'Warehouse route',
+    'glpi_b_connection_id' => 'production',
+    'glpi_a_source_entity_id' => '10',
+    'glpi_a_source_entity_name' => 'Parent Entity',
+    'glpi_b_target_entity_id' => '100',
+    'glpi_b_target_entity_name' => 'Target Entity',
+    'asset_types' => ['Computer', 'Printer'],
+    'include_child_entities' => true,
+    'active' => true,
+]) {
+    throw new RuntimeException('Entity sync route input was not normalized.');
+}
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'prod-parent',
+    'name' => 'Production parent',
+    'glpi_b_connection_id' => 'production',
+    'glpi_a_source_entity_id' => '10',
+    'glpi_a_source_entity_name' => 'Parent Entity',
+    'glpi_b_target_entity_id' => '100',
+    'glpi_b_target_entity_name' => 'Production Target',
+    'asset_types' => ['Computer', 'Printer'],
+    'include_child_entities' => '1',
+    'active' => '1',
+]);
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'prod-child',
+    'name' => 'Production child',
+    'glpi_b_connection_id' => 'production',
+    'glpi_a_source_entity_id' => '20',
+    'glpi_a_source_entity_name' => 'Child Entity',
+    'glpi_b_target_entity_id' => '200',
+    'glpi_b_target_entity_name' => 'Production Child Target',
+    'asset_types' => ['Computer'],
+    'include_child_entities' => '',
+    'active' => '1',
+]);
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'staging-parent',
+    'name' => 'Staging parent',
+    'glpi_b_connection_id' => 'staging',
+    'glpi_a_source_entity_id' => '10',
+    'glpi_a_source_entity_name' => 'Parent Entity',
+    'glpi_b_target_entity_id' => '300',
+    'glpi_b_target_entity_name' => 'Staging Target',
+    'asset_types' => ['Computer'],
+    'include_child_entities' => '1',
+    'active' => '1',
+]);
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'disabled-staging-child',
+    'name' => 'Disabled staging child',
+    'glpi_b_connection_id' => 'staging',
+    'glpi_a_source_entity_id' => '20',
+    'glpi_a_source_entity_name' => 'Child Entity',
+    'glpi_b_target_entity_id' => '400',
+    'glpi_b_target_entity_name' => 'Disabled Target',
+    'asset_types' => ['Computer'],
+    'include_child_entities' => '',
+    'active' => '',
+]);
+
+$savedRoutes = \GlpiPlugin\Assetsync20\EntitySyncRoute::loadAll();
+
+if (count($savedRoutes) !== 4) {
+    throw new RuntimeException('Entity sync routes should be saved as multiple records.');
+}
+
+$savedRoute = \GlpiPlugin\Assetsync20\EntitySyncRoute::find('prod-parent');
+
+if ($savedRoute === null || $savedRoute['glpi_b_target_entity_id'] !== '100') {
+    throw new RuntimeException('Saved entity sync route could not be found.');
+}
+
+$matchResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Computer', '20', ['1', '10', '20']);
+$matchedRouteIds = [];
+
+foreach ($matchResult['matches'] as $match) {
+    $matchedRouteIds[$match['glpi_b_connection_id']] = $match['route']['id'];
+}
+
+if ($matchResult['conflicts'] !== []) {
+    throw new RuntimeException('Non-conflicting entity route match should not report conflicts.');
+}
+
+if ($matchedRouteIds !== [
+    'production' => 'prod-child',
+    'staging' => 'staging-parent',
+]) {
+    throw new RuntimeException('Entity route matching should return the deepest route per GLPI B connection.');
+}
+
+$productionOnlyResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Computer', '20', ['1', '10', '20'], 'production');
+
+if (count($productionOnlyResult['matches']) !== 1 || $productionOnlyResult['matches'][0]['route']['id'] !== 'prod-child') {
+    throw new RuntimeException('Entity route matching should filter by GLPI B connection id.');
+}
+
+$printerResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Printer', '20', ['1', '10', '20']);
+
+if (count($printerResult['matches']) !== 1 || $printerResult['matches'][0]['route']['id'] !== 'prod-parent') {
+    throw new RuntimeException('Entity route matching should require the selected asset type.');
+}
+
+$phoneResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Phone', '20', ['1', '10', '20']);
+
+if ($phoneResult['matches'] !== []) {
+    throw new RuntimeException('Entity route matching should ignore routes for other asset types.');
+}
+
+$grandchildResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Computer', '21', ['1', '10', '20', '21'], 'production');
+
+if (count($grandchildResult['matches']) !== 1 || $grandchildResult['matches'][0]['route']['id'] !== 'prod-parent') {
+    throw new RuntimeException('Entity route matching should not include children unless the route allows it.');
+}
+
+$exactParentResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Computer', '10', ['1', '10']);
+
+if (count($exactParentResult['matches']) !== 2) {
+    throw new RuntimeException('Exact entity route matching should work for each GLPI B connection.');
+}
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'prod-child-conflict',
+    'name' => 'Production child conflict',
+    'glpi_b_connection_id' => 'production',
+    'glpi_a_source_entity_id' => '20',
+    'glpi_a_source_entity_name' => 'Child Entity',
+    'glpi_b_target_entity_id' => '201',
+    'glpi_b_target_entity_name' => 'Production Child Target 2',
+    'asset_types' => ['Computer'],
+    'include_child_entities' => '',
+    'active' => '1',
+]);
+
+$conflictResult = \GlpiPlugin\Assetsync20\EntitySyncRoute::matchAsset('Computer', '20', ['1', '10', '20'], 'production');
+
+if (count($conflictResult['conflicts']) !== 1) {
+    throw new RuntimeException('Equal-depth entity route overlaps should be reported as conflicts.');
+}
+
+$conflictRouteIds = $conflictResult['conflicts'][0]['route_ids'];
+sort($conflictRouteIds);
+
+if ($conflictRouteIds !== ['prod-child', 'prod-child-conflict']) {
+    throw new RuntimeException('Entity route conflict should include the overlapping route ids.');
+}
+
+$configConflicts = \GlpiPlugin\Assetsync20\EntitySyncRoute::findConfigConflicts();
+
+if (count($configConflicts) !== 1) {
+    throw new RuntimeException('Entity route config conflicts should be detectable.');
+}
+
+\GlpiPlugin\Assetsync20\EntitySyncRoute::delete('prod-child-conflict');
+
+if (\GlpiPlugin\Assetsync20\EntitySyncRoute::find('prod-child-conflict') !== null) {
+    throw new RuntimeException('Deleted entity sync route should not be loaded.');
+}
+
 \GlpiPlugin\Assetsync20\GlpiBConnection::delete('staging');
 
 if (\GlpiPlugin\Assetsync20\GlpiBConnection::find('staging') !== null) {
@@ -397,7 +585,7 @@ if (!plugin_assetsync20_uninstall()) {
 
 $remainingValues = Config::getConfigurationValues('plugin:assetsync20');
 
-foreach (['glpib_connections', 'field_mappings', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
+foreach (['glpib_connections', 'field_mappings', 'entity_sync_routes', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
     if (array_key_exists($deletedKey, $remainingValues)) {
         throw new RuntimeException('Uninstall should delete ' . $deletedKey . '.');
     }
