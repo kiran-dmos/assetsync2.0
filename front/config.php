@@ -19,6 +19,7 @@ if (class_exists('Session') && method_exists('Session', 'checkRight')) {
 
 $message = null;
 $messageClass = 'info';
+$editConnection = null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (class_exists('Session') && method_exists('Session', 'checkRight')) {
@@ -27,6 +28,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if (isset($_POST['save'])) {
         GlpiBConnection::save([
+            'id'         => $_POST['id'] ?? '',
             'name'       => $_POST['name'] ?? '',
             'base_url'   => $_POST['base_url'] ?? '',
             'app_token'  => $_POST['app_token'] ?? '',
@@ -36,10 +38,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $message = 'GLPI B connection saved.';
         $messageClass = 'success';
+        $editConnection = GlpiBConnection::find((string) ($_POST['id'] ?? ''));
     }
 
     if (isset($_POST['test'])) {
         $connection = GlpiBConnection::fromInput([
+            'id'         => $_POST['id'] ?? '',
             'name'       => $_POST['name'] ?? '',
             'base_url'   => $_POST['base_url'] ?? '',
             'app_token'  => $_POST['app_token'] ?? '',
@@ -49,10 +53,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $test = GlpiBConnection::test($connection);
         $message = $test['message'];
         $messageClass = $test['success'] ? 'success' : 'warning';
+        $editConnection = $connection;
+    }
+
+    if (isset($_POST['edit'])) {
+        $editConnection = GlpiBConnection::find((string) ($_POST['id'] ?? ''));
+    }
+
+    if (isset($_POST['delete'])) {
+        GlpiBConnection::delete((string) ($_POST['id'] ?? ''));
+        $message = 'GLPI B connection deleted.';
+        $messageClass = 'success';
     }
 }
 
-$connection = GlpiBConnection::load();
+$connections = GlpiBConnection::loadAll();
+$connection = $editConnection ?? [
+    'id'         => '',
+    'name'       => '',
+    'base_url'   => '',
+    'app_token'  => '',
+    'user_token' => '',
+    'active'     => false,
+];
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
     Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
@@ -69,9 +92,61 @@ if ($message !== null) {
     echo '<div class="' . $html($messageClass) . '">' . $html($message) . '</div>';
 }
 
-echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
 echo '<table class="tab_cadre_fixe">';
-echo '<tr><th colspan="2">GLPI B connection</th></tr>';
+echo '<tr><th colspan="7">GLPI B connections</th></tr>';
+echo '<tr>';
+echo '<th>Name</th>';
+echo '<th>Base URL</th>';
+echo '<th>Active</th>';
+echo '<th>Saved app token</th>';
+echo '<th>Saved user token</th>';
+echo '<th colspan="2">Actions</th>';
+echo '</tr>';
+
+if ($connections === []) {
+    echo '<tr><td colspan="7" class="center">No GLPI B connections saved.</td></tr>';
+}
+
+foreach ($connections as $savedConnection) {
+    echo '<tr>';
+    echo '<td>' . $html($savedConnection['name']) . '</td>';
+    echo '<td>' . $html($savedConnection['base_url']) . '</td>';
+    echo '<td>' . ($savedConnection['active'] ? 'Yes' : 'No') . '</td>';
+    echo '<td>' . ($savedConnection['app_token'] !== '' ? 'Yes' : 'No') . '</td>';
+    echo '<td>' . ($savedConnection['user_token'] !== '' ? 'Yes' : 'No') . '</td>';
+    echo '<td class="center">';
+    echo '<form method="post" action="' . $html(Menu::configUrl()) . '" style="display:inline">';
+    echo '<input type="hidden" name="id" value="' . $html($savedConnection['id']) . '">';
+    if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
+        echo '<input type="hidden" name="_glpi_csrf_token" value="'
+            . $html(Session::getNewCSRFToken()) . '">';
+    }
+    echo '<button type="submit" name="edit" value="1" class="submit">Edit</button> ';
+    echo '<button type="submit" name="delete" value="1" class="submit">Delete</button>';
+    echo '</form>';
+    echo '</td>';
+    echo '<td class="center">';
+    echo '<form method="post" action="' . $html(Menu::configUrl()) . '" style="display:inline">';
+    echo '<input type="hidden" name="id" value="' . $html($savedConnection['id']) . '">';
+    echo '<input type="hidden" name="name" value="' . $html($savedConnection['name']) . '">';
+    echo '<input type="hidden" name="base_url" value="' . $html($savedConnection['base_url']) . '">';
+    echo '<input type="hidden" name="active" value="' . ($savedConnection['active'] ? '1' : '') . '">';
+    if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
+        echo '<input type="hidden" name="_glpi_csrf_token" value="'
+            . $html(Session::getNewCSRFToken()) . '">';
+    }
+    echo '<button type="submit" name="test" value="1" class="submit">Test</button>';
+    echo '</form>';
+    echo '</td>';
+    echo '</tr>';
+}
+
+echo '</table>';
+
+echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
+echo '<input type="hidden" name="id" value="' . $html($connection['id']) . '">';
+echo '<table class="tab_cadre_fixe">';
+echo '<tr><th colspan="2">' . ($connection['id'] !== '' ? 'Edit GLPI B connection' : 'Add GLPI B connection') . '</th></tr>';
 
 echo '<tr>';
 echo '<td><label for="name">Connection name</label></td>';
@@ -119,6 +194,9 @@ if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
 
 echo '<button type="submit" name="save" value="1" class="submit">Save</button> ';
 echo '<button type="submit" name="test" value="1" class="submit">Test connection</button>';
+if ($connection['id'] !== '') {
+    echo ' <a href="' . $html(Menu::configUrl()) . '" class="submit">Add new</a>';
+}
 echo '</td>';
 echo '</tr>';
 echo '</table>';

@@ -7,8 +7,9 @@ namespace GlpiPlugin\Assetsync20;
 final class GlpiBConnection
 {
     private const CONTEXT = 'plugin:assetsync20';
+    private const CONNECTIONS_KEY = 'glpib_connections';
 
-    private const DEFAULTS = [
+    private const OLD_KEYS = [
         'glpib_name'       => '',
         'glpib_base_url'   => '',
         'glpib_app_token'  => '',
@@ -17,36 +18,44 @@ final class GlpiBConnection
     ];
 
     /**
-     * @return array{name:string,base_url:string,app_token:string,user_token:string,active:bool}
+     * @return array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}
      */
     public static function load(): array
     {
-        $values = self::DEFAULTS;
+        $connections = self::loadAll();
 
-        if (class_exists('\Config') && method_exists('\Config', 'getConfigurationValues')) {
-            $savedValues = \Config::getConfigurationValues(self::CONTEXT, array_keys(self::DEFAULTS));
-
-            if (is_array($savedValues)) {
-                $values = array_merge($values, $savedValues);
-            }
-        }
-
-        return [
-            'name'       => (string) $values['glpib_name'],
-            'base_url'   => (string) $values['glpib_base_url'],
-            'app_token'  => self::decryptToken((string) $values['glpib_app_token']),
-            'user_token' => self::decryptToken((string) $values['glpib_user_token']),
-            'active'     => (string) $values['glpib_active'] === '1',
-        ];
+        return $connections[0] ?? self::emptyConnection();
     }
 
     /**
-     * @param array{name?:string,base_url?:string,app_token?:string,user_token?:string,active?:mixed} $input
-     * @return array{name:string,base_url:string,app_token:string,user_token:string,active:bool}
+     * @return list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}>
+     */
+    public static function loadAll(): array
+    {
+        $savedValues = self::getSavedValues([self::CONNECTIONS_KEY]);
+        $connections = self::decodeConnections((string) ($savedValues[self::CONNECTIONS_KEY] ?? ''));
+
+        if ($connections !== []) {
+            return $connections;
+        }
+
+        $migrated = self::loadOldConnection();
+        if ($migrated === null) {
+            return [];
+        }
+
+        self::saveAll([$migrated]);
+
+        return [$migrated];
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url?:string,app_token?:string,user_token?:string,active?:mixed} $input
+     * @return array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}
      */
     public static function fromInput(array $input): array
     {
-        $current = self::load();
+        $current = self::find((string) ($input['id'] ?? '')) ?? self::emptyConnection();
 
         $appToken = trim((string) ($input['app_token'] ?? ''));
         if ($appToken === '') {
@@ -59,6 +68,7 @@ final class GlpiBConnection
         }
 
         return [
+            'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
             'base_url'   => self::cleanBaseUrl((string) ($input['base_url'] ?? '')),
             'app_token'  => $appToken,
@@ -68,23 +78,57 @@ final class GlpiBConnection
     }
 
     /**
-     * @param array{name?:string,base_url?:string,app_token?:string,user_token?:string,active?:mixed} $input
+     * @param array{id?:string,name?:string,base_url?:string,app_token?:string,user_token?:string,active?:mixed} $input
      */
     public static function save(array $input): void
     {
         $connection = self::fromInput($input);
+        $connections = self::loadAll();
+        $saved = false;
 
-        $values = [
-            'glpib_name'       => $connection['name'],
-            'glpib_base_url'   => $connection['base_url'],
-            'glpib_app_token'  => self::encryptToken($connection['app_token']),
-            'glpib_user_token' => self::encryptToken($connection['user_token']),
-            'glpib_active'     => $connection['active'] ? '1' : '0',
-        ];
-
-        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-            \Config::setConfigurationValues(self::CONTEXT, $values);
+        foreach ($connections as $index => $savedConnection) {
+            if ($savedConnection['id'] === $connection['id']) {
+                $connections[$index] = $connection;
+                $saved = true;
+                break;
+            }
         }
+
+        if (!$saved) {
+            $connections[] = $connection;
+        }
+
+        self::saveAll($connections);
+    }
+
+    public static function delete(string $id): void
+    {
+        $id = self::connectionId($id);
+        $connections = [];
+
+        foreach (self::loadAll() as $connection) {
+            if ($connection['id'] !== $id) {
+                $connections[] = $connection;
+            }
+        }
+
+        self::saveAll($connections);
+    }
+
+    /**
+     * @return array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}|null
+     */
+    public static function find(string $id): ?array
+    {
+        $id = self::connectionId($id);
+
+        foreach (self::loadAll() as $connection) {
+            if ($connection['id'] === $id) {
+                return $connection;
+            }
+        }
+
+        return null;
     }
 
     public static function install(): void
@@ -97,24 +141,18 @@ final class GlpiBConnection
             return;
         }
 
-        $savedValues = \Config::getConfigurationValues(self::CONTEXT, array_keys(self::DEFAULTS));
-        $missingValues = [];
-
-        foreach (self::DEFAULTS as $key => $value) {
-            if (!array_key_exists($key, $savedValues)) {
-                $missingValues[$key] = $value;
-            }
-        }
-
-        if ($missingValues !== []) {
-            \Config::setConfigurationValues(self::CONTEXT, $missingValues);
+        if (self::loadAll() === []) {
+            self::saveAll([]);
         }
     }
 
     public static function uninstall(): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::CONTEXT, array_keys(self::DEFAULTS));
+            \Config::deleteConfigurationValues(self::CONTEXT, array_merge(
+                [self::CONNECTIONS_KEY],
+                array_keys(self::OLD_KEYS)
+            ));
         }
     }
 
@@ -183,6 +221,142 @@ final class GlpiBConnection
     private static function apiUrl(string $baseUrl, string $endpoint): string
     {
         return self::cleanBaseUrl($baseUrl) . '/apirest.php/' . $endpoint;
+    }
+
+    /**
+     * @param list<string> $keys
+     * @return array<string,mixed>
+     */
+    private static function getSavedValues(array $keys = []): array
+    {
+        if (class_exists('\Config') && method_exists('\Config', 'getConfigurationValues')) {
+            $savedValues = \Config::getConfigurationValues(self::CONTEXT, $keys);
+
+            if (is_array($savedValues)) {
+                return $savedValues;
+            }
+        }
+
+        return [];
+    }
+
+    /**
+     * @return array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}
+     */
+    private static function emptyConnection(): array
+    {
+        return [
+            'id'         => self::connectionId(''),
+            'name'       => '',
+            'base_url'   => '',
+            'app_token'  => '',
+            'user_token' => '',
+            'active'     => false,
+        ];
+    }
+
+    /**
+     * @return array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}|null
+     */
+    private static function loadOldConnection(): ?array
+    {
+        $values = array_merge(self::OLD_KEYS, self::getSavedValues(array_keys(self::OLD_KEYS)));
+        $hasOldValue = false;
+
+        foreach ($values as $value) {
+            if ((string) $value !== '' && (string) $value !== '0') {
+                $hasOldValue = true;
+                break;
+            }
+        }
+
+        if (!$hasOldValue) {
+            return null;
+        }
+
+        return [
+            'id'         => self::connectionId(''),
+            'name'       => (string) $values['glpib_name'],
+            'base_url'   => self::cleanBaseUrl((string) $values['glpib_base_url']),
+            'app_token'  => self::decryptToken((string) $values['glpib_app_token']),
+            'user_token' => self::decryptToken((string) $values['glpib_user_token']),
+            'active'     => (string) $values['glpib_active'] === '1',
+        ];
+    }
+
+    /**
+     * @param string $savedJson
+     * @return list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}>
+     */
+    private static function decodeConnections(string $savedJson): array
+    {
+        if ($savedJson === '') {
+            return [];
+        }
+
+        $savedConnections = json_decode($savedJson, true);
+        if (!is_array($savedConnections)) {
+            return [];
+        }
+
+        $connections = [];
+
+        foreach ($savedConnections as $savedConnection) {
+            if (!is_array($savedConnection)) {
+                continue;
+            }
+
+            $connections[] = [
+                'id'         => self::connectionId((string) ($savedConnection['id'] ?? '')),
+                'name'       => (string) ($savedConnection['name'] ?? ''),
+                'base_url'   => (string) ($savedConnection['base_url'] ?? ''),
+                'app_token'  => self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
+                'user_token' => self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
+                'active'     => !empty($savedConnection['active']),
+            ];
+        }
+
+        return $connections;
+    }
+
+    /**
+     * @param list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}> $connections
+     */
+    private static function saveAll(array $connections): void
+    {
+        $savedConnections = [];
+
+        foreach ($connections as $connection) {
+            $savedConnections[] = [
+                'id'         => self::connectionId($connection['id']),
+                'name'       => $connection['name'],
+                'base_url'   => self::cleanBaseUrl($connection['base_url']),
+                'app_token'  => self::encryptToken($connection['app_token']),
+                'user_token' => self::encryptToken($connection['user_token']),
+                'active'     => $connection['active'],
+            ];
+        }
+
+        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
+            \Config::setConfigurationValues(self::CONTEXT, [
+                self::CONNECTIONS_KEY => json_encode($savedConnections, JSON_THROW_ON_ERROR),
+            ]);
+        }
+    }
+
+    private static function connectionId(string $id): string
+    {
+        $id = trim($id);
+
+        if ($id !== '') {
+            return $id;
+        }
+
+        try {
+            return bin2hex(random_bytes(8));
+        } catch (\Throwable) {
+            return str_replace('.', '', uniqid('glpib_', true));
+        }
     }
 
     /**
