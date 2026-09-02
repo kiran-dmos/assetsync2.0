@@ -1,0 +1,17 @@
+{
+  "name": "dmos/assetsync20",
+  "description": "Barebone GLPI plugin scaffold for assetsync2.0.",
+  "type": "glpi-plugin",
+  "license": "GPL-3.0-or-later",
+  "require": {
+    "php": ">=8.2"
+  },
+  "autoload": {
+    "psr-4": {
+      "GlpiPlugin\\Assetsync20\\": "src/"
+    }
+  },
+  "scripts": {
+    "test:smoke": "php tests/smoke.php"
+  }
+}
