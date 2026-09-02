@@ -59,7 +59,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.2',
+    'version' => '0.1.3',
 ];
 
 foreach ($expectations as $key => $expected) {
@@ -93,6 +93,10 @@ if (($menu['title'] ?? null) !== 'AssetSync2.0') {
 
 if (($menu['icon'] ?? null) !== 'ti ti-refresh') {
     throw new RuntimeException('Menu icon is incorrect.');
+}
+
+if (($menu['links']['fieldmapping'] ?? null) !== '/plugins/assetsync20/front/fieldmapping.php') {
+    throw new RuntimeException('Field Mapping menu link is incorrect.');
 }
 
 $connections = \GlpiPlugin\Assetsync20\GlpiBConnection::loadAll();
@@ -158,6 +162,31 @@ if ($savedConnection['base_url'] !== 'https://glpi-b.example.com') {
 
 if ($savedConnection['app_token'] !== 'app-secret' || $savedConnection['user_token'] !== 'user-secret') {
     throw new RuntimeException('Saved GLPI B tokens could not be loaded.');
+}
+
+\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    'name' => 'glpi_b',
+    'serial' => 'both',
+    'invalid_field' => 'glpi_a',
+    'comment' => 'invalid_source',
+]);
+
+$savedMappings = \GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer');
+
+if ($savedMappings !== ['name' => 'glpi_b', 'serial' => 'both']) {
+    throw new RuntimeException('Field mappings should save valid source selections only.');
+}
+
+$assetTypes = \GlpiPlugin\Assetsync20\FieldMapping::assetTypes();
+
+if (($assetTypes['NetworkEquipment'] ?? null) !== 'Network Equipment') {
+    throw new RuntimeException('Network equipment asset type label is incorrect.');
+}
+
+$sourceOptions = \GlpiPlugin\Assetsync20\FieldMapping::sourceOptions();
+
+if (($sourceOptions['both'] ?? null) !== 'Both') {
+    throw new RuntimeException('Both source option is missing.');
 }
 
 \GlpiPlugin\Assetsync20\GlpiBConnection::save([
@@ -251,7 +280,7 @@ if (!plugin_assetsync20_uninstall()) {
 
 $remainingValues = Config::getConfigurationValues('plugin:assetsync20');
 
-foreach (['glpib_connections', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
+foreach (['glpib_connections', 'field_mappings', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
     if (array_key_exists($deletedKey, $remainingValues)) {
         throw new RuntimeException('Uninstall should delete ' . $deletedKey . '.');
     }
