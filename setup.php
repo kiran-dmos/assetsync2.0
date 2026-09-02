@@ -9,7 +9,7 @@ use GlpiPlugin\Assetsync20\Menu;
  * GLPI bootstrap for the assetsync2.0 plugin.
  */
 
-define('PLUGIN_ASSETSYNC20_VERSION', '0.1.3');
+define('PLUGIN_ASSETSYNC20_VERSION', '0.1.4');
 define('PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION', '11.0.0');
 define('PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION', '12.0.0');
 define('PLUGIN_ASSETSYNC20_MIN_PHP_VERSION', '8.2.0');

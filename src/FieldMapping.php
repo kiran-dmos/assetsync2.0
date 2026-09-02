@@ -54,22 +54,31 @@ final class FieldMapping
     }
 
     /**
-     * @return array<string,string>
+     * @return array<string,array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}>
      */
     public static function load(string $connectionId, string $itemtype): array
     {
         $connectionId = trim($connectionId);
         $itemtype = self::validItemtype($itemtype);
         $allMappings = self::loadAll();
-        $savedMappings = $allMappings[$connectionId][$itemtype] ?? [];
+        $savedMappings = [];
 
-        return is_array($savedMappings) ? self::cleanMappings($itemtype, $savedMappings) : [];
+        if (isset($allMappings[$connectionId]) && is_array($allMappings[$connectionId])) {
+            $connectionMappings = $allMappings[$connectionId];
+
+            if (isset($connectionMappings[$itemtype]) && is_array($connectionMappings[$itemtype])) {
+                $savedMappings = $connectionMappings[$itemtype];
+            }
+        }
+
+        return self::cleanMappings($itemtype, $savedMappings, [], true);
     }
 
     /**
      * @param array<string,mixed> $fieldMappings
+     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
      */
-    public static function save(string $connectionId, string $itemtype, array $fieldMappings): void
+    public static function save(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields = []): void
     {
         $connectionId = trim($connectionId);
         if ($connectionId === '') {
@@ -78,7 +87,7 @@ final class FieldMapping
 
         $itemtype = self::validItemtype($itemtype);
         $allMappings = self::loadAll();
-        $allMappings[$connectionId][$itemtype] = self::cleanMappings($itemtype, $fieldMappings);
+        $allMappings[$connectionId][$itemtype] = self::cleanMappings($itemtype, $fieldMappings, $glpiBFields, false);
 
         if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
             \Config::setConfigurationValues(self::CONTEXT, [
@@ -113,7 +122,7 @@ final class FieldMapping
     }
 
     /**
-     * @return array<string,array<string,array<string,string>>>
+     * @return array<string,mixed>
      */
     private static function loadAll(): array
     {
@@ -134,31 +143,119 @@ final class FieldMapping
 
     /**
      * @param array<string,mixed> $fieldMappings
-     * @return array<string,string>
+     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
+     * @return array<string,array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}>
      */
-    private static function cleanMappings(string $itemtype, array $fieldMappings): array
-    {
+    private static function cleanMappings(
+        string $itemtype,
+        array $fieldMappings,
+        array $glpiBFields,
+        bool $keepRowsWithoutGlpiB
+    ): array {
         $validSources = array_keys(self::sourceOptions());
-        $validFields = [];
+        $validGlpiAFields = [];
+        $glpiBFieldsByKey = self::glpiBFieldsByKey($glpiBFields);
 
         foreach (self::fieldsFor($itemtype) as $field) {
-            $validFields[$field['key']] = true;
+            $validGlpiAFields[$field['key']] = true;
         }
 
         $cleanMappings = [];
 
-        foreach ($fieldMappings as $fieldKey => $source) {
+        foreach ($fieldMappings as $fieldKey => $mapping) {
             $fieldKey = (string) $fieldKey;
-            $source = (string) $source;
 
-            if (!isset($validFields[$fieldKey]) || !in_array($source, $validSources, true)) {
+            if (!isset($validGlpiAFields[$fieldKey])) {
                 continue;
             }
 
-            $cleanMappings[$fieldKey] = $source;
+            $record = self::mappingRecord($fieldKey, $mapping, $validSources);
+            if ($record === null) {
+                continue;
+            }
+
+            $glpiBFieldKey = $record['glpi_b_field_key'];
+
+            if ($glpiBFieldKey === '' && !$keepRowsWithoutGlpiB) {
+                continue;
+            }
+
+            if ($glpiBFieldKey !== '' && isset($glpiBFieldsByKey[$glpiBFieldKey])) {
+                $glpiBField = $glpiBFieldsByKey[$glpiBFieldKey];
+                $record['glpi_b_field_id'] = $glpiBField['id'];
+                $record['glpi_b_field_uid'] = $glpiBField['uid'];
+                $record['glpi_b_field_label'] = $glpiBField['label'];
+            } elseif ($glpiBFieldKey !== '' && $glpiBFieldsByKey !== []) {
+                continue;
+            }
+
+            $cleanMappings[$fieldKey] = $record;
         }
 
         return $cleanMappings;
+    }
+
+    /**
+     * @param mixed $mapping
+     * @param list<string> $validSources
+     * @return array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}|null
+     */
+    private static function mappingRecord(string $fieldKey, $mapping, array $validSources): ?array
+    {
+        if (is_array($mapping)) {
+            $source = (string) ($mapping['source_of_truth'] ?? '');
+            $glpiBFieldKey = (string) ($mapping['glpi_b_field_key'] ?? '');
+            $glpiBFieldId = (string) ($mapping['glpi_b_field_id'] ?? '');
+            $glpiBFieldUid = (string) ($mapping['glpi_b_field_uid'] ?? '');
+            $glpiBFieldLabel = (string) ($mapping['glpi_b_field_label'] ?? '');
+        } else {
+            $source = (string) $mapping;
+            $glpiBFieldKey = '';
+            $glpiBFieldId = '';
+            $glpiBFieldUid = '';
+            $glpiBFieldLabel = '';
+        }
+
+        $source = trim($source);
+        if (!in_array($source, $validSources, true)) {
+            return null;
+        }
+
+        return [
+            'glpi_a_field_key'   => $fieldKey,
+            'glpi_b_field_key'   => trim($glpiBFieldKey),
+            'glpi_b_field_id'    => trim($glpiBFieldId),
+            'glpi_b_field_uid'   => trim($glpiBFieldUid),
+            'glpi_b_field_label' => trim(strip_tags($glpiBFieldLabel)),
+            'source_of_truth'    => $source,
+        ];
+    }
+
+    /**
+     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
+     * @return array<string,array{key:string,id:string,uid:string,label:string}>
+     */
+    private static function glpiBFieldsByKey(array $glpiBFields): array
+    {
+        $fieldsByKey = [];
+
+        foreach ($glpiBFields as $field) {
+            $key = trim((string) ($field['key'] ?? ''));
+            $label = trim(strip_tags((string) ($field['label'] ?? '')));
+
+            if ($key === '' || $label === '') {
+                continue;
+            }
+
+            $fieldsByKey[$key] = [
+                'key'   => $key,
+                'id'    => trim((string) ($field['id'] ?? '')),
+                'uid'   => trim((string) ($field['uid'] ?? '')),
+                'label' => $label,
+            ];
+        }
+
+        return $fieldsByKey;
     }
 
     private static function validItemtype(string $itemtype): string
@@ -192,18 +289,34 @@ final class FieldMapping
                 continue;
             }
 
+            $fieldKey = (string) $optionId;
+            $hasFieldKey = is_int($optionId) || ctype_digit($fieldKey);
             $label = trim(strip_tags((string) $option['name']));
-            if ($label === '') {
+            if ($label === '' || (!$hasFieldKey && self::isHeaderOnlySearchOption($option))) {
                 continue;
             }
 
             $fields[] = [
-                'key'   => (string) $optionId,
+                'key'   => $fieldKey,
                 'label' => $label,
             ];
         }
 
         return $fields;
+    }
+
+    /**
+     * @param array<string,mixed> $option
+     */
+    private static function isHeaderOnlySearchOption(array $option): bool
+    {
+        foreach (['field', 'table', 'datatype', 'uid'] as $fieldName) {
+            if (isset($option[$fieldName]) && is_scalar($option[$fieldName]) && trim((string) $option[$fieldName]) !== '') {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /**

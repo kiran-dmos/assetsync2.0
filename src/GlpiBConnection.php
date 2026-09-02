@@ -206,6 +206,80 @@ final class GlpiBConnection
         ];
     }
 
+    /**
+     * @param array{name:string,base_url:string,app_token:string,user_token:string,active:bool} $connection
+     * @return array{success:bool,message:string,fields:list<array{key:string,id:string,uid:string,label:string}>}
+     */
+    public static function fetchNativeFields(array $connection, string $itemtype): array
+    {
+        if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
+            return [
+                'success' => false,
+                'message' => 'Base URL, app token, and user token are required.',
+                'fields'  => [],
+            ];
+        }
+
+        $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
+            'App-Token: ' . $connection['app_token'],
+            'Authorization: user_token ' . $connection['user_token'],
+        ]);
+
+        if (!$session['success']) {
+            return [
+                'success' => false,
+                'message' => $session['message'],
+                'fields'  => [],
+            ];
+        }
+
+        $sessionToken = (string) ($session['body']['session_token'] ?? '');
+        if ($sessionToken === '') {
+            return [
+                'success' => false,
+                'message' => 'GLPI B did not return a session token.',
+                'fields'  => [],
+            ];
+        }
+
+        $fieldsResponse = self::request(
+            'GET',
+            self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)),
+            [
+                'App-Token: ' . $connection['app_token'],
+                'Session-Token: ' . $sessionToken,
+            ]
+        );
+
+        self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
+            'App-Token: ' . $connection['app_token'],
+            'Session-Token: ' . $sessionToken,
+        ]);
+
+        if (!$fieldsResponse['success']) {
+            return [
+                'success' => false,
+                'message' => $fieldsResponse['message'],
+                'fields'  => [],
+            ];
+        }
+
+        $fields = self::fieldsFromSearchOptions($fieldsResponse['body']);
+        if ($fields === []) {
+            return [
+                'success' => false,
+                'message' => 'GLPI B did not return any native fields for this asset type.',
+                'fields'  => [],
+            ];
+        }
+
+        return [
+            'success' => true,
+            'message' => 'GLPI B fields loaded.',
+            'fields'  => $fields,
+        ];
+    }
+
     private static function cleanBaseUrl(string $baseUrl): string
     {
         $baseUrl = rtrim(trim($baseUrl), '/');
@@ -221,6 +295,82 @@ final class GlpiBConnection
     private static function apiUrl(string $baseUrl, string $endpoint): string
     {
         return self::cleanBaseUrl($baseUrl) . '/apirest.php/' . $endpoint;
+    }
+
+    /**
+     * @param array<string,mixed> $options
+     * @return list<array{key:string,id:string,uid:string,label:string}>
+     */
+    private static function fieldsFromSearchOptions(array $options): array
+    {
+        $fields = [];
+        $seenKeys = [];
+
+        foreach ($options as $optionId => $option) {
+            if (!is_array($option) || !isset($option['name']) || !is_scalar($option['name'])) {
+                continue;
+            }
+
+            $label = trim(strip_tags((string) $option['name']));
+            if ($label === '') {
+                continue;
+            }
+
+            $id = self::searchOptionId($optionId, $option);
+            if ($id === '' && self::isHeaderOnlySearchOption($option)) {
+                continue;
+            }
+
+            $uid = isset($option['uid']) && is_scalar($option['uid']) ? trim((string) $option['uid']) : '';
+            $key = $uid !== '' ? $uid : $id;
+
+            if ($key === '' || isset($seenKeys[$key])) {
+                continue;
+            }
+
+            $seenKeys[$key] = true;
+            $fields[] = [
+                'key'   => $key,
+                'id'    => $id,
+                'uid'   => $uid,
+                'label' => $label,
+            ];
+        }
+
+        return $fields;
+    }
+
+    /**
+     * @param array<string,mixed> $option
+     */
+    private static function isHeaderOnlySearchOption(array $option): bool
+    {
+        foreach (['field', 'table', 'datatype', 'uid'] as $fieldName) {
+            if (isset($option[$fieldName]) && is_scalar($option[$fieldName]) && trim((string) $option[$fieldName]) !== '') {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * @param int|string $optionId
+     * @param array<string,mixed> $option
+     */
+    private static function searchOptionId($optionId, array $option): string
+    {
+        if (isset($option['id']) && is_scalar($option['id']) && trim((string) $option['id']) !== '') {
+            return trim((string) $option['id']);
+        }
+
+        if (is_int($optionId)) {
+            return (string) $optionId;
+        }
+
+        $optionId = trim((string) $optionId);
+
+        return ctype_digit($optionId) ? $optionId : '';
     }
 
     /**

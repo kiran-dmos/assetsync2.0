@@ -59,7 +59,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.3',
+    'version' => '0.1.4',
 ];
 
 foreach ($expectations as $key => $expected) {
@@ -164,17 +164,134 @@ if ($savedConnection['app_token'] !== 'app-secret' || $savedConnection['user_tok
     throw new RuntimeException('Saved GLPI B tokens could not be loaded.');
 }
 
+$emptyFieldFetch = \GlpiPlugin\Assetsync20\GlpiBConnection::fetchNativeFields($connection, 'Computer');
+
+if ($emptyFieldFetch['success'] !== false || $emptyFieldFetch['message'] !== 'Base URL, app token, and user token are required.') {
+    throw new RuntimeException('Empty GLPI B field fetch result is incorrect.');
+}
+
+$fieldsFromSearchOptions = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'fieldsFromSearchOptions');
+$fieldsFromSearchOptions->setAccessible(true);
+$glpiBFields = $fieldsFromSearchOptions->invoke(null, ['common' => [
+    'name' => 'Characteristics',
+], 1 => [
+    'name' => 'Name',
+    'field' => 'name',
+    'table' => 'glpi_computers',
+    'uid' => 'Computer.name',
+], 2 => [
+    'name' => '<strong>Serial number</strong>',
+    'field' => 'serial',
+    'table' => 'glpi_computers',
+], 'notes' => [
+    'name' => 'Notes',
+    'field' => 'comment',
+    'uid' => 'Computer.comment',
+]]);
+
+if ($glpiBFields !== [
+    [
+        'key' => 'Computer.name',
+        'id' => '1',
+        'uid' => 'Computer.name',
+        'label' => 'Name',
+    ],
+    [
+        'key' => '2',
+        'id' => '2',
+        'uid' => '',
+        'label' => 'Serial number',
+    ],
+    [
+        'key' => 'Computer.comment',
+        'id' => '',
+        'uid' => 'Computer.comment',
+        'label' => 'Notes',
+    ],
+]) {
+    throw new RuntimeException('GLPI B search options were not normalized correctly.');
+}
+
 \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
-    'name' => 'glpi_b',
-    'serial' => 'both',
-    'invalid_field' => 'glpi_a',
-    'comment' => 'invalid_source',
-]);
+    'name' => [
+        'glpi_b_field_key' => 'Computer.name',
+        'source_of_truth' => 'glpi_b',
+    ],
+    'serial' => [
+        'glpi_b_field_key' => '2',
+        'source_of_truth' => 'both',
+    ],
+    'invalid_field' => [
+        'glpi_b_field_key' => 'Computer.comment',
+        'source_of_truth' => 'glpi_a',
+    ],
+    'comment' => [
+        'glpi_b_field_key' => 'Computer.comment',
+        'source_of_truth' => 'invalid_source',
+    ],
+    'otherserial' => [
+        'glpi_b_field_key' => 'missing',
+        'source_of_truth' => 'glpi_a',
+    ],
+], $glpiBFields);
 
 $savedMappings = \GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer');
 
-if ($savedMappings !== ['name' => 'glpi_b', 'serial' => 'both']) {
-    throw new RuntimeException('Field mappings should save valid source selections only.');
+if ($savedMappings !== [
+    'name' => [
+        'glpi_a_field_key' => 'name',
+        'glpi_b_field_key' => 'Computer.name',
+        'glpi_b_field_id' => '1',
+        'glpi_b_field_uid' => 'Computer.name',
+        'glpi_b_field_label' => 'Name',
+        'source_of_truth' => 'glpi_b',
+    ],
+    'serial' => [
+        'glpi_a_field_key' => 'serial',
+        'glpi_b_field_key' => '2',
+        'glpi_b_field_id' => '2',
+        'glpi_b_field_uid' => '',
+        'glpi_b_field_label' => 'Serial number',
+        'source_of_truth' => 'both',
+    ],
+]) {
+    throw new RuntimeException('Field mappings should save valid GLPI A fields, GLPI B fields, and source selections only.');
+}
+
+Config::setConfigurationValues('plugin:assetsync20', [
+    'field_mappings' => json_encode([
+        'production' => [
+            'Computer' => [
+                'name' => 'glpi_b',
+                'serial' => 'both',
+                'invalid_field' => 'glpi_a',
+                'comment' => 'invalid_source',
+            ],
+        ],
+    ], JSON_THROW_ON_ERROR),
+]);
+
+$legacyMappings = \GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer');
+
+if ($legacyMappings !== [
+    'name' => [
+        'glpi_a_field_key' => 'name',
+        'glpi_b_field_key' => '',
+        'glpi_b_field_id' => '',
+        'glpi_b_field_uid' => '',
+        'glpi_b_field_label' => '',
+        'source_of_truth' => 'glpi_b',
+    ],
+    'serial' => [
+        'glpi_a_field_key' => 'serial',
+        'glpi_b_field_key' => '',
+        'glpi_b_field_id' => '',
+        'glpi_b_field_uid' => '',
+        'glpi_b_field_label' => '',
+        'source_of_truth' => 'both',
+    ],
+]) {
+    throw new RuntimeException('Legacy field mappings should load as normalized records.');
 }
 
 $assetTypes = \GlpiPlugin\Assetsync20\FieldMapping::assetTypes();

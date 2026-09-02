@@ -30,24 +30,76 @@ if (!array_key_exists($selectedItemtype, $assetTypes)) {
     $selectedItemtype = 'Computer';
 }
 
+$selectedConnection = $selectedConnectionId !== '' ? GlpiBConnection::find($selectedConnectionId) : null;
+$glpiBFields = [];
+$glpiBFieldsLoaded = false;
+$glpiBFieldsMessage = null;
+
+if ($selectedConnection !== null) {
+    $glpiBFieldsResult = GlpiBConnection::fetchNativeFields($selectedConnection, $selectedItemtype);
+    $glpiBFieldsLoaded = $glpiBFieldsResult['success'];
+    $glpiBFields = $glpiBFieldsResult['fields'];
+
+    if (!$glpiBFieldsLoaded) {
+        $glpiBFieldsMessage = $glpiBFieldsResult['message'];
+    }
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save'])) {
     if (class_exists('Session') && method_exists('Session', 'checkRight')) {
         Session::checkRight('config', defined('UPDATE') ? UPDATE : 2);
     }
 
-    if (GlpiBConnection::find($selectedConnectionId) === null) {
+    if ($selectedConnection === null) {
         $message = 'Select a GLPI B connection before saving field mappings.';
+        $messageClass = 'warning';
+    } elseif (!$glpiBFieldsLoaded) {
+        $message = 'Field mappings were not saved because GLPI B fields could not be loaded: '
+            . ($glpiBFieldsMessage ?? 'Unknown error.');
         $messageClass = 'warning';
     } else {
         $postedMappings = $_POST['field_mappings'] ?? [];
-        FieldMapping::save($selectedConnectionId, $selectedItemtype, is_array($postedMappings) ? $postedMappings : []);
+        FieldMapping::save(
+            $selectedConnectionId,
+            $selectedItemtype,
+            is_array($postedMappings) ? $postedMappings : [],
+            $glpiBFields
+        );
         $message = 'Field mappings saved.';
         $messageClass = 'success';
     }
+} elseif ($selectedConnection !== null && !$glpiBFieldsLoaded) {
+    $message = 'GLPI B fields could not be loaded: ' . ($glpiBFieldsMessage ?? 'Unknown error.');
+    $messageClass = 'warning';
 }
 
 $savedMappings = $selectedConnectionId !== '' ? FieldMapping::load($selectedConnectionId, $selectedItemtype) : [];
 $fields = FieldMapping::fieldsFor($selectedItemtype);
+$displayGlpiBFields = $glpiBFields;
+$displayGlpiBFieldKeys = [];
+
+foreach ($displayGlpiBFields as $glpiBField) {
+    $displayGlpiBFieldKeys[$glpiBField['key']] = true;
+}
+
+foreach ($savedMappings as $savedMapping) {
+    $savedGlpiBFieldKey = $savedMapping['glpi_b_field_key'] ?? '';
+
+    if ($savedGlpiBFieldKey === '' || isset($displayGlpiBFieldKeys[$savedGlpiBFieldKey])) {
+        continue;
+    }
+
+    $savedGlpiBFieldLabel = $savedMapping['glpi_b_field_label'] !== ''
+        ? $savedMapping['glpi_b_field_label']
+        : $savedGlpiBFieldKey;
+    $displayGlpiBFields[] = [
+        'key'   => $savedGlpiBFieldKey,
+        'id'    => $savedMapping['glpi_b_field_id'] ?? '',
+        'uid'   => $savedMapping['glpi_b_field_uid'] ?? '',
+        'label' => $savedGlpiBFieldLabel,
+    ];
+    $displayGlpiBFieldKeys[$savedGlpiBFieldKey] = true;
+}
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
     Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
@@ -55,6 +107,22 @@ if (class_exists('Html') && method_exists('Html', 'header')) {
 
 $html = static function (string $value): string {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+};
+
+$fieldOptionLabel = static function (array $field): string {
+    $label = (string) ($field['label'] ?? '');
+    $uid = (string) ($field['uid'] ?? '');
+    $id = (string) ($field['id'] ?? '');
+
+    if ($uid !== '') {
+        return $label . ' (' . $uid . ')';
+    }
+
+    if ($id !== '') {
+        return $label . ' (#' . $id . ')';
+    }
+
+    return $label;
 };
 
 echo '<div class="center">';
@@ -110,7 +178,7 @@ echo '<tr><td colspan="2" class="center"><button type="submit" class="submit">Lo
 echo '</table>';
 echo '</form>';
 
-if ($selectedConnectionId === '' || GlpiBConnection::find($selectedConnectionId) === null) {
+if ($selectedConnectionId === '' || $selectedConnection === null) {
     echo '<table class="tab_cadre_fixe">';
     echo '<tr><td class="center">Select a GLPI B connection to edit field mappings.</td></tr>';
     echo '</table>';
@@ -127,16 +195,40 @@ echo '<form method="post" action="' . $html(Menu::fieldMappingUrl()) . '">';
 echo '<input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">';
 echo '<input type="hidden" name="itemtype" value="' . $html($selectedItemtype) . '">';
 echo '<table class="tab_cadre_fixe">';
-echo '<tr><th colspan="2">' . $html($assetTypes[$selectedItemtype]) . ' fields</th></tr>';
-echo '<tr><th>Field</th><th>Source of truth</th></tr>';
+echo '<tr><th colspan="4">' . $html($assetTypes[$selectedItemtype]) . ' fields</th></tr>';
+echo '<tr>';
+echo '<th>GLPI A field</th>';
+echo '<th>GLPI A key</th>';
+echo '<th>GLPI B field</th>';
+echo '<th>Source of truth</th>';
+echo '</tr>';
 
 foreach ($fields as $field) {
     $fieldKey = $field['key'];
-    $savedSource = $savedMappings[$fieldKey] ?? 'glpi_a';
+    $savedMapping = $savedMappings[$fieldKey] ?? [
+        'glpi_b_field_key' => '',
+        'source_of_truth'  => 'glpi_a',
+    ];
+    $savedGlpiBFieldKey = $savedMapping['glpi_b_field_key'] ?? '';
+    $savedSource = $savedMapping['source_of_truth'] ?? 'glpi_a';
 
     echo '<tr>';
     echo '<td>' . $html($field['label']) . '</td>';
-    echo '<td><select name="field_mappings[' . $html($fieldKey) . ']">';
+    echo '<td><code>' . $html($fieldKey) . '</code></td>';
+    echo '<td><select name="field_mappings[' . $html($fieldKey) . '][glpi_b_field_key]"'
+        . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>';
+    echo '<option value="">Do not map</option>';
+
+    foreach ($displayGlpiBFields as $glpiBField) {
+        $glpiBFieldKey = $glpiBField['key'];
+        $selected = $glpiBFieldKey === $savedGlpiBFieldKey ? ' selected' : '';
+        echo '<option value="' . $html($glpiBFieldKey) . '"' . $selected . '>'
+            . $html($fieldOptionLabel($glpiBField)) . '</option>';
+    }
+
+    echo '</select></td>';
+    echo '<td><select name="field_mappings[' . $html($fieldKey) . '][source_of_truth]"'
+        . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>';
 
     foreach ($sourceOptions as $sourceValue => $sourceLabel) {
         $selected = $sourceValue === $savedSource ? ' selected' : '';
@@ -148,14 +240,15 @@ foreach ($fields as $field) {
 }
 
 echo '<tr>';
-echo '<td colspan="2" class="center">';
+echo '<td colspan="4" class="center">';
 
 if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
     echo '<input type="hidden" name="_glpi_csrf_token" value="'
         . $html(Session::getNewCSRFToken()) . '">';
 }
 
-echo '<button type="submit" name="save" value="1" class="submit">Save</button>';
+echo '<button type="submit" name="save" value="1" class="submit"'
+    . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>Save</button>';
 echo '</td>';
 echo '</tr>';
 echo '</table>';
