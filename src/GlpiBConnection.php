@@ -280,6 +280,220 @@ final class GlpiBConnection
         ];
     }
 
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @return array{success:bool,message:string,items:list<array{id:int>>,total_count:int,transient:bool}
+     */
+    public static function searchBySerial(array $connection, string $itemtype, string $serial): array
+    {
+        $serial = trim($serial);
+        if ($serial === '') {
+            return [
+                'success'     => false,
+                'message'     => 'Serial is required before searching GLPI B.',
+                'items'       => [],
+                'total_count' => 0,
+                'transient'   => false,
+            ];
+        }
+
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $serial): array {
+            $optionsResponse = self::request(
+                'GET',
+                self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ]
+            );
+
+            if (!$optionsResponse['success']) {
+                return self::searchFailure($optionsResponse['message'], $optionsResponse['transient']);
+            }
+
+            $serialOptionId = self::searchOptionIdForNativeField($optionsResponse['body'], 'serial');
+            if ($serialOptionId === '') {
+                return self::searchFailure('GLPI B did not expose a serial search option for ' . $itemtype . '.', false);
+            }
+
+            $idOptionId = self::searchOptionIdForNativeField($optionsResponse['body'], 'id');
+            $query = [
+                'criteria' => [
+                    [
+                        'field'      => $serialOptionId,
+                        'searchtype' => 'equals',
+                        'value'      => $serial,
+                    ],
+                ],
+                'range' => '0-2',
+            ];
+
+            if ($idOptionId !== '') {
+                $query['forcedisplay'] = [$idOptionId];
+            }
+
+            $searchResponse = self::request(
+                'GET',
+                self::apiUrlWithQuery($connection['base_url'], 'search/' . rawurlencode($itemtype), $query),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ]
+            );
+
+            if (!$searchResponse['success']) {
+                return self::searchFailure($searchResponse['message'], $searchResponse['transient']);
+            }
+
+            $totalCount = self::searchTotalCount($searchResponse['body']);
+            $items = self::itemsFromSearchResponse($searchResponse['body'], $idOptionId);
+
+            if ($totalCount === 1 && $items === []) {
+                return self::searchFailure('GLPI B search did not include a usable asset id.', false);
+            }
+
+            return [
+                'success'     => true,
+                'message'     => 'GLPI B serial search succeeded.',
+                'items'       => $items,
+                'total_count' => $totalCount,
+                'transient'   => false,
+            ];
+        });
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @return array{success:bool,message:string,item:array<string,mixed>,missing:bool,transient:bool}
+     */
+    public static function getItem(array $connection, string $itemtype, int $itemsId): array
+    {
+        if ($itemsId <= 0) {
+            return [
+                'success'   => false,
+                'message'   => 'A GLPI B asset id is required.',
+                'item'      => [],
+                'missing'   => false,
+                'transient' => false,
+            ];
+        }
+
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId): array {
+            $response = self::request(
+                'GET',
+                self::apiUrl($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ]
+            );
+
+            if (!$response['success']) {
+                return [
+                    'success'   => false,
+                    'message'   => $response['message'],
+                    'item'      => [],
+                    'missing'   => $response['status_code'] === 404,
+                    'transient' => $response['transient'],
+                ];
+            }
+
+            return [
+                'success'   => true,
+                'message'   => 'GLPI B asset loaded.',
+                'item'      => $response['body'],
+                'missing'   => false,
+                'transient' => false,
+            ];
+        });
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param array<string,mixed> $input
+     * @return array{success:bool,message:string,id:int,transient:bool}
+     */
+    public static function createItem(array $connection, string $itemtype, array $input): array
+    {
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $input): array {
+            $response = self::request(
+                'POST',
+                self::apiUrl($connection['base_url'], rawurlencode($itemtype)),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ],
+                ['input' => $input]
+            );
+
+            if (!$response['success']) {
+                return [
+                    'success'   => false,
+                    'message'   => $response['message'],
+                    'id'        => 0,
+                    'transient' => $response['transient'],
+                ];
+            }
+
+            return [
+                'success'   => true,
+                'message'   => 'GLPI B asset created.',
+                'id'        => self::createdItemId($response['body']),
+                'transient' => false,
+            ];
+        });
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param array<string,mixed> $input
+     * @return array{success:bool,message:string,transient:bool}
+     */
+    public static function updateItem(array $connection, string $itemtype, int $itemsId, array $input): array
+    {
+        if ($itemsId <= 0) {
+            return [
+                'success'   => false,
+                'message'   => 'A GLPI B asset id is required.',
+                'transient' => false,
+            ];
+        }
+
+        if ($input === []) {
+            return [
+                'success'   => true,
+                'message'   => 'No GLPI B fields needed an update.',
+                'transient' => false,
+            ];
+        }
+
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $input): array {
+            $response = self::request(
+                'PUT',
+                self::apiUrl($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ],
+                ['input' => $input]
+            );
+
+            if (!$response['success']) {
+                return [
+                    'success'   => false,
+                    'message'   => $response['message'],
+                    'transient' => $response['transient'],
+                ];
+            }
+
+            return [
+                'success'   => true,
+                'message'   => 'GLPI B asset updated.',
+                'transient' => false,
+            ];
+        });
+    }
+
     private static function cleanBaseUrl(string $baseUrl): string
     {
         $baseUrl = rtrim(trim($baseUrl), '/');
@@ -295,6 +509,14 @@ final class GlpiBConnection
     private static function apiUrl(string $baseUrl, string $endpoint): string
     {
         return self::cleanBaseUrl($baseUrl) . '/apirest.php/' . $endpoint;
+    }
+
+    /**
+     * @param array<string,mixed> $query
+     */
+    private static function apiUrlWithQuery(string $baseUrl, string $endpoint, array $query): string
+    {
+        return self::apiUrl($baseUrl, $endpoint) . '?' . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
     }
 
     /**
@@ -510,16 +732,190 @@ final class GlpiBConnection
     }
 
     /**
-     * @param list<string> $headers
-     * @return array{success:bool,message:string,body:array<string,mixed>}
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param callable(string):array<string,mixed> $callback
+     * @return array<string,mixed>
      */
-    private static function request(string $method, string $url, array $headers): array
+    private static function withSession(array $connection, callable $callback): array
+    {
+        if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
+            return [
+                'success'   => false,
+                'message'   => 'Base URL, app token, and user token are required.',
+                'transient' => false,
+            ];
+        }
+
+        $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
+            'App-Token: ' . $connection['app_token'],
+            'Authorization: user_token ' . $connection['user_token'],
+        ]);
+
+        if (!$session['success']) {
+            return [
+                'success'   => false,
+                'message'   => $session['message'],
+                'transient' => $session['transient'],
+            ];
+        }
+
+        $sessionToken = (string) ($session['body']['session_token'] ?? '');
+        if ($sessionToken === '') {
+            return [
+                'success'   => false,
+                'message'   => 'GLPI B did not return a session token.',
+                'transient' => false,
+            ];
+        }
+
+        try {
+            return $callback($sessionToken);
+        } finally {
+            self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
+                'App-Token: ' . $connection['app_token'],
+                'Session-Token: ' . $sessionToken,
+            ]);
+        }
+    }
+
+    /**
+     * @return array{success:bool,message:string,items:list<array{id:int>>,total_count:int,transient:bool}
+     */
+    private static function searchFailure(string $message, bool $transient): array
+    {
+        return [
+            'success'     => false,
+            'message'     => $message,
+            'items'       => [],
+            'total_count' => 0,
+            'transient'   => $transient,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $options
+     */
+    private static function searchOptionIdForNativeField(array $options, string $fieldName): string
+    {
+        foreach ($options as $optionId => $option) {
+            if (!is_array($option)) {
+                continue;
+            }
+
+            $field = isset($option['field']) && is_scalar($option['field']) ? trim((string) $option['field']) : '';
+            $uid = isset($option['uid']) && is_scalar($option['uid']) ? trim((string) $option['uid']) : '';
+
+            if ($field !== $fieldName && !str_ends_with($uid, '.' . $fieldName)) {
+                continue;
+            }
+
+            $id = self::searchOptionId($optionId, $option);
+            if ($id !== '') {
+                return $id;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * @param array<string,mixed> $body
+     */
+    private static function searchTotalCount(array $body): int
+    {
+        if (isset($body['totalcount']) && is_scalar($body['totalcount'])) {
+            return (int) $body['totalcount'];
+        }
+
+        return isset($body['data']) && is_array($body['data']) ? count($body['data']) : 0;
+    }
+
+    /**
+     * @param array<string,mixed> $body
+     * @return list<array{id:int}>
+     */
+    private static function itemsFromSearchResponse(array $body, string $idOptionId): array
+    {
+        $data = $body['data'] ?? [];
+        if (!is_array($data)) {
+            return [];
+        }
+
+        $items = [];
+        foreach ($data as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $id = self::searchRowId($row, $idOptionId);
+            if ($id > 0) {
+                $items[] = ['id' => $id];
+            }
+        }
+
+        return $items;
+    }
+
+    /**
+     * @param array<string|int,mixed> $row
+     */
+    private static function searchRowId(array $row, string $idOptionId): int
+    {
+        $candidateKeys = ['id'];
+        if ($idOptionId !== '') {
+            $candidateKeys[] = $idOptionId;
+        }
+        $candidateKeys[] = '2';
+
+        foreach ($candidateKeys as $key) {
+            if (array_key_exists($key, $row)) {
+                $id = self::cleanRemoteId($row[$key]);
+                if ($id > 0) {
+                    return $id;
+                }
+            }
+        }
+
+        return 0;
+    }
+
+    private static function cleanRemoteId($value): int
+    {
+        if (is_array($value) && isset($value['id'])) {
+            $value = $value['id'];
+        }
+
+        if (!is_scalar($value)) {
+            return 0;
+        }
+
+        $value = trim(strip_tags((string) $value));
+
+        return ctype_digit($value) ? (int) $value : 0;
+    }
+
+    /**
+     * @param array<string,mixed> $body
+     */
+    private static function createdItemId(array $body): int
+    {
+        return self::cleanRemoteId($body['id'] ?? 0);
+    }
+
+    /**
+     * @param list<string> $headers
+     * @param array<string,mixed>|null $payload
+     * @return array{success:bool,message:string,body:array<string,mixed>,status_code:int,transient:bool}
+     */
+    private static function request(string $method, string $url, array $headers, ?array $payload = null): array
     {
         if (!function_exists('curl_init')) {
             return [
-                'success' => false,
-                'message' => 'The PHP cURL extension is required to test the connection.',
-                'body'    => [],
+                'success'     => false,
+                'message'     => 'The PHP cURL extension is required to test the connection.',
+                'body'        => [],
+                'status_code' => 0,
+                'transient'   => false,
             ];
         }
 
@@ -527,18 +923,29 @@ final class GlpiBConnection
 
         if ($curl === false) {
             return [
-                'success' => false,
-                'message' => 'Unable to initialize the HTTP request.',
-                'body'    => [],
+                'success'     => false,
+                'message'     => 'Unable to initialize the HTTP request.',
+                'body'        => [],
+                'status_code' => 0,
+                'transient'   => true,
             ];
+        }
+
+        $requestHeaders = array_merge($headers, ['Accept: application/json']);
+        if ($payload !== null) {
+            $requestHeaders[] = 'Content-Type: application/json';
         }
 
         curl_setopt_array($curl, [
             CURLOPT_CUSTOMREQUEST  => $method,
-            CURLOPT_HTTPHEADER     => array_merge($headers, ['Accept: application/json']),
+            CURLOPT_HTTPHEADER     => $requestHeaders,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 15,
         ]);
+
+        if ($payload !== null) {
+            curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($payload, JSON_THROW_ON_ERROR));
+        }
 
         $rawBody = curl_exec($curl);
         $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
@@ -547,9 +954,11 @@ final class GlpiBConnection
 
         if ($rawBody === false) {
             return [
-                'success' => false,
-                'message' => 'HTTP request failed: ' . $error,
-                'body'    => [],
+                'success'     => false,
+                'message'     => 'HTTP request failed: ' . $error,
+                'body'        => [],
+                'status_code' => $statusCode,
+                'transient'   => true,
             ];
         }
 
@@ -560,17 +969,26 @@ final class GlpiBConnection
 
         if ($statusCode < 200 || $statusCode >= 300) {
             return [
-                'success' => false,
-                'message' => 'GLPI B returned HTTP ' . $statusCode . '.',
-                'body'    => $body,
+                'success'     => false,
+                'message'     => 'GLPI B returned HTTP ' . $statusCode . '.',
+                'body'        => $body,
+                'status_code' => $statusCode,
+                'transient'   => self::isTransientStatusCode($statusCode),
             ];
         }
 
         return [
-            'success' => true,
-            'message' => 'Request succeeded.',
-            'body'    => $body,
+            'success'     => true,
+            'message'     => 'Request succeeded.',
+            'body'        => $body,
+            'status_code' => $statusCode,
+            'transient'   => false,
         ];
+    }
+
+    private static function isTransientStatusCode(int $statusCode): bool
+    {
+        return $statusCode === 408 || $statusCode === 429 || $statusCode >= 500 || $statusCode === 0;
     }
 
     private static function encryptToken(string $token): string

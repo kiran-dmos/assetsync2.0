@@ -37,6 +37,32 @@ final class FieldMapping
     }
 
     /**
+     * @return list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}>
+     */
+    public static function syncMappings(string $connectionId, string $itemtype): array
+    {
+        $itemtype = self::validItemtype($itemtype);
+        $mappings = [];
+
+        foreach (self::load($connectionId, $itemtype) as $mapping) {
+            $glpiAField = self::safeLocalSyncField($itemtype, $mapping['glpi_a_field_key']);
+            $glpiBField = self::safeRemoteSyncField($mapping);
+
+            if ($glpiAField === '' || $glpiBField === '') {
+                continue;
+            }
+
+            $mappings[] = [
+                'glpi_a_field'    => $glpiAField,
+                'glpi_b_field'    => $glpiBField,
+                'source_of_truth' => $mapping['source_of_truth'],
+            ];
+        }
+
+        return $mappings;
+    }
+
+    /**
      * @return list<array{key:string,label:string}>
      */
     public static function fieldsFor(string $itemtype): array
@@ -339,5 +365,130 @@ final class FieldMapping
         }
 
         return $fields;
+    }
+
+    private static function safeLocalSyncField(string $itemtype, string $fieldKey): string
+    {
+        $directField = self::safeSyncFieldName($fieldKey);
+        if ($directField !== '') {
+            return $directField;
+        }
+
+        if (!class_exists('\Search') || !method_exists('\Search', 'getOptions')) {
+            return '';
+        }
+
+        try {
+            $options = \Search::getOptions($itemtype);
+        } catch (\Throwable) {
+            return '';
+        }
+
+        if (!is_array($options)) {
+            return '';
+        }
+
+        $itemTable = self::itemTable($itemtype);
+
+        foreach ($options as $optionId => $option) {
+            if (!is_array($option) || !self::searchOptionMatches($fieldKey, $optionId, $option)) {
+                continue;
+            }
+
+            $optionTable = isset($option['table']) && is_scalar($option['table']) ? trim((string) $option['table']) : '';
+            if ($optionTable !== '' && $itemTable !== '' && $optionTable !== $itemTable) {
+                continue;
+            }
+
+            $field = isset($option['field']) && is_scalar($option['field']) ? trim((string) $option['field']) : '';
+            $safeField = self::safeSyncFieldName($field);
+            if ($safeField !== '') {
+                return $safeField;
+            }
+        }
+
+        return '';
+    }
+
+    /**
+     * @param array{glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string} $mapping
+     */
+    private static function safeRemoteSyncField(array $mapping): string
+    {
+        foreach (['glpi_b_field_key', 'glpi_b_field_uid'] as $fieldName) {
+            $safeField = self::safeSyncFieldName((string) ($mapping[$fieldName] ?? ''));
+            if ($safeField !== '') {
+                return $safeField;
+            }
+        }
+
+        return self::safeSyncFieldFromLabel((string) ($mapping['glpi_b_field_label'] ?? ''));
+    }
+
+    private static function safeSyncFieldName(string $fieldKey): string
+    {
+        $fieldKey = trim($fieldKey);
+        if ($fieldKey === '') {
+            return '';
+        }
+
+        foreach (array_keys(self::safeSyncFields()) as $fieldName) {
+            if ($fieldKey === $fieldName || str_ends_with($fieldKey, '.' . $fieldName)) {
+                return $fieldName;
+            }
+        }
+
+        return '';
+    }
+
+    private static function safeSyncFieldFromLabel(string $label): string
+    {
+        $label = strtolower(trim(strip_tags($label)));
+        $labels = [
+            'name'             => 'name',
+            'serial number'    => 'serial',
+            'serial'           => 'serial',
+            'inventory number' => 'otherserial',
+            'asset tag'        => 'otherserial',
+            'comments'         => 'comment',
+            'comment'          => 'comment',
+        ];
+
+        return $labels[$label] ?? '';
+    }
+
+    /**
+     * @return array<string,true>
+     */
+    private static function safeSyncFields(): array
+    {
+        return [
+            'name'        => true,
+            'serial'      => true,
+            'otherserial' => true,
+            'comment'     => true,
+        ];
+    }
+
+    /**
+     * @param int|string $optionId
+     * @param array<string,mixed> $option
+     */
+    private static function searchOptionMatches(string $fieldKey, $optionId, array $option): bool
+    {
+        $optionId = (string) $optionId;
+        $id = isset($option['id']) && is_scalar($option['id']) ? trim((string) $option['id']) : $optionId;
+        $uid = isset($option['uid']) && is_scalar($option['uid']) ? trim((string) $option['uid']) : '';
+
+        return $fieldKey === $id || ($uid !== '' && $fieldKey === $uid);
+    }
+
+    private static function itemTable(string $itemtype): string
+    {
+        if (class_exists($itemtype) && method_exists($itemtype, 'getTable')) {
+            return (string) $itemtype::getTable();
+        }
+
+        return '';
     }
 }
