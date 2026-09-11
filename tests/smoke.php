@@ -527,6 +527,24 @@ if (\GlpiPlugin\Assetsync20\Menu::entitySyncRoutesUrl() !== '/plugins/assetsync2
     throw new RuntimeException('Entity Sync Routes internal URL is incorrect.');
 }
 
+$dashboard = file_get_contents(dirname(__DIR__) . '/front/config.php');
+if ($dashboard === false) {
+    throw new RuntimeException('Dashboard page could not be read.');
+}
+
+foreach ([
+    'AssetSync2.0 dashboard',
+    'GLPI B Connections',
+    'Open entity routes',
+    'Open field mapping',
+    'Open automatic actions',
+    'AssetSyncCron::TASK_NAME',
+] as $dashboardText) {
+    if (!str_contains($dashboard, $dashboardText)) {
+        throw new RuntimeException('Dashboard is missing expected text: ' . $dashboardText);
+    }
+}
+
 $installedValues = Config::getConfigurationValues('plugin:assetsync20');
 
 if (!array_key_exists('entity_sync_routes', $installedValues)) {

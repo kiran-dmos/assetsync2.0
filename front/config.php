@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use GlpiPlugin\Assetsync20\Plugin;
 use GlpiPlugin\Assetsync20\Menu;
+use GlpiPlugin\Assetsync20\AssetSyncCron;
 use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\GlpiBConnection;
 
@@ -25,6 +26,20 @@ $assetTypes = FieldMapping::assetTypes();
 
 $urlWithQuery = static function (string $url, array $query): string {
     return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($query);
+};
+
+$glpiFrontUrl = static function (string $page): string {
+    $page = ltrim($page, '/');
+
+    if (class_exists('Html') && method_exists('Html', 'getPrefixedUrl')) {
+        try {
+            return Html::getPrefixedUrl('/front/' . $page);
+        } catch (Throwable) {
+            // Partial GLPI bootstrap contexts can make URL helpers unavailable.
+        }
+    }
+
+    return '/front/' . $page;
 };
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -102,6 +117,44 @@ if ($message !== null) {
 }
 
 echo '<table class="tab_cadre_fixe">';
+echo '<tr><th colspan="3">AssetSync2.0 dashboard</th></tr>';
+echo '<tr>';
+echo '<th>Step</th>';
+echo '<th>What to open</th>';
+echo '<th>Action</th>';
+echo '</tr>';
+echo '<tr>';
+echo '<td>1</td>';
+echo '<td><strong>GLPI B Connections</strong><br><small>Add the client GLPI API details, then test them.</small></td>';
+echo '<td class="center"><a class="submit" href="' . $html(Menu::configUrl() . '#glpib-connections') . '">Open connections</a></td>';
+echo '</tr>';
+echo '<tr>';
+echo '<td>2</td>';
+echo '<td><strong>Entity Routes</strong><br><small>Choose which GLPI A entities and asset types sync to each GLPI B connection.</small></td>';
+echo '<td class="center"><a class="submit" href="' . $html(Menu::entitySyncRoutesUrl()) . '">Open entity routes</a></td>';
+echo '</tr>';
+echo '<tr>';
+echo '<td>3</td>';
+echo '<td><strong>Field Mapping</strong><br><small>Match GLPI A fields to GLPI B fields and choose the source of truth.</small></td>';
+echo '<td class="center"><a class="submit" href="' . $html(Menu::fieldMappingUrl()) . '">Open field mapping</a></td>';
+echo '</tr>';
+echo '<tr>';
+echo '<td>4</td>';
+echo '<td><strong>Sync / CRON</strong><br><small>Automatic action: <code>' . $html(AssetSyncCron::TASK_NAME) . '</code></small></td>';
+echo '<td class="center"><a class="submit" href="' . $html($glpiFrontUrl('crontask.php')) . '">Open automatic actions</a></td>';
+echo '</tr>';
+echo '</table>';
+
+echo '<table class="tab_cadre_fixe">';
+echo '<tr><th colspan="2">Quick setup checklist</th></tr>';
+echo '<tr><td>1. Add a GLPI B connection.</td><td>Use the connection form below.</td></tr>';
+echo '<tr><td>2. Test the connection.</td><td>Use the Test button on the saved connection row.</td></tr>';
+echo '<tr><td>3. Add entity routes.</td><td>Use Entity routes for the GLPI B connection.</td></tr>';
+echo '<tr><td>4. Map fields.</td><td>Use Field mappings for the GLPI B connection.</td></tr>';
+echo '<tr><td>5. Run sync.</td><td>Use GLPI automatic action <code>' . $html(AssetSyncCron::TASK_NAME) . '</code>.</td></tr>';
+echo '</table>';
+
+echo '<table class="tab_cadre_fixe" id="glpib-connections">';
 echo '<tr><th colspan="9">GLPI B connections</th></tr>';
 echo '<tr>';
 echo '<th>Name</th>';
