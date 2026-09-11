@@ -30,6 +30,44 @@ if (class_exists('Session') && method_exists('Session', 'checkRight')) {
 $message = null;
 $messageClass = 'info';
 $editRoute = null;
+$selectedConnectionId = trim((string) ($_POST['connection_id'] ?? $_GET['connection_id'] ?? ''));
+
+$urlWithQuery = static function (string $url, array $query): string {
+    return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($query);
+};
+
+$routePageUrl = static function (string $connectionId = '') use ($urlWithQuery): string {
+    if ($connectionId === '') {
+        return Menu::entitySyncRoutesUrl();
+    }
+
+    return $urlWithQuery(Menu::entitySyncRoutesUrl(), ['connection_id' => $connectionId]);
+};
+
+$connectionSetupUrl = static function (string $connectionId) use ($urlWithQuery): string {
+    return $urlWithQuery(Menu::configUrl(), ['id' => $connectionId]);
+};
+
+$redirectToConnectionSetup = static function (
+    string $connectionId,
+    string $redirectMessage,
+    string $redirectMessageClass
+) use ($connectionSetupUrl): void {
+    if ($connectionId === '' || !class_exists('Html') || !method_exists('Html', 'redirect')) {
+        return;
+    }
+
+    if (class_exists('Session') && method_exists('Session', 'addMessageAfterRedirect')) {
+        $messageType = defined('INFO') ? INFO : 0;
+        if ($redirectMessageClass === 'warning') {
+            $messageType = defined('WARNING') ? WARNING : $messageType;
+        }
+
+        Session::addMessageAfterRedirect($redirectMessage, false, $messageType);
+    }
+
+    Html::redirect($connectionSetupUrl($connectionId));
+};
 
 $requestMethod = (string) ($_SERVER['REQUEST_METHOD'] ?? 'GET');
 
@@ -39,10 +77,13 @@ if ($requestMethod === 'POST') {
     }
 
     if (isset($_POST['save'])) {
+        $routeConnectionId = $selectedConnectionId !== ''
+            ? $selectedConnectionId
+            : (string) ($_POST['glpi_b_connection_id'] ?? '');
         $route = EntitySyncRoute::fromInput([
             'id'                         => $_POST['id'] ?? '',
             'name'                       => $_POST['name'] ?? '',
-            'glpi_b_connection_id'       => $_POST['glpi_b_connection_id'] ?? '',
+            'glpi_b_connection_id'       => $routeConnectionId,
             'glpi_a_source_entity_id'    => $_POST['glpi_a_source_entity_id'] ?? '',
             'glpi_a_source_entity_name'  => $_POST['glpi_a_source_entity_name'] ?? '',
             'glpi_b_target_entity_id'    => $_POST['glpi_b_target_entity_id'] ?? '',
@@ -56,27 +97,56 @@ if ($requestMethod === 'POST') {
         $message = 'Entity sync route saved.';
         $messageClass = 'success';
         $editRoute = EntitySyncRoute::find($route['id']);
+        $redirectToConnectionSetup($selectedConnectionId, $message, $messageClass);
     }
 
     if (isset($_POST['edit'])) {
         $editRoute = EntitySyncRoute::find((string) ($_POST['id'] ?? ''));
+
+        if ($selectedConnectionId === '' && $editRoute !== null) {
+            $selectedConnectionId = $editRoute['glpi_b_connection_id'];
+        }
     }
 
     if (isset($_POST['delete'])) {
         EntitySyncRoute::delete((string) ($_POST['id'] ?? ''));
         $message = 'Entity sync route deleted.';
         $messageClass = 'success';
+        $redirectToConnectionSetup($selectedConnectionId, $message, $messageClass);
     }
 }
 
 $connections = GlpiBConnection::loadAll();
-$routes = EntitySyncRoute::loadAll();
+$selectedConnection = $selectedConnectionId !== '' ? GlpiBConnection::find($selectedConnectionId) : null;
+
+if ($selectedConnectionId !== '' && $selectedConnection === null) {
+    if ($message === null) {
+        $message = 'The selected GLPI B connection was not found.';
+    }
+    $messageClass = 'warning';
+    $selectedConnectionId = '';
+}
+
+$allRoutes = EntitySyncRoute::loadAll();
+$routes = [];
+foreach ($allRoutes as $savedRoute) {
+    if ($selectedConnectionId === '' || $savedRoute['glpi_b_connection_id'] === $selectedConnectionId) {
+        $routes[] = $savedRoute;
+    }
+}
+
 $assetTypes = FieldMapping::assetTypes();
-$conflicts = EntitySyncRoute::findConfigConflicts();
+$conflicts = [];
+foreach (EntitySyncRoute::findConfigConflicts() as $conflict) {
+    if ($selectedConnectionId === '' || $conflict['glpi_b_connection_id'] === $selectedConnectionId) {
+        $conflicts[] = $conflict;
+    }
+}
+
 $route = $editRoute ?? [
     'id'                         => '',
     'name'                       => '',
-    'glpi_b_connection_id'       => '',
+    'glpi_b_connection_id'       => $selectedConnectionId,
     'glpi_a_source_entity_id'    => '',
     'glpi_a_source_entity_name'  => '',
     'glpi_b_target_entity_id'    => '',
@@ -113,8 +183,8 @@ $assetTypeLabels = static function (array $selectedTypes) use ($assetTypes): str
     return implode(', ', $labels);
 };
 
-$routeLabel = static function (string $routeId) use ($routes): string {
-    foreach ($routes as $savedRoute) {
+$routeLabel = static function (string $routeId) use ($allRoutes): string {
+    foreach ($allRoutes as $savedRoute) {
         if ($savedRoute['id'] === $routeId) {
             return $savedRoute['name'] !== '' ? $savedRoute['name'] : $savedRoute['id'];
         }
@@ -151,7 +221,24 @@ $entityDropdown = static function (array $selectedRoute) use ($html): void {
 };
 
 echo '<div class="center">';
-echo '<h2>Entity Sync Routes</h2>';
+$pageTitle = 'Entity Sync Routes';
+if ($selectedConnection !== null) {
+    $selectedConnectionLabel = $selectedConnection['name'] !== ''
+        ? $selectedConnection['name']
+        : $selectedConnection['base_url'];
+    $pageTitle .= ' for ' . $selectedConnectionLabel;
+}
+
+echo '<h2>' . $html($pageTitle) . '</h2>';
+
+if ($selectedConnectionId !== '') {
+    echo '<p>';
+    echo '<a class="submit" href="' . $html($connectionSetupUrl($selectedConnectionId)) . '">Back to GLPI B connection setup</a> ';
+    echo '<a class="submit" href="' . $html($urlWithQuery(Menu::fieldMappingUrl(), [
+        'connection_id' => $selectedConnectionId,
+    ])) . '">Field mappings</a>';
+    echo '</p>';
+}
 
 if ($message !== null) {
     echo '<div class="' . $html($messageClass) . '">' . $html($message) . '</div>';
@@ -186,7 +273,7 @@ if ($conflicts !== []) {
 }
 
 echo '<table class="tab_cadre_fixe">';
-echo '<tr><th colspan="8">Saved routes</th></tr>';
+echo '<tr><th colspan="8">' . ($selectedConnectionId !== '' ? 'Saved routes for this connection' : 'Saved routes') . '</th></tr>';
 echo '<tr>';
 echo '<th>Name</th>';
 echo '<th>GLPI B connection</th>';
@@ -199,7 +286,9 @@ echo '<th>Actions</th>';
 echo '</tr>';
 
 if ($routes === []) {
-    echo '<tr><td colspan="8" class="center">No entity sync routes saved.</td></tr>';
+    echo '<tr><td colspan="8" class="center">No entity sync routes saved'
+        . ($selectedConnectionId !== '' ? ' for this GLPI B connection' : '')
+        . '.</td></tr>';
 }
 
 foreach ($routes as $savedRoute) {
@@ -219,8 +308,11 @@ foreach ($routes as $savedRoute) {
     echo '<td>' . ($savedRoute['include_child_entities'] ? 'Yes' : 'No') . '</td>';
     echo '<td>' . ($savedRoute['active'] ? 'Yes' : 'No') . '</td>';
     echo '<td class="center">';
-    echo '<form method="post" action="' . $html(Menu::entitySyncRoutesUrl()) . '" style="display:inline">';
+    echo '<form method="post" action="' . $html($routePageUrl($selectedConnectionId)) . '" style="display:inline">';
     echo '<input type="hidden" name="id" value="' . $html($savedRoute['id']) . '">';
+    if ($selectedConnectionId !== '') {
+        echo '<input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">';
+    }
     $csrfInput();
     echo '<button type="submit" name="edit" value="1" class="submit">Edit</button> ';
     echo '<button type="submit" name="delete" value="1" class="submit">Delete</button>';
@@ -247,8 +339,11 @@ if ($connections === []) {
     return;
 }
 
-echo '<form method="post" action="' . $html(Menu::entitySyncRoutesUrl()) . '">';
+echo '<form method="post" action="' . $html($routePageUrl($selectedConnectionId)) . '">';
 echo '<input type="hidden" name="id" value="' . $html($route['id']) . '">';
+if ($selectedConnectionId !== '') {
+    echo '<input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">';
+}
 echo '<table class="tab_cadre_fixe">';
 echo '<tr><th colspan="2">' . ($route['id'] !== '' ? 'Edit route' : 'Add route') . '</th></tr>';
 
@@ -259,14 +354,21 @@ echo '</tr>';
 
 echo '<tr>';
 echo '<td><label for="glpi_b_connection_id">GLPI B connection</label></td>';
-echo '<td><select id="glpi_b_connection_id" name="glpi_b_connection_id" required>';
-echo '<option value="">Select a connection</option>';
-foreach ($connections as $connection) {
-    $selected = $connection['id'] === $route['glpi_b_connection_id'] ? ' selected' : '';
-    echo '<option value="' . $html($connection['id']) . '"' . $selected . '>'
-        . $html($connectionLabels[$connection['id']]) . '</option>';
+echo '<td>';
+if ($selectedConnection !== null) {
+    echo $html($connectionLabels[$selectedConnectionId]);
+    echo '<input type="hidden" name="glpi_b_connection_id" value="' . $html($selectedConnectionId) . '">';
+} else {
+    echo '<select id="glpi_b_connection_id" name="glpi_b_connection_id" required>';
+    echo '<option value="">Select a connection</option>';
+    foreach ($connections as $connection) {
+        $selected = $connection['id'] === $route['glpi_b_connection_id'] ? ' selected' : '';
+        echo '<option value="' . $html($connection['id']) . '"' . $selected . '>'
+            . $html($connectionLabels[$connection['id']]) . '</option>';
+    }
+    echo '</select>';
 }
-echo '</select></td>';
+echo '</td>';
 echo '</tr>';
 
 echo '<tr>';
@@ -324,7 +426,7 @@ echo '<td colspan="2" class="center">';
 $csrfInput();
 echo '<button type="submit" name="save" value="1" class="submit">Save</button>';
 if ($route['id'] !== '') {
-    echo ' <a href="' . $html(Menu::entitySyncRoutesUrl()) . '" class="submit">Add new</a>';
+    echo ' <a href="' . $html($routePageUrl($selectedConnectionId)) . '" class="submit">Add new</a>';
 }
 echo '</td>';
 echo '</tr>';

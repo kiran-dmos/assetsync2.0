@@ -29,9 +29,8 @@ final class Menu
             'page'  => $page,
             'icon'  => 'ti ti-refresh',
             'links' => [
-                'config'           => $page,
-                'fieldmapping'     => self::fieldMappingUrl(),
-                'entitysyncroutes' => self::entitySyncRoutesUrl(),
+                'config'       => $page,
+                'fieldmapping' => self::fieldMappingUrl(),
             ],
         ];
     }

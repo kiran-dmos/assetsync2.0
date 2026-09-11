@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use GlpiPlugin\Assetsync20\Plugin;
 use GlpiPlugin\Assetsync20\Menu;
+use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\GlpiBConnection;
 
 if (!defined('GLPI_ROOT')) {
@@ -20,6 +21,11 @@ if (class_exists('Session') && method_exists('Session', 'checkRight')) {
 $message = null;
 $messageClass = 'info';
 $editConnection = null;
+$assetTypes = FieldMapping::assetTypes();
+
+$urlWithQuery = static function (string $url, array $query): string {
+    return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($query);
+};
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (class_exists('Session') && method_exists('Session', 'checkRight')) {
@@ -27,7 +33,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (isset($_POST['save'])) {
-        GlpiBConnection::save([
+        $connectionInput = GlpiBConnection::fromInput([
             'id'         => $_POST['id'] ?? '',
             'name'       => $_POST['name'] ?? '',
             'base_url'   => $_POST['base_url'] ?? '',
@@ -35,10 +41,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'user_token' => $_POST['user_token'] ?? '',
             'active'     => $_POST['active'] ?? '',
         ]);
+        GlpiBConnection::save($connectionInput);
 
         $message = 'GLPI B connection saved.';
         $messageClass = 'success';
-        $editConnection = GlpiBConnection::find((string) ($_POST['id'] ?? ''));
+        $editConnection = GlpiBConnection::find($connectionInput['id']);
     }
 
     if (isset($_POST['test'])) {
@@ -65,6 +72,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $message = 'GLPI B connection deleted.';
         $messageClass = 'success';
     }
+} elseif (isset($_GET['id'])) {
+    $editConnection = GlpiBConnection::find((string) ($_GET['id'] ?? ''));
 }
 
 $connections = GlpiBConnection::loadAll();
@@ -93,18 +102,18 @@ if ($message !== null) {
 }
 
 echo '<table class="tab_cadre_fixe">';
-echo '<tr><th colspan="7">GLPI B connections</th></tr>';
+echo '<tr><th colspan="9">GLPI B connections</th></tr>';
 echo '<tr>';
 echo '<th>Name</th>';
 echo '<th>Base URL</th>';
 echo '<th>Active</th>';
 echo '<th>Saved app token</th>';
 echo '<th>Saved user token</th>';
-echo '<th colspan="2">Actions</th>';
+echo '<th colspan="4">Actions</th>';
 echo '</tr>';
 
 if ($connections === []) {
-    echo '<tr><td colspan="7" class="center">No GLPI B connections saved.</td></tr>';
+    echo '<tr><td colspan="9" class="center">No GLPI B connections saved.</td></tr>';
 }
 
 foreach ($connections as $savedConnection) {
@@ -137,6 +146,16 @@ foreach ($connections as $savedConnection) {
     }
     echo '<button type="submit" name="test" value="1" class="submit">Test</button>';
     echo '</form>';
+    echo '</td>';
+    echo '<td class="center">';
+    echo '<a class="submit" href="' . $html($urlWithQuery(Menu::entitySyncRoutesUrl(), [
+        'connection_id' => $savedConnection['id'],
+    ])) . '">Entity routes</a>';
+    echo '</td>';
+    echo '<td class="center">';
+    echo '<a class="submit" href="' . $html($urlWithQuery(Menu::fieldMappingUrl(), [
+        'connection_id' => $savedConnection['id'],
+    ])) . '">Field mappings</a>';
     echo '</td>';
     echo '</tr>';
 }
@@ -201,6 +220,31 @@ echo '</td>';
 echo '</tr>';
 echo '</table>';
 echo '</form>';
+
+if ($connection['id'] !== '') {
+    $connectionLabel = $connection['name'] !== '' ? $connection['name'] : $connection['base_url'];
+    echo '<table class="tab_cadre_fixe">';
+    echo '<tr><th colspan="2">Setup for ' . $html($connectionLabel) . '</th></tr>';
+    echo '<tr>';
+    echo '<td>Entity routes</td>';
+    echo '<td><a class="submit" href="' . $html($urlWithQuery(Menu::entitySyncRoutesUrl(), [
+        'connection_id' => $connection['id'],
+    ])) . '">Manage entity routes</a></td>';
+    echo '</tr>';
+    echo '<tr>';
+    echo '<td>Field mappings</td>';
+    echo '<td>';
+    foreach ($assetTypes as $itemtype => $label) {
+        echo '<a class="submit" href="' . $html($urlWithQuery(Menu::fieldMappingUrl(), [
+            'connection_id' => $connection['id'],
+            'itemtype'      => $itemtype,
+        ])) . '">' . $html($label) . '</a> ';
+    }
+    echo '</td>';
+    echo '</tr>';
+    echo '</table>';
+}
+
 echo '</div>';
 
 if (class_exists('Html') && method_exists('Html', 'footer')) {

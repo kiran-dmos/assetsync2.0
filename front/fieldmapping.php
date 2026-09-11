@@ -26,6 +26,10 @@ $sourceOptions = FieldMapping::sourceOptions();
 $selectedConnectionId = trim((string) ($_POST['connection_id'] ?? $_GET['connection_id'] ?? ''));
 $selectedItemtype = (string) ($_POST['itemtype'] ?? $_GET['itemtype'] ?? 'Computer');
 
+$urlWithQuery = static function (string $url, array $query): string {
+    return $url . (str_contains($url, '?') ? '&' : '?') . http_build_query($query);
+};
+
 if (!array_key_exists($selectedItemtype, $assetTypes)) {
     $selectedItemtype = 'Computer';
 }
@@ -127,6 +131,12 @@ $fieldOptionLabel = static function (array $field): string {
 
 echo '<div class="center">';
 echo '<h2>Field Mapping</h2>';
+
+if ($selectedConnection !== null) {
+    echo '<p><a class="submit" href="' . $html($urlWithQuery(Menu::configUrl(), [
+        'id' => $selectedConnectionId,
+    ])) . '">Back to GLPI B connection setup</a></p>';
+}
 
 if ($message !== null) {
     echo '<div class="' . $html($messageClass) . '">' . $html($message) . '</div>';

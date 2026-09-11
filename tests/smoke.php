@@ -519,8 +519,12 @@ if (($menu['links']['fieldmapping'] ?? null) !== '/plugins/assetsync20/front/fie
     throw new RuntimeException('Field Mapping menu link is incorrect.');
 }
 
-if (($menu['links']['entitysyncroutes'] ?? null) !== '/plugins/assetsync20/front/entitysyncroutes.php') {
-    throw new RuntimeException('Entity Sync Routes menu link is incorrect.');
+if (array_key_exists('entitysyncroutes', $menu['links'] ?? [])) {
+    throw new RuntimeException('Entity Sync Routes should not be exposed as a top-level menu link.');
+}
+
+if (\GlpiPlugin\Assetsync20\Menu::entitySyncRoutesUrl() !== '/plugins/assetsync20/front/entitysyncroutes.php') {
+    throw new RuntimeException('Entity Sync Routes internal URL is incorrect.');
 }
 
 $installedValues = Config::getConfigurationValues('plugin:assetsync20');
