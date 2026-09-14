@@ -142,6 +142,7 @@ final class FakeDB
     public array $tables = [
         'glpi_entities' => [],
         'glpi_computers' => [],
+        'glpi_logs' => [],
     ];
 
     /** @var array<string,int> */
@@ -222,6 +223,11 @@ final class FakeDB
 
         if (isset($query['LIMIT'])) {
             $filtered = array_slice($filtered, 0, (int) $query['LIMIT']);
+        }
+
+        if (isset($query['SELECT']) && is_array($query['SELECT'])) {
+            $selected = array_flip(array_map('strval', $query['SELECT']));
+            $filtered = array_map(static fn (array $row): array => array_intersect_key($row, $selected), $filtered);
         }
 
         return new FakeDBResult($filtered);
@@ -371,10 +377,146 @@ class Computer
     }
 }
 
+class Search
+{
+    public static function getOptions($itemtype): array
+    {
+        if (PluginFieldsContainer::$options === []) {
+            return [];
+        }
+
+        return [
+            1 => ['name' => 'Name', 'field' => 'name', 'table' => 'glpi_computers', 'uid' => 'Computer.name'],
+            5 => ['name' => 'Serial number', 'field' => 'serial', 'table' => 'glpi_computers', 'uid' => 'Computer.serial'],
+            6 => ['name' => 'Inventory number', 'field' => 'otherserial', 'table' => 'glpi_computers', 'uid' => 'Computer.otherserial'],
+            16 => ['name' => 'Comments', 'field' => 'comment', 'table' => 'glpi_computers', 'uid' => 'Computer.comment'],
+        ] + PluginFieldsContainer::$options;
+    }
+}
+
+function getItemTypeForTable($table): string
+{
+    return 'PluginFieldsComputerdmosasset';
+}
+
+function getTableForItemType($class): string
+{
+    return 'glpi_plugin_fields_computerdmosassets';
+}
+
+class PluginFieldsContainer
+{
+    public static array $options = [];
+
+    public static function getAddSearchOptions($itemtype): array
+    {
+        return self::$options;
+    }
+}
+
+class PluginFieldsField
+{
+    public static array $definitions = [
+        1 => [
+            'id' => 1,
+            'name' => 'namefield',
+            'type' => 'text',
+            'is_active' => 1,
+            'plugin_fields_containers_id' => 1,
+            'is_readonly' => 0,
+        ],
+    ];
+    public array $fields = [];
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$definitions[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+}
+
+class PluginFieldsComputerdmosasset
+{
+    /** @var array<int,array<string,mixed>> */
+    public static array $rows = [];
+    private static int $nextId = 1;
+    public array $fields = [];
+
+    public static function getType(): string
+    {
+        return self::class;
+    }
+
+    public function getFromDBByCrit(array $criteria): bool
+    {
+        $itemsId = (int) ($criteria['items_id'] ?? 0);
+        $itemtype = (string) ($criteria['itemtype'] ?? '');
+        $row = self::$rows[$itemsId] ?? null;
+
+        if ($row === null || (string) ($row['itemtype'] ?? '') !== $itemtype) {
+            $this->fields = [];
+            return false;
+        }
+
+        $this->fields = $row;
+
+        return true;
+    }
+
+    public function update(array $input): bool
+    {
+        $itemsId = (int) ($input['items_id'] ?? 0);
+        if ($itemsId <= 0) {
+            foreach (self::$rows as $savedItemsId => $row) {
+                if ((int) ($row['id'] ?? 0) === (int) ($input['id'] ?? 0)) {
+                    $itemsId = $savedItemsId;
+                    break;
+                }
+            }
+        }
+
+        if ($itemsId <= 0) {
+            return false;
+        }
+
+        self::$rows[$itemsId] = array_merge(self::$rows[$itemsId] ?? [], $input);
+        $this->fields = self::$rows[$itemsId];
+        \GlpiPlugin\Assetsync20\AssetChangeHook::onUpdate($this);
+
+        return true;
+    }
+
+    public function add(array $input): bool
+    {
+        $itemsId = (int) ($input['items_id'] ?? 0);
+        if ($itemsId <= 0) {
+            return false;
+        }
+
+        $input['id'] = self::$nextId++;
+        self::$rows[$itemsId] = $input;
+        $this->fields = self::$rows[$itemsId];
+        \GlpiPlugin\Assetsync20\AssetChangeHook::onAdd($this);
+
+        return true;
+    }
+}
+
 final class FakeGlpiBClient
 {
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $records = [];
+    /** @var array<string,array<int,array<string,mixed>>> */
+    public array $customRecords = [];
+    /** @var array<string,string> */
+    public array $customHistoryOptionIds = [];
+    /** @var array<string,array<int,array<string,string>>> */
+    public array $customHistoryDates = [];
+    /** @var array<string,array<int,list<array<string,mixed>>>> */
+    public array $customHistoryLogs = [];
+    /** @var list<array{itemtype:string,items_id:int,option_ids:list<string>,itemtype_links:list<string>}> */
+    public array $customHistoryRequests = [];
     private int $nextId = 1000;
 
     /**
@@ -465,6 +607,103 @@ final class FakeGlpiBClient
 
     /**
      * @param array{id:string} $connection
+     * @param list<string> $keys
+     * @param array<string,mixed> $changes
+     * @param array<string,string> $expectedTypes
+     * @return array{success:bool,message:string,item:array<string,mixed>,history_option_ids:array<string,string>,history_refs:array<string,array{option_id:string,itemtype_link:string}>,transient:bool}
+     */
+    public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
+    {
+        $recordKey = $this->key($connection, $itemtype);
+        $values = [];
+        $historyOptionIds = array_intersect_key($this->customHistoryOptionIds, array_flip($keys));
+        $historyRefs = [];
+
+        if ($itemsId > 0) {
+            $this->customRecords[$recordKey][$itemsId] ??= [];
+            foreach ($changes as $key => $value) {
+                $this->customRecords[$recordKey][$itemsId][(string) $key] = $value;
+            }
+
+            foreach ($keys as $key) {
+                $key = (string) $key;
+                $type = (string) ($expectedTypes[$key] ?? 'text');
+                $values[$key] = $this->customRecords[$recordKey][$itemsId][$key] ?? \GlpiPlugin\Assetsync20\FieldsText::missingValue($type);
+            }
+        }
+
+        foreach ($historyOptionIds as $key => $optionId) {
+            $historyRefs[$key] = [
+                'option_id' => $optionId,
+                'itemtype_link' => 'PluginFieldsComputerdmosasset',
+            ];
+        }
+
+        return [
+            'success' => true,
+            'message' => 'custom values loaded',
+            'item' => $values,
+            'history_option_ids' => $historyOptionIds,
+            'history_refs' => $historyRefs,
+            'transient' => false,
+        ];
+    }
+
+    /**
+     * @param array{id:string} $connection
+     * @param array<string,array{option_id?:int|string,itemtype_link?:string}> $historyRefs
+     * @return array{success:bool,message:string,dates:array<string,string>,transient:bool}
+     */
+    public function customHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs): array
+    {
+        $recordKey = $this->key($connection, $itemtype);
+        $optionIds = [];
+        $itemtypeLinks = [];
+        $dates = [];
+        foreach ($historyRefs as $key => $ref) {
+            $optionId = (string) ($ref['option_id'] ?? '');
+            $itemtypeLink = (string) ($ref['itemtype_link'] ?? '');
+            if ($optionId !== '') {
+                $optionIds[] = $optionId;
+            }
+            if ($itemtypeLink !== '') {
+                $itemtypeLinks[] = $itemtypeLink;
+            }
+        }
+
+        if (($this->customHistoryLogs[$recordKey][$itemsId] ?? []) !== []) {
+            $filter = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'latestHistoryDatesByRef');
+            $filter->setAccessible(true);
+            $dates = $filter->invoke(null, $this->customHistoryLogs[$recordKey][$itemsId], $historyRefs);
+        } else {
+            foreach ($historyRefs as $key => $ref) {
+                $optionId = (string) ($ref['option_id'] ?? '');
+                if (array_key_exists($key, $this->customHistoryDates[$recordKey][$itemsId] ?? [])) {
+                    $dates[$key] = $this->customHistoryDates[$recordKey][$itemsId][$key];
+                    continue;
+                }
+                if ($optionId !== '' && array_key_exists($optionId, $this->customHistoryDates[$recordKey][$itemsId] ?? [])) {
+                    $dates[$key] = $this->customHistoryDates[$recordKey][$itemsId][$optionId];
+                }
+            }
+        }
+        $this->customHistoryRequests[] = [
+            'itemtype' => $itemtype,
+            'items_id' => $itemsId,
+            'option_ids' => $optionIds,
+            'itemtype_links' => $itemtypeLinks,
+        ];
+
+        return [
+            'success' => true,
+            'message' => 'custom history loaded',
+            'dates' => $dates,
+            'transient' => false,
+        ];
+    }
+
+    /**
+     * @param array{id:string} $connection
      */
     private function key(array $connection, string $itemtype): string
     {
@@ -472,10 +711,145 @@ final class FakeGlpiBClient
     }
 }
 
+function configureCustomNameMapping(string $source, string $customKey, string $remoteOptionId): array
+{
+    $remoteFields = [[
+        'key' => $customKey,
+        'id' => $remoteOptionId,
+        'uid' => $customKey,
+        'label' => 'DMOS Name',
+    ]];
+
+    \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+        $customKey => [
+            'glpi_b_field_key' => $customKey,
+            'glpi_b_field_uid' => $customKey,
+            'glpi_b_field_label' => 'DMOS Name',
+            'source_of_truth' => $source,
+        ],
+    ], $remoteFields);
+
+    return $remoteFields;
+}
+
+function seedLinkedCustomComputer(
+    FakeDB $DB,
+    FakeGlpiBClient $remoteClient,
+    int $assetId,
+    int $remoteId,
+    string $customKey,
+    string $customOptionId,
+    string $remoteOptionId,
+    string $localValue,
+    ?string $localHistoryDate,
+    string $remoteValue,
+    ?string $remoteHistoryDate,
+    bool $localHistoryUsesParentOption = true
+): void {
+    static $logId = 80000;
+
+    $DB->insert('glpi_computers', [
+        'id' => $assetId,
+        'entities_id' => 20,
+        'is_deleted' => 0,
+        'name' => 'Custom test ' . $assetId,
+        'serial' => 'SER-' . $assetId,
+        'otherserial' => '',
+        'comment' => '',
+        'date_mod' => '2026-09-14 06:05:43',
+    ]);
+    PluginFieldsComputerdmosasset::$rows[$assetId] = [
+        'id' => 1000 + $assetId,
+        'items_id' => $assetId,
+        'itemtype' => 'Computer',
+        'plugin_fields_containers_id' => 1,
+        'namefield' => $localValue,
+    ];
+
+    if ($localHistoryDate !== null) {
+        $DB->insert('glpi_logs', [
+            'id' => ++$logId,
+            'itemtype' => 'Computer',
+            'items_id' => $assetId,
+            'itemtype_link' => $localHistoryUsesParentOption ? '' : 'PluginFieldsComputerdmosasset',
+            'linked_action' => $localHistoryUsesParentOption ? 0 : 18,
+            'date_mod' => $localHistoryDate,
+            'id_search_option' => $localHistoryUsesParentOption ? (int) $customOptionId : 0,
+            'old_value' => 'old custom value',
+            'new_value' => $localValue,
+        ]);
+    }
+
+    $remoteClient->records['production:Computer'][$remoteId] = [
+        'id' => $remoteId,
+        'entities_id' => 200,
+        'is_deleted' => 0,
+        'name' => 'Custom remote test ' . $remoteId,
+        'serial' => 'SER-' . $assetId,
+        'date_mod' => '2026-09-14 06:05:49',
+    ];
+    $remoteClient->customRecords['production:Computer'][$remoteId] = [$customKey => $remoteValue];
+    $remoteClient->customHistoryDates['production:Computer'][$remoteId] = $remoteHistoryDate === null
+        ? []
+        : [$remoteOptionId => $remoteHistoryDate];
+
+    \GlpiPlugin\Assetsync20\AssetSyncLink::save([
+        'itemtype' => 'Computer',
+        'items_id' => $assetId,
+        'glpi_b_connection_id' => 'production',
+        'route_id' => 'prod-child',
+        'remote_items_id' => $remoteId,
+        'status' => \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED,
+        'last_payload_hash' => '',
+        'last_payload_date' => '2026-09-14 06:05:43',
+    ]);
+}
+
+function hasPendingProductionQueue(FakeDB $DB, int $assetId): bool
+{
+    foreach ($DB->tables[\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE] ?? [] as $queueRow) {
+        if (
+            (int) ($queueRow['items_id'] ?? 0) === $assetId
+            && (string) ($queueRow['glpi_b_connection_id'] ?? '') === 'production'
+            && (string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function cronManualForceRequestedFor(array $post, array $argv): bool
+{
+    $previousPost = $_POST;
+    $hadArgv = array_key_exists('argv', $_SERVER);
+    $previousArgv = $_SERVER['argv'] ?? null;
+
+    $_POST = $post;
+    $_SERVER['argv'] = $argv;
+
+    try {
+        $method = new ReflectionMethod(\GlpiPlugin\Assetsync20\AssetSyncCron::class, 'manualForceRequested');
+        $method->setAccessible(true);
+
+        return (bool) $method->invoke(null);
+    } finally {
+        $_POST = $previousPost;
+        if ($hadArgv) {
+            $_SERVER['argv'] = $previousArgv;
+        } else {
+            unset($_SERVER['argv']);
+        }
+    }
+}
+
 $DB = new FakeDB();
+$PLUGIN_HOOKS = [];
 
 require_once dirname(__DIR__) . '/setup.php';
 require_once dirname(__DIR__) . '/hook.php';
+plugin_init_assetsync20();
 
 $metadata = plugin_version_assetsync20();
 
@@ -494,6 +868,11 @@ foreach ($expectations as $key => $expected) {
             var_export($metadata[$key] ?? null, true)
         ));
     }
+}
+
+$updateHook = $PLUGIN_HOOKS['item_update']['assetsync20']['Computer'] ?? null;
+if ($updateHook !== [\GlpiPlugin\Assetsync20\AssetChangeHook::class, 'onUpdate']) {
+    throw new RuntimeException('Computer update hook should enqueue changed GLPI A assets.');
 }
 
 if (!plugin_assetsync20_check_prerequisites()) {
@@ -574,6 +953,22 @@ if (
     || ($registeredTask['options']['state'] ?? null) !== CronTask::STATE_WAITING
 ) {
     throw new RuntimeException('Asset sync automatic action registration is incorrect.');
+}
+
+if (cronManualForceRequestedFor(['execute' => '63'], ['front/cron.php'])) {
+    throw new RuntimeException('Automatic action list Execute should not be treated as a manual force run.');
+}
+
+if (!cronManualForceRequestedFor(['execute' => \GlpiPlugin\Assetsync20\AssetSyncCron::TASK_NAME], ['front/cron.php'])) {
+    throw new RuntimeException('Automatic action form Execute should be treated as a manual force run.');
+}
+
+if (!cronManualForceRequestedFor([], ['front/cron.php', '--force', \GlpiPlugin\Assetsync20\AssetSyncCron::TASK_NAME])) {
+    throw new RuntimeException('CLI cron --force should be treated as a manual force run for the named asset sync task.');
+}
+
+if (cronManualForceRequestedFor([], ['front/cron.php', \GlpiPlugin\Assetsync20\AssetSyncCron::TASK_NAME, '--force'])) {
+    throw new RuntimeException('CLI cron arguments should only force tasks after the --force option has been parsed.');
 }
 
 $connections = \GlpiPlugin\Assetsync20\GlpiBConnection::loadAll();
@@ -1137,6 +1532,33 @@ if ($syncService->queueAssetIfNeeded('Computer', 501, 'production') !== false) {
     throw new RuntimeException('Queueing an already synced asset with the same payload should be idempotent.');
 }
 
+$DB->update('glpi_computers', [
+    'name' => 'Local Laptop Hooked',
+    'date_mod' => '2026-01-01 00:10:00',
+], ['id' => 501]);
+$hookedComputer = new Computer();
+$hookedComputer->fields = ['id' => 501, 'entities_id' => 20];
+\GlpiPlugin\Assetsync20\AssetChangeHook::onUpdate($hookedComputer);
+$hookQueued = false;
+foreach ($DB->tables[\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE] ?? [] as $queueRow) {
+    if (
+        (string) ($queueRow['itemtype'] ?? '') === 'Computer'
+        && (int) ($queueRow['items_id'] ?? 0) === 501
+        && (string) ($queueRow['glpi_b_connection_id'] ?? '') === 'production'
+        && (string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING
+    ) {
+        $hookQueued = true;
+        break;
+    }
+}
+if (!$hookQueued) {
+    throw new RuntimeException('GLPI A asset update hook should enqueue changed linked assets.');
+}
+$syncService->processQueue(10);
+if (($remoteClient->records['production:Computer'][$productionRecord['id']]['name'] ?? '') !== 'Local Laptop Hooked') {
+    throw new RuntimeException('GLPI A asset update hook should push changed A values to GLPI B.');
+}
+
 $productionLink = $linksByConnection['production'];
 $productionRemoteId = (int) $productionLink['remote_items_id'];
 $remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Remote Laptop';
@@ -1176,6 +1598,23 @@ if (($localComputer['name'] ?? '') !== 'Remote Laptop') {
     throw new RuntimeException('GLPI B source of truth should pull remote values into the linked GLPI A asset.');
 }
 
+$remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Remote Laptop Recent';
+
+if ($syncService->queueAssetIfNeeded('Computer', 501, 'production')) {
+    throw new RuntimeException('Scheduled runs should keep the inbound hourly recheck cooldown for recently synced links.');
+}
+
+if (!$syncService->queueAssetIfNeeded('Computer', 501, 'production', true)) {
+    throw new RuntimeException('Manual force runs should bypass the inbound hourly recheck cooldown for recently synced links.');
+}
+
+$syncService->processQueue(10);
+$localComputer = $DB->firstRow('glpi_computers', ['id' => 501]);
+
+if (($localComputer['name'] ?? '') !== 'Remote Laptop Recent') {
+    throw new RuntimeException('Manual force runs should pull recent GLPI B changes without waiting for the hourly recheck.');
+}
+
 $DB->update(
     \GlpiPlugin\Assetsync20\AssetSyncLink::TABLE,
     ['last_sync_at' => '2000-01-01 00:00:00'],
@@ -1192,6 +1631,132 @@ $localComputer = $DB->firstRow('glpi_computers', ['id' => 501]);
 
 if (($localComputer['name'] ?? '') !== 'Remote Laptop Rechecked') {
     throw new RuntimeException('Periodic remote recheck should pull changed GLPI B values.');
+}
+
+$forceMappings = \GlpiPlugin\Assetsync20\FieldMapping::syncMappings('production', 'Computer');
+$forceRoute = \GlpiPlugin\Assetsync20\EntitySyncRoute::find('prod-child');
+if ($forceRoute === null) {
+    throw new RuntimeException('Manual force smoke test route could not be found.');
+}
+
+foreach ([506, 507] as $forceAssetId) {
+    $DB->insert('glpi_computers', [
+        'id' => $forceAssetId,
+        'entities_id' => 20,
+        'is_deleted' => 0,
+        'name' => 'Manual Local ' . $forceAssetId,
+        'serial' => 'SER-' . $forceAssetId,
+        'otherserial' => '',
+        'comment' => '',
+        'date_mod' => '2026-09-14 09:11:03',
+    ]);
+
+    $remoteId = 2500 + $forceAssetId;
+    $remoteClient->records['production:Computer'][$remoteId] = [
+        'id' => $remoteId,
+        'entities_id' => 200,
+        'is_deleted' => 0,
+        'name' => 'Manual Remote ' . $forceAssetId,
+        'serial' => 'SER-' . $forceAssetId,
+        'date_mod' => '2026-09-14 09:15:54',
+    ];
+
+    $forceAsset = $DB->firstRow('glpi_computers', ['id' => $forceAssetId]);
+    if ($forceAsset === null) {
+        throw new RuntimeException('Manual force smoke test asset could not be loaded.');
+    }
+
+    \GlpiPlugin\Assetsync20\AssetSyncLink::save([
+        'itemtype' => 'Computer',
+        'items_id' => $forceAssetId,
+        'glpi_b_connection_id' => 'production',
+        'route_id' => 'prod-child',
+        'remote_items_id' => $remoteId,
+        'status' => \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED,
+        'last_payload_hash' => $syncService->payloadHash($forceAsset, $forceRoute, $forceMappings),
+        'last_payload_date' => '2026-09-14 09:11:03',
+    ]);
+}
+
+$syncService->run(1, 25, true);
+$firstForcedAsset = $DB->firstRow('glpi_computers', ['id' => 506]);
+$secondForcedAsset = $DB->firstRow('glpi_computers', ['id' => 507]);
+
+if (($firstForcedAsset['name'] ?? '') !== 'Manual Remote 506') {
+    throw new RuntimeException('Manual force backfill should process the first scanned recently synced inbound asset.');
+}
+
+if (($secondForcedAsset['name'] ?? '') !== 'Manual Local 507' || hasPendingProductionQueue($DB, 507)) {
+    throw new RuntimeException('Manual force backfill should not exceed the configured batch limit.');
+}
+
+$syncService->run(1, 25, true);
+$secondForcedAsset = $DB->firstRow('glpi_computers', ['id' => 507]);
+
+if (($secondForcedAsset['name'] ?? '') !== 'Manual Remote 507') {
+    throw new RuntimeException('Manual force backfill should pick up the next inbound asset on a later bounded run.');
+}
+
+\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    'name' => [
+        'glpi_b_field_key' => 'Computer.name',
+        'source_of_truth' => 'glpi_a',
+    ],
+    'serial' => [
+        'glpi_b_field_key' => 'Computer.serial',
+        'source_of_truth' => 'glpi_a',
+    ],
+], [
+    [
+        'key' => 'Computer.name',
+        'id' => '1',
+        'uid' => 'Computer.name',
+        'label' => 'Name',
+    ],
+    [
+        'key' => 'Computer.serial',
+        'id' => '5',
+        'uid' => 'Computer.serial',
+        'label' => 'Serial number',
+    ],
+]);
+
+$DB->insert('glpi_computers', [
+    'id' => 508,
+    'entities_id' => 20,
+    'is_deleted' => 0,
+    'name' => 'One Way Local',
+    'serial' => 'SER-508',
+    'otherserial' => '',
+    'comment' => '',
+    'date_mod' => '2026-09-14 09:11:03',
+]);
+$remoteClient->records['production:Computer'][2508] = [
+    'id' => 2508,
+    'entities_id' => 200,
+    'is_deleted' => 0,
+    'name' => 'One Way Remote',
+    'serial' => 'SER-508',
+    'date_mod' => '2026-09-14 09:15:54',
+];
+$oneWayMappings = \GlpiPlugin\Assetsync20\FieldMapping::syncMappings('production', 'Computer');
+$oneWayAsset = $DB->firstRow('glpi_computers', ['id' => 508]);
+if ($oneWayAsset === null) {
+    throw new RuntimeException('Manual force one-way smoke test asset could not be loaded.');
+}
+\GlpiPlugin\Assetsync20\AssetSyncLink::save([
+    'itemtype' => 'Computer',
+    'items_id' => 508,
+    'glpi_b_connection_id' => 'production',
+    'route_id' => 'prod-child',
+    'remote_items_id' => 2508,
+    'status' => \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED,
+    'last_payload_hash' => $syncService->payloadHash($oneWayAsset, $forceRoute, $oneWayMappings),
+    'last_payload_date' => '2026-09-14 09:11:03',
+]);
+
+if ($syncService->queueAssetIfNeeded('Computer', 508, 'production', true)) {
+    throw new RuntimeException('Manual force runs should not queue unchanged one-way GLPI A mappings.');
 }
 
 $remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Conflicting Remote Laptop';
@@ -1353,6 +1918,133 @@ if (\GlpiPlugin\Assetsync20\EntitySyncRoute::find('prod-child-conflict') !== nul
 
 if (\GlpiPlugin\Assetsync20\GlpiBConnection::find('staging') !== null) {
     throw new RuntimeException('Deleted GLPI B connection should not be loaded.');
+}
+
+$customKey = 'Computer.PluginFieldsComputerdmosasset.namefield';
+$customOptionId = '884776';
+$remoteCustomOptionId = '76666';
+$DB->tables['glpi_plugin_fields_containers'] = [[
+    'id' => 108,
+    'name' => 'dmosasset',
+    'itemtypes' => '["Computer"]',
+    'is_active' => 1,
+]];
+$DB->tables['glpi_plugin_fields_computerdmosassets'] = [];
+PluginFieldsContainer::$options = [];
+$PLUGIN_HOOKS = [];
+plugin_init_assetsync20();
+$fallbackCustomUpdateHook = $PLUGIN_HOOKS['item_update']['assetsync20']['PluginFieldsComputerdmosasset'] ?? null;
+if ($fallbackCustomUpdateHook !== [\GlpiPlugin\Assetsync20\AssetChangeHook::class, 'onUpdate']) {
+    throw new RuntimeException('Fields-plugin container table fallback should register custom row update hooks during plugin init.');
+}
+PluginFieldsContainer::$options = [
+    (int) $customOptionId => [
+        'name' => 'DMOS Name',
+        'field' => 'namefield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'text',
+        'pfields_fields_id' => 1,
+        'plugin_fields_containers_id' => 1,
+    ],
+];
+$PLUGIN_HOOKS = [];
+plugin_init_assetsync20();
+$customUpdateHook = $PLUGIN_HOOKS['item_update']['assetsync20']['PluginFieldsComputerdmosasset'] ?? null;
+if ($customUpdateHook !== [\GlpiPlugin\Assetsync20\AssetChangeHook::class, 'onUpdate']) {
+    throw new RuntimeException('Fields-plugin row update hook should enqueue changed GLPI A custom values.');
+}
+$remoteClient->customHistoryOptionIds[$customKey] = $remoteCustomOptionId;
+
+configureCustomNameMapping('both', $customKey, $remoteCustomOptionId);
+seedLinkedCustomComputer($DB, $remoteClient, 601, 2601, $customKey, $customOptionId, $remoteCustomOptionId, 'AssetSync Both A test', '2026-09-14 08:15:30', 'Kiran PC 06 Test 1', '2026-09-14 08:15:35');
+$DB->insert('glpi_logs', [
+    'id' => 81001,
+    'itemtype' => 'Computer',
+    'items_id' => 601,
+    'itemtype_link' => 'PluginFieldsComputerdmosasset',
+    'linked_action' => 18,
+    'date_mod' => '2026-09-14 08:15:39',
+    'id_search_option' => 0,
+    'old_value' => 'AssetSync Both A test',
+    'new_value' => 'Kiran PC 06 Test 1',
+]);
+$historyRequestsBefore = count($remoteClient->customHistoryRequests);
+if (!$syncService->queueAssetIfNeeded('Computer', 601, 'production')) {
+    throw new RuntimeException('Stale parent date_mod custom A edit should queue from payload hash.');
+}
+$syncService->processQueue(10);
+if (($remoteClient->customRecords['production:Computer'][2601][$customKey] ?? null) !== 'AssetSync Both A test') {
+    throw new RuntimeException('Custom Both should push newer GLPI A history value even when GLPI B parent date_mod is newer.');
+}
+if (count($remoteClient->customHistoryRequests) <= $historyRequestsBefore) {
+    throw new RuntimeException('Custom Both should acquire GLPI B history through the remote client.');
+}
+$lastHistoryRequest = end($remoteClient->customHistoryRequests);
+if (($lastHistoryRequest['option_ids'] ?? []) !== [$remoteCustomOptionId]) {
+    throw new RuntimeException('Custom Both history lookup should request the mapped remote search option id.');
+}
+if (($lastHistoryRequest['itemtype_links'] ?? []) !== ['PluginFieldsComputerdmosasset']) {
+    throw new RuntimeException('Custom Both history lookup should request the generated remote Fields container class.');
+}
+
+seedLinkedCustomComputer($DB, $remoteClient, 602, 2602, $customKey, $customOptionId, $remoteCustomOptionId, 'Kiran PC 06 Test 1', '2026-09-14 08:15:30', 'AssetSync Both B test', '2026-09-14 08:15:00');
+$remoteClient->customHistoryLogs['production:Computer'][2602] = [
+    ['id' => 92001, 'id_search_option' => (int) $remoteCustomOptionId, 'itemtype_link' => '', 'date_mod' => '2026-09-14 08:15:00'],
+    ['id' => 92002, 'id_search_option' => 0, 'itemtype_link' => 'PluginFieldsComputerdmosasset', 'date_mod' => '2026-09-14 08:16:21'],
+];
+if (!$syncService->queueAssetIfNeeded('Computer', 602, 'production')) {
+    throw new RuntimeException('Stale parent date_mod custom B edit should queue when the linked asset is rechecked.');
+}
+$syncService->processQueue(10);
+if ((PluginFieldsComputerdmosasset::$rows[602]['namefield'] ?? null) !== 'AssetSync Both B test') {
+    throw new RuntimeException('Custom Both should pull newer GLPI B history value even when both parent date_mod values are stale.');
+}
+if (hasPendingProductionQueue($DB, 602)) {
+    throw new RuntimeException('Sync-written local custom value should not feed back into a new queued job.');
+}
+
+seedLinkedCustomComputer($DB, $remoteClient, 603, 2603, $customKey, $customOptionId, $remoteCustomOptionId, '', '2026-09-14 08:20:00', 'filled', '2026-09-14 08:10:00');
+if (!$syncService->queueAssetIfNeeded('Computer', 603, 'production')) {
+    throw new RuntimeException('Newer custom blank should queue for Both conflict resolution.');
+}
+$syncService->processQueue(10);
+if (!array_key_exists($customKey, $remoteClient->customRecords['production:Computer'][2603]) || $remoteClient->customRecords['production:Computer'][2603][$customKey] !== '') {
+    throw new RuntimeException('Custom Both should treat a newer blank as a real value.');
+}
+
+seedLinkedCustomComputer($DB, $remoteClient, 604, 2604, $customKey, $customOptionId, $remoteCustomOptionId, 'Local without reliable history', '2026-09-14 08:30:00', 'Remote without reliable history', null, false);
+if (!$syncService->queueAssetIfNeeded('Computer', 604, 'production')) {
+    throw new RuntimeException('Differing custom values without reliable history should still queue for blocking.');
+}
+$syncService->processQueue(10);
+$customBlockedLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 604, 'production');
+if (($customBlockedLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT) {
+    throw new RuntimeException('Differing custom Both values without parent-style history should block instead of guessing parent timestamps.');
+}
+if (($remoteClient->customRecords['production:Computer'][2604][$customKey] ?? null) !== 'Remote without reliable history') {
+    throw new RuntimeException('Blocked custom history conflict should not write GLPI B.');
+}
+
+configureCustomNameMapping('glpi_a', $customKey, $remoteCustomOptionId);
+seedLinkedCustomComputer($DB, $remoteClient, 605, 2605, $customKey, $customOptionId, $remoteCustomOptionId, 'One-way custom A value', null, 'Old one-way B value', null);
+$historyRequestsBefore = count($remoteClient->customHistoryRequests);
+if (!$syncService->queueAssetIfNeeded('Computer', 605, 'production')) {
+    throw new RuntimeException('One-way custom A source should queue without requiring history.');
+}
+$syncService->processQueue(10);
+if (($remoteClient->customRecords['production:Computer'][2605][$customKey] ?? null) !== 'One-way custom A value') {
+    throw new RuntimeException('One-way custom A source should not fail when history is unavailable.');
+}
+if (count($remoteClient->customHistoryRequests) !== $historyRequestsBefore) {
+    throw new RuntimeException('One-way custom mappings should not request conflict history.');
+}
+
+PluginFieldsComputerdmosasset::$rows[605]['namefield'] = 'One-way custom hook value';
+$customRow = new PluginFieldsComputerdmosasset();
+$customRow->fields = PluginFieldsComputerdmosasset::$rows[605];
+\GlpiPlugin\Assetsync20\AssetChangeHook::onUpdate($customRow);
+if (!hasPendingProductionQueue($DB, 605)) {
+    throw new RuntimeException('Fields-plugin update hook should queue parent assets after custom GLPI A edits.');
 }
 
 Config::$values = [

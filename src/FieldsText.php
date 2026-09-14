@@ -124,7 +124,7 @@ final class FieldsText
         return $type === self::TYPE_YESNO ? 0 : '';
     }
 
-    public static function metadataFromOption(string $itemtype, array $option): array
+    public static function metadataFromOption(string $itemtype, array $option, $optionId = null): array
     {
         $key = self::key($itemtype, $option);
         if ($key === '') {
@@ -142,6 +142,7 @@ final class FieldsText
             'type' => self::validate($option),
             'field_id' => self::positiveInt($option['pfields_fields_id'] ?? 0),
             'container_id' => self::positiveInt($option['plugin_fields_containers_id'] ?? 0),
+            'search_option_id' => self::positiveInt($option['id'] ?? $optionId ?? 0),
             'writable' => empty($option['is_readonly']),
         ];
     }
@@ -192,14 +193,14 @@ final class FieldsText
         }
 
         $metadata = [];
-        foreach (self::localOptions($itemtype) as $option) {
+        foreach (self::localOptions($itemtype) as $optionId => $option) {
             if (!is_array($option)) {
                 continue;
             }
 
             $key = self::key($itemtype, $option);
             if ($key !== '' && isset($wanted[$key])) {
-                $metadata[$key] = self::metadataFromOption($itemtype, $option);
+                $metadata[$key] = self::metadataFromOption($itemtype, $option, $optionId);
             }
         }
 
@@ -220,6 +221,23 @@ final class FieldsText
         }
 
         return $types;
+    }
+
+    /**
+     * @return array<string,array{option_id:string,itemtype_link:string}>
+     */
+    public static function customHistoryRefs(string $itemtype, array $keys): array
+    {
+        $refs = [];
+
+        foreach (self::customMetadata($itemtype, $keys) as $key => $metadata) {
+            $refs[$key] = [
+                'option_id' => self::positiveInt($metadata['search_option_id'] ?? 0) > 0 ? (string) $metadata['search_option_id'] : '',
+                'itemtype_link' => (string) ($metadata['class'] ?? ''),
+            ];
+        }
+
+        return $refs;
     }
 
     public static function localValues(string $itemtype, int $itemsId, array $keys): array
@@ -247,9 +265,9 @@ final class FieldsText
     {
         foreach ($values as $key => $value) {
             $metadata = null;
-            foreach (self::localOptions($itemtype) as $option) {
+            foreach (self::localOptions($itemtype) as $optionId => $option) {
                 if (self::key($itemtype, $option) === $key) {
-                    $metadata = self::metadataFromOption($itemtype, $option);
+                    $metadata = self::metadataFromOption($itemtype, $option, $optionId);
                     $definition = new \PluginFieldsField();
                     if (!$definition->getFromDB((int) $metadata['field_id'])) {
                         return false;

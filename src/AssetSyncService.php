@@ -29,17 +29,17 @@ final class AssetSyncService
         }
     }
 
-    public function run(int $batchSize = 10, int $timeLimitSeconds = 25): int
+    public function run(int $batchSize = 10, int $timeLimitSeconds = 25, bool $forceInboundRecheck = false): int
     {
         $batchSize = max(1, $batchSize);
         $deadline = time() + max(1, $timeLimitSeconds);
-        $enqueued = $this->enqueueBackfill($batchSize, $deadline);
+        $enqueued = $this->enqueueBackfill($batchSize, $deadline, $forceInboundRecheck);
         $processed = $this->processQueue($batchSize, $deadline);
 
         return $enqueued + $processed;
     }
 
-    public function enqueueBackfill(int $limit = 10, ?int $deadline = null): int
+    public function enqueueBackfill(int $limit = 10, ?int $deadline = null, bool $forceInboundRecheck = false): int
     {
         $db = $this->db();
         if ($db === null || !method_exists($db, 'request')) {
@@ -86,7 +86,7 @@ final class AssetSyncService
                     }
 
                     $cursor = $itemsId;
-                    if ($this->queueAssetIfNeeded($itemtype, $itemsId, $route['glpi_b_connection_id'])) {
+                    if ($this->queueAssetIfNeeded($itemtype, $itemsId, $route['glpi_b_connection_id'], $forceInboundRecheck)) {
                         $enqueued++;
                     }
                 }
@@ -99,7 +99,7 @@ final class AssetSyncService
         return $enqueued;
     }
 
-    public function queueAssetIfNeeded(string $itemtype, int $itemsId, string $connectionId): bool
+    public function queueAssetIfNeeded(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck = false): bool
     {
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
@@ -138,8 +138,14 @@ final class AssetSyncService
 
         if ($link !== null && (string) ($link['route_id'] ?? '') === $route['id'] && (string) ($link['last_payload_hash'] ?? '') === $payloadHash) {
             $linkStatus = (string) ($link['status'] ?? '');
-            if ($linkStatus === AssetSyncLink::STATUS_SYNCED && !$this->linkedAssetNeedsRemoteCheck($link, $mappings)) {
-                return false;
+            if ($linkStatus === AssetSyncLink::STATUS_SYNCED) {
+                if ($forceInboundRecheck) {
+                    if (!$this->hasInboundMapping($mappings)) {
+                        return false;
+                    }
+                } elseif (!$this->linkedAssetNeedsRemoteCheck($link, $mappings)) {
+                    return false;
+                }
             }
 
             if (str_starts_with($linkStatus, 'blocked_')) {
@@ -346,8 +352,21 @@ final class AssetSyncService
         }
         // Native creation already applied its mappings; custom rows are written separately.
         $comparisonMappings = $createdRemote ? array_values(array_filter($mappings, static fn (array $mapping): bool => FieldsText::isCustom($mapping['glpi_b_field']) || FieldsText::isCustom($mapping['glpi_a_field']))) : $mappings;
+        $localCustomDateMods = [];
+        $remoteCustomDateMods = [];
         try {
-            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes);
+            $customHistoryNeeds = $this->customHistoryNeeds($asset, $remoteItem ?? [], $comparisonMappings, $customTypes);
+            if ($customHistoryNeeds['local'] !== []) {
+                $localCustomDateMods = $this->localCustomHistoryDates($itemtype, $itemsId, $customHistoryNeeds['local']);
+            }
+            if ($customHistoryNeeds['remote'] !== []) {
+                $remoteHistoryRefs = $this->historyRefs($customResult['history_refs'] ?? [], $customHistoryNeeds['remote']);
+                $remoteCustomDateMods = $this->remoteCustomHistoryDates($connection, $itemtype, $remoteItemsId, $remoteHistoryRefs, $job, $route['id'], $attempts);
+                if ($remoteCustomDateMods === null) {
+                    return;
+                }
+            }
+            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes, $localCustomDateMods, $remoteCustomDateMods);
         } catch (\Throwable $error) {
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
             return;
@@ -358,7 +377,7 @@ final class AssetSyncService
                 $job,
                 $route['id'],
                 AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT,
-                'Both sides have different values without a newer valid asset timestamp for: ' . implode(', ', $changes['conflicts']) . '.',
+                'Both sides have different values without a newer valid asset or custom history timestamp for: ' . implode(', ', $changes['conflicts']) . '.',
                 $remoteItemsId
             );
             return;
@@ -382,9 +401,14 @@ final class AssetSyncService
             }
         }
 
-        if ($changes['local'] !== [] && !$this->updateLocalAsset($itemtype, $itemsId, $changes['local'])) {
-            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, 'GLPI A rejected the local field update.', $remoteItemsId);
-            return;
+        if ($changes['local'] !== []) {
+            $updatedLocal = AssetChangeHook::withoutQueue(
+                fn (): bool => $this->updateLocalAsset($itemtype, $itemsId, $changes['local'])
+            );
+            if (!$updatedLocal) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, 'GLPI A rejected the local field update.', $remoteItemsId);
+                return;
+            }
         }
 
         $finalAsset = array_merge($asset, $changes['local']);
@@ -720,9 +744,11 @@ final class AssetSyncService
      * @param array<string,mixed> $route
      * @param list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}> $mappings
      * @param array<string,string> $fieldTypes
+     * @param array<string,string> $localCustomDateMods
+     * @param array<string,string> $remoteCustomDateMods
      * @return array{remote:array<string,mixed>,local:array<string,mixed>,conflicts:list<string>}
      */
-    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings, array $fieldTypes = []): array
+    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings, array $fieldTypes = [], array $localCustomDateMods = [], array $remoteCustomDateMods = []): array
     {
         $remoteChanges = [];
         $localChanges = [];
@@ -732,8 +758,6 @@ final class AssetSyncService
         if ($targetEntityId !== '' && $this->value($remoteItem['entities_id'] ?? '') !== $targetEntityId) {
             $remoteChanges['entities_id'] = (int) $targetEntityId;
         }
-
-        $newerDateModSource = $this->newerDateModSource($asset, $remoteItem);
 
         foreach ($mappings as $mapping) {
             $fieldType = $this->mappingFieldType($mapping, $fieldTypes);
@@ -758,6 +782,8 @@ final class AssetSyncService
                 continue;
             }
 
+            $newerDateModSource = $this->newerMappingDateModSource($asset, $remoteItem, $mapping, $localCustomDateMods, $remoteCustomDateMods);
+
             if ($newerDateModSource === 'glpi_a') {
                 $remoteChanges[$mapping['glpi_b_field']] = $this->changeValue($localValue, $fieldType);
                 continue;
@@ -781,43 +807,277 @@ final class AssetSyncService
     /**
      * @param array<string,mixed> $asset
      * @param array<string,mixed> $remoteItem
+     * @param list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}> $mappings
+     * @param array<string,string> $fieldTypes
+     * @return array{local:list<string>,remote:list<string>}
      */
-    private function newerDateModSource(array $asset, array $remoteItem): string
+    private function customHistoryNeeds(array $asset, array $remoteItem, array $mappings, array $fieldTypes): array
     {
-        $localDateMod = trim((string) ($asset['date_mod'] ?? ''));
-        $remoteDateMod = trim((string) ($remoteItem['date_mod'] ?? ''));
+        $localKeys = [];
+        $remoteKeys = [];
 
+        foreach ($mappings as $mapping) {
+            if ($mapping['source_of_truth'] !== 'both') {
+                continue;
+            }
+
+            if (!FieldsText::isCustom($mapping['glpi_a_field']) && !FieldsText::isCustom($mapping['glpi_b_field'])) {
+                continue;
+            }
+
+            $fieldType = $this->mappingFieldType($mapping, $fieldTypes);
+            $localValue = $this->mappedValue($asset[$mapping['glpi_a_field']] ?? '', $fieldType);
+            $remoteValue = $this->mappedValue($remoteItem[$mapping['glpi_b_field']] ?? '', $fieldType);
+            if ($localValue === $remoteValue) {
+                continue;
+            }
+
+            if (FieldsText::isCustom($mapping['glpi_a_field'])) {
+                $localKeys[$mapping['glpi_a_field']] = true;
+            }
+
+            if (FieldsText::isCustom($mapping['glpi_b_field'])) {
+                $remoteKeys[$mapping['glpi_b_field']] = true;
+            }
+        }
+
+        return [
+            'local' => array_keys($localKeys),
+            'remote' => array_keys($remoteKeys),
+        ];
+    }
+
+    /**
+     * @param list<string> $keys
+     * @return array<string,string>
+     */
+    private function localCustomHistoryDates(string $itemtype, int $itemsId, array $keys): array
+    {
+        $db = $this->db();
+        if ($db === null || !method_exists($db, 'request') || $keys === []) {
+            return [];
+        }
+
+        $historyRefs = FieldsText::customHistoryRefs($itemtype, $keys);
+        if ($historyRefs === []) {
+            return [];
+        }
+
+        $rows = $db->request([
+            'SELECT' => ['id', 'date_mod', 'id_search_option', 'itemtype_link'],
+            'FROM' => 'glpi_logs',
+            'WHERE' => [
+                'itemtype' => $itemtype,
+                'items_id' => $itemsId,
+            ],
+            'ORDER' => 'id DESC',
+            'LIMIT' => max(20, count($historyRefs) * 20),
+        ]);
+
+        return $this->latestHistoryDatesByRef($rows, $historyRefs);
+    }
+
+    /**
+     * @param array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool} $connection
+     * @param array<string,array{option_id:string,itemtype_link:string}> $historyRefs
+     * @param array<string,mixed> $job
+     * @return array<string,string>|null
+     */
+    private function remoteCustomHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs, array $job, string $routeId, int $attempts): ?array
+    {
+        if ($historyRefs === []) {
+            return [];
+        }
+
+        $historyResult = $this->callRemote('customHistoryDates', [$connection, $itemtype, $itemsId, $historyRefs]);
+        if (!$this->remoteSucceeded($historyResult)) {
+            $this->handleRemoteFailure($job, $routeId, $historyResult, $attempts, $itemsId);
+            return null;
+        }
+
+        return $this->stringMap($historyResult['dates'] ?? []);
+    }
+
+    /**
+     * @param mixed $value
+     * @param list<string> $keys
+     * @return array<string,array{option_id:string,itemtype_link:string}>
+     */
+    private function historyRefs($value, array $keys): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $refs = [];
+        foreach ($keys as $key) {
+            $ref = is_array($value[$key] ?? null) ? $value[$key] : [];
+            $optionId = $this->cleanHistoryOptionId($ref['option_id'] ?? '');
+            $itemtypeLink = is_scalar($ref['itemtype_link'] ?? null) ? trim((string) $ref['itemtype_link']) : '';
+            if ($optionId === '' && $itemtypeLink === '') {
+                continue;
+            }
+
+            $refs[$key] = [
+                'option_id' => $optionId,
+                'itemtype_link' => $itemtypeLink,
+            ];
+        }
+
+        return $refs;
+    }
+
+    /**
+     * @param iterable<array<string,mixed>> $rows
+     * @param array<string,array{option_id:string,itemtype_link:string}> $historyRefs
+     * @return array<string,string>
+     */
+    private function latestHistoryDatesByRef(iterable $rows, array $historyRefs): array
+    {
+        $latestRows = [];
+
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $logId = (int) ($row['id'] ?? 0);
+            if ($logId <= 0) {
+                continue;
+            }
+
+            $optionId = $this->cleanHistoryOptionId($row['id_search_option'] ?? 0);
+            $itemtypeLink = is_scalar($row['itemtype_link'] ?? null) ? trim((string) $row['itemtype_link']) : '';
+            if ($optionId === '' && $itemtypeLink === '') {
+                continue;
+            }
+
+            foreach ($historyRefs as $key => $ref) {
+                $matchesOption = ($ref['option_id'] ?? '') !== '' && $optionId === $ref['option_id'];
+                $matchesItemtypeLink = ($ref['itemtype_link'] ?? '') !== '' && $itemtypeLink === $ref['itemtype_link'];
+                if (!$matchesOption && !$matchesItemtypeLink) {
+                    continue;
+                }
+
+                if (!isset($latestRows[$key]) || $logId > $latestRows[$key]['id']) {
+                    $latestRows[$key] = [
+                        'id' => $logId,
+                        'date_mod' => is_scalar($row['date_mod'] ?? null) ? trim((string) $row['date_mod']) : '',
+                    ];
+                }
+            }
+        }
+
+        $dates = [];
+        foreach ($latestRows as $key => $row) {
+            $dates[$key] = $row['date_mod'];
+        }
+
+        return $dates;
+    }
+
+    /**
+     * @param array<string,mixed> $asset
+     * @param array<string,mixed> $remoteItem
+     * @param array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string} $mapping
+     * @param array<string,string> $localCustomDateMods
+     * @param array<string,string> $remoteCustomDateMods
+     */
+    private function newerMappingDateModSource(array $asset, array $remoteItem, array $mapping, array $localCustomDateMods, array $remoteCustomDateMods): string
+    {
+        $localKey = $mapping['glpi_a_field'];
+        $remoteKey = $mapping['glpi_b_field'];
+        $localDateMod = FieldsText::isCustom($localKey)
+            ? $this->effectiveCustomDateMod((string) ($asset['date_mod'] ?? ''), (string) ($localCustomDateMods[$localKey] ?? ''))
+            : trim((string) ($asset['date_mod'] ?? ''));
+        $remoteDateMod = FieldsText::isCustom($remoteKey)
+            ? $this->effectiveCustomDateMod((string) ($remoteItem['date_mod'] ?? ''), (string) ($remoteCustomDateMods[$remoteKey] ?? ''))
+            : trim((string) ($remoteItem['date_mod'] ?? ''));
+
+        return $this->newerDateModValueSource($localDateMod, $remoteDateMod);
+    }
+
+    private function effectiveCustomDateMod(string $parentDateMod, string $customHistoryDateMod): string
+    {
+        $customHistoryTimestamp = $this->validDateModTimestamp(trim($customHistoryDateMod));
+        if ($customHistoryTimestamp === null) {
+            return '';
+        }
+
+        $parentDateMod = trim($parentDateMod);
+        $parentTimestamp = $this->validDateModTimestamp($parentDateMod);
+        if ($parentTimestamp !== null && $parentTimestamp > $customHistoryTimestamp) {
+            return $parentDateMod;
+        }
+
+        return trim($customHistoryDateMod);
+    }
+
+    private function newerDateModValueSource(string $localDateMod, string $remoteDateMod): string
+    {
         if ($localDateMod === '' || $remoteDateMod === '') {
             return '';
         }
 
-        $localDate = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $localDateMod);
-        $localErrors = \DateTimeImmutable::getLastErrors();
-        $localHasErrors = is_array($localErrors) && ((int) $localErrors['warning_count'] > 0 || (int) $localErrors['error_count'] > 0);
+        $localTimestamp = $this->validDateModTimestamp($localDateMod);
+        $remoteTimestamp = $this->validDateModTimestamp($remoteDateMod);
 
-        $remoteDate = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $remoteDateMod);
-        $remoteErrors = \DateTimeImmutable::getLastErrors();
-        $remoteHasErrors = is_array($remoteErrors) && ((int) $remoteErrors['warning_count'] > 0 || (int) $remoteErrors['error_count'] > 0);
-
-        if (
-            $localDate === false
-            || $remoteDate === false
-            || $localHasErrors
-            || $remoteHasErrors
-            || $localDate->format('Y-m-d H:i:s') !== $localDateMod
-            || $remoteDate->format('Y-m-d H:i:s') !== $remoteDateMod
-        ) {
+        if ($localTimestamp === null || $remoteTimestamp === null) {
             return '';
         }
-
-        $localTimestamp = $localDate->getTimestamp();
-        $remoteTimestamp = $remoteDate->getTimestamp();
 
         if ($localTimestamp === $remoteTimestamp) {
             return '';
         }
 
         return $localTimestamp > $remoteTimestamp ? 'glpi_a' : 'glpi_b';
+    }
+
+    private function validDateModTimestamp(string $dateMod): ?int
+    {
+        if ($dateMod === '') {
+            return null;
+        }
+
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $dateMod);
+        $errors = \DateTimeImmutable::getLastErrors();
+        $hasErrors = is_array($errors) && ((int) $errors['warning_count'] > 0 || (int) $errors['error_count'] > 0);
+
+        if ($date === false || $hasErrors || $date->format('Y-m-d H:i:s') !== $dateMod) {
+            return null;
+        }
+
+        return $date->getTimestamp();
+    }
+
+    private function cleanHistoryOptionId($value): string
+    {
+        if (!is_scalar($value)) {
+            return '';
+        }
+
+        $value = trim((string) $value);
+
+        return $value !== '' && ctype_digit($value) && (int) $value > 0 ? $value : '';
+    }
+
+    /**
+     * @return array<string,string>
+     */
+    private function stringMap($value): array
+    {
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $strings = [];
+        foreach ($value as $key => $text) {
+            if (is_scalar($key) && is_scalar($text)) {
+                $strings[(string) $key] = (string) $text;
+            }
+        }
+
+        return $strings;
     }
 
     /**

@@ -8,6 +8,7 @@ final class GlpiBConnection
 {
     private const CONTEXT = 'plugin:assetsync20';
     private const CONNECTIONS_KEY = 'glpib_connections';
+    private const CUSTOM_HISTORY_RANGE = '0-20';
 
     private const OLD_KEYS = [
         'glpib_name'       => '',
@@ -499,7 +500,7 @@ final class GlpiBConnection
     {
         $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
         if ($keys === []) {
-            return ['success' => true, 'item' => []];
+            return ['success' => true, 'item' => [], 'history_option_ids' => [], 'history_refs' => []];
         }
 
         return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes): array {
@@ -510,10 +511,12 @@ final class GlpiBConnection
             }
 
             $containers = [];
+            $historyOptionIds = [];
+            $historyRefs = [];
             foreach ($keys as $key) {
                 $descriptor = FieldsText::descriptor($itemtype, $key);
                 $metadata = null;
-                foreach ($options['body'] as $option) {
+                foreach ($options['body'] as $optionId => $option) {
                     if (!is_array($option)) {
                         continue;
                     }
@@ -522,7 +525,7 @@ final class GlpiBConnection
                         continue;
                     }
 
-                    $candidate = FieldsText::metadataFromOption($itemtype, $option);
+                    $candidate = FieldsText::metadataFromOption($itemtype, $option, $optionId);
                     if ($candidate['key'] === $key) {
                         $metadata = $candidate;
                         break;
@@ -548,7 +551,14 @@ final class GlpiBConnection
                 if (array_key_exists($key, $changes) && !$metadata['writable']) {
                     throw new \RuntimeException('The remote Fields-plugin field is read-only: ' . $key);
                 }
+                if ($metadata['search_option_id'] > 0) {
+                    $historyOptionIds[$key] = (string) $metadata['search_option_id'];
+                }
                 $class = $metadata['class'];
+                $historyRefs[$key] = [
+                    'option_id' => (string) ($historyOptionIds[$key] ?? ''),
+                    'itemtype_link' => $class,
+                ];
                 $containers[$class]['id'] = $metadata['container_id'];
                 $containers[$class]['fields'][$key] = [
                     'column' => $metadata['field'],
@@ -625,7 +635,69 @@ final class GlpiBConnection
                 }
             }
 
-            return ['success' => true, 'item' => $values];
+            return ['success' => true, 'item' => $values, 'history_option_ids' => $historyOptionIds, 'history_refs' => $historyRefs];
+        });
+    }
+
+    /**
+     * Read bounded GLPI history rows for custom Fields search-option and container refs.
+     *
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param array<string,array{option_id?:int|string,itemtype_link?:string}> $historyRefs
+     * @return array{success:bool,message:string,dates:array<string,string>,transient:bool}
+     */
+    public static function customHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs): array
+    {
+        $historyRefs = self::cleanHistoryRefs($historyRefs);
+        if ($itemsId <= 0 || $historyRefs === []) {
+            return [
+                'success' => true,
+                'message' => 'No GLPI B custom history needed.',
+                'dates' => [],
+                'transient' => false,
+            ];
+        }
+
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $historyRefs): array {
+            $response = self::request(
+                'GET',
+                self::apiUrlWithQuery($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId . '/Log', [
+                    'range' => self::CUSTOM_HISTORY_RANGE,
+                    'sort' => 'id',
+                    'order' => 'DESC',
+                    'get_hateoas' => 0,
+                ]),
+                [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ]
+            );
+
+            if (!$response['success']) {
+                return [
+                    'success' => false,
+                    'message' => $response['message'],
+                    'dates' => [],
+                    'transient' => $response['transient'],
+                ];
+            }
+
+            $logs = $response['body'] ?? null;
+            if (!is_array($logs)) {
+                return [
+                    'success' => true,
+                    'message' => 'GLPI B did not expose item history for this asset.',
+                    'dates' => [],
+                    'transient' => false,
+                ];
+            }
+
+            return [
+                'success' => true,
+                'message' => 'GLPI B custom history loaded.',
+                'dates' => self::latestHistoryDatesByRef($logs, $historyRefs),
+                'transient' => false,
+            ];
         });
     }
 
@@ -686,6 +758,90 @@ final class GlpiBConnection
         }
 
         return rtrim($baseUrl, '/');
+    }
+
+    /**
+     * @param array<string,array{option_id?:int|string,itemtype_link?:string}> $historyRefs
+     * @return array<string,array{option_id:string,itemtype_link:string}>
+     */
+    private static function cleanHistoryRefs(array $historyRefs): array
+    {
+        $clean = [];
+
+        foreach ($historyRefs as $key => $ref) {
+            if (!is_scalar($key) || !is_array($ref)) {
+                continue;
+            }
+
+            $optionId = self::cleanHistoryOptionId($ref['option_id'] ?? '');
+            $itemtypeLink = is_scalar($ref['itemtype_link'] ?? null) ? trim((string) $ref['itemtype_link']) : '';
+            if ($optionId === '' && $itemtypeLink === '') {
+                continue;
+            }
+
+            $clean[(string) $key] = [
+                'option_id' => $optionId,
+                'itemtype_link' => $itemtypeLink,
+            ];
+        }
+
+        return $clean;
+    }
+
+    /**
+     * @param array<string|int,mixed> $logs
+     * @param array<string,array{option_id:string,itemtype_link:string}> $historyRefs
+     * @return array<string,string>
+     */
+    private static function latestHistoryDatesByRef(array $logs, array $historyRefs): array
+    {
+        $latestRows = [];
+
+        foreach ($logs as $log) {
+            if (!is_array($log)) {
+                continue;
+            }
+
+            $optionId = self::cleanHistoryOptionId($log['id_search_option'] ?? 0);
+            $logId = self::cleanRemoteId($log['id'] ?? 0);
+            $itemtypeLink = is_scalar($log['itemtype_link'] ?? null) ? trim((string) $log['itemtype_link']) : '';
+            if (($optionId === '' && $itemtypeLink === '') || $logId <= 0) {
+                continue;
+            }
+
+            foreach ($historyRefs as $key => $ref) {
+                $matchesOption = $ref['option_id'] !== '' && $optionId === $ref['option_id'];
+                $matchesItemtypeLink = $ref['itemtype_link'] !== '' && $itemtypeLink === $ref['itemtype_link'];
+                if (!$matchesOption && !$matchesItemtypeLink) {
+                    continue;
+                }
+
+                if (!isset($latestRows[$key]) || $logId > $latestRows[$key]['id']) {
+                    $latestRows[$key] = [
+                        'id' => $logId,
+                        'date_mod' => is_scalar($log['date_mod'] ?? null) ? trim((string) $log['date_mod']) : '',
+                    ];
+                }
+            }
+        }
+
+        $dates = [];
+        foreach ($latestRows as $key => $row) {
+            $dates[$key] = $row['date_mod'];
+        }
+
+        return $dates;
+    }
+
+    private static function cleanHistoryOptionId($value): string
+    {
+        if (!is_scalar($value)) {
+            return '';
+        }
+
+        $value = trim((string) $value);
+
+        return $value !== '' && ctype_digit($value) && (int) $value > 0 ? $value : '';
     }
 
     private static function apiUrl(string $baseUrl, string $endpoint): string

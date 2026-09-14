@@ -29,7 +29,7 @@ final class AssetSyncCron
     public static function cronassetsync20_sync(\CronTask $task): int
     {
         $batchSize = self::batchSize($task);
-        $count = (new AssetSyncService())->run($batchSize, self::TIME_LIMIT_SECONDS);
+        $count = (new AssetSyncService())->run($batchSize, self::TIME_LIMIT_SECONDS, self::manualForceRequested());
 
         if (method_exists($task, 'addVolume')) {
             $task->addVolume($count);
@@ -66,5 +66,47 @@ final class AssetSyncCron
         }
 
         return min(self::MAX_BATCH_SIZE, $value);
+    }
+
+    private static function manualForceRequested(): bool
+    {
+        return self::taskFormForceRequested() || self::cliTaskForceRequested();
+    }
+
+    private static function taskFormForceRequested(): bool
+    {
+        $execute = $_POST['execute'] ?? null;
+
+        return is_scalar($execute) && !is_numeric($execute) && (string) $execute === self::TASK_NAME;
+    }
+
+    private static function cliTaskForceRequested(): bool
+    {
+        if (PHP_SAPI !== 'cli' || !isset($_SERVER['argv']) || !is_array($_SERVER['argv'])) {
+            return false;
+        }
+
+        $force = false;
+        foreach (array_slice($_SERVER['argv'], 1) as $argument) {
+            if (!is_scalar($argument)) {
+                continue;
+            }
+
+            $argument = (string) $argument;
+            if ($argument === '--force') {
+                $force = true;
+                continue;
+            }
+
+            if (is_numeric($argument)) {
+                return false;
+            }
+
+            if ($argument === self::TASK_NAME) {
+                return $force;
+            }
+        }
+
+        return false;
     }
 }

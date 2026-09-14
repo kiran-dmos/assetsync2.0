@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 use GlpiPlugin\Assetsync20\Plugin;
 use GlpiPlugin\Assetsync20\Menu;
+use GlpiPlugin\Assetsync20\AssetChangeHook;
+use GlpiPlugin\Assetsync20\FieldMapping;
 
 /**
  * GLPI bootstrap for the assetsync2.0 plugin.
@@ -25,6 +27,28 @@ function plugin_init_assetsync20(): void
     $PLUGIN_HOOKS['menu_toadd'][Plugin::KEY] = [
         'config' => Menu::class,
     ];
+
+    foreach (array_keys(FieldMapping::assetTypes()) as $itemtype) {
+        $PLUGIN_HOOKS['item_add'][Plugin::KEY][$itemtype] = [
+            AssetChangeHook::class,
+            'onAdd',
+        ];
+        $PLUGIN_HOOKS['item_update'][Plugin::KEY][$itemtype] = [
+            AssetChangeHook::class,
+            'onUpdate',
+        ];
+
+        foreach (AssetChangeHook::customHookItemtypesFor($itemtype) as $customItemtype) {
+            $PLUGIN_HOOKS['item_add'][Plugin::KEY][$customItemtype] = [
+                AssetChangeHook::class,
+                'onAdd',
+            ];
+            $PLUGIN_HOOKS['item_update'][Plugin::KEY][$customItemtype] = [
+                AssetChangeHook::class,
+                'onUpdate',
+            ];
+        }
+    }
 }
 
 function plugin_version_assetsync20(): array
