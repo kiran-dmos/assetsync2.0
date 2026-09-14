@@ -358,7 +358,7 @@ final class AssetSyncService
                 $job,
                 $route['id'],
                 AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT,
-                'Both sides have different non-blank values for: ' . implode(', ', $changes['conflicts']) . '.',
+                'Both sides have different values without a newer valid asset timestamp for: ' . implode(', ', $changes['conflicts']) . '.',
                 $remoteItemsId
             );
             return;
@@ -733,6 +733,8 @@ final class AssetSyncService
             $remoteChanges['entities_id'] = (int) $targetEntityId;
         }
 
+        $newerDateModSource = $this->newerDateModSource($asset, $remoteItem);
+
         foreach ($mappings as $mapping) {
             $fieldType = $this->mappingFieldType($mapping, $fieldTypes);
             $localValue = $this->mappedValue($asset[$mapping['glpi_a_field']] ?? '', $fieldType);
@@ -752,19 +754,21 @@ final class AssetSyncService
                 continue;
             }
 
-            if ($this->isBlank($localValue) && !$this->isBlank($remoteValue)) {
-                $localChanges[$mapping['glpi_a_field']] = $this->changeValue($remoteValue, $fieldType);
+            if ($localValue === $remoteValue) {
                 continue;
             }
 
-            if (!$this->isBlank($localValue) && $this->isBlank($remoteValue)) {
+            if ($newerDateModSource === 'glpi_a') {
                 $remoteChanges[$mapping['glpi_b_field']] = $this->changeValue($localValue, $fieldType);
                 continue;
             }
 
-            if (!$this->isBlank($localValue) && !$this->isBlank($remoteValue) && $localValue !== $remoteValue) {
-                $conflicts[] = $mapping['glpi_a_field'];
+            if ($newerDateModSource === 'glpi_b') {
+                $localChanges[$mapping['glpi_a_field']] = $this->changeValue($remoteValue, $fieldType);
+                continue;
             }
+
+            $conflicts[] = $mapping['glpi_a_field'];
         }
 
         return [
@@ -772,6 +776,48 @@ final class AssetSyncService
             'local' => $localChanges,
             'conflicts' => $conflicts,
         ];
+    }
+
+    /**
+     * @param array<string,mixed> $asset
+     * @param array<string,mixed> $remoteItem
+     */
+    private function newerDateModSource(array $asset, array $remoteItem): string
+    {
+        $localDateMod = trim((string) ($asset['date_mod'] ?? ''));
+        $remoteDateMod = trim((string) ($remoteItem['date_mod'] ?? ''));
+
+        if ($localDateMod === '' || $remoteDateMod === '') {
+            return '';
+        }
+
+        $localDate = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $localDateMod);
+        $localErrors = \DateTimeImmutable::getLastErrors();
+        $localHasErrors = is_array($localErrors) && ((int) $localErrors['warning_count'] > 0 || (int) $localErrors['error_count'] > 0);
+
+        $remoteDate = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $remoteDateMod);
+        $remoteErrors = \DateTimeImmutable::getLastErrors();
+        $remoteHasErrors = is_array($remoteErrors) && ((int) $remoteErrors['warning_count'] > 0 || (int) $remoteErrors['error_count'] > 0);
+
+        if (
+            $localDate === false
+            || $remoteDate === false
+            || $localHasErrors
+            || $remoteHasErrors
+            || $localDate->format('Y-m-d H:i:s') !== $localDateMod
+            || $remoteDate->format('Y-m-d H:i:s') !== $remoteDateMod
+        ) {
+            return '';
+        }
+
+        $localTimestamp = $localDate->getTimestamp();
+        $remoteTimestamp = $remoteDate->getTimestamp();
+
+        if ($localTimestamp === $remoteTimestamp) {
+            return '';
+        }
+
+        return $localTimestamp > $remoteTimestamp ? 'glpi_a' : 'glpi_b';
     }
 
     /**

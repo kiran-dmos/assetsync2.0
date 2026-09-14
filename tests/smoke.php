@@ -425,7 +425,10 @@ final class FakeGlpiBClient
     public function createItem(array $connection, string $itemtype, array $input): array
     {
         $id = $this->nextId++;
-        $this->records[$this->key($connection, $itemtype)][$id] = array_merge($input, ['id' => $id]);
+        $record = $input;
+        $record['id'] = $id;
+        $record['date_mod'] = $record['date_mod'] ?? '2026-01-01 00:00:00';
+        $this->records[$this->key($connection, $itemtype)][$id] = $record;
 
         return [
             'success' => true,
@@ -1192,6 +1195,7 @@ if (($localComputer['name'] ?? '') !== 'Remote Laptop Rechecked') {
 }
 
 $remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Conflicting Remote Laptop';
+$remoteClient->records['production:Computer'][$productionRemoteId]['date_mod'] = '2026-01-02 00:00:00';
 
 \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
     'name' => [
@@ -1223,18 +1227,18 @@ if (!$syncService->queueAssetIfNeeded('Computer', 501, 'production')) {
 
 $syncService->processQueue(10);
 $localComputer = $DB->firstRow('glpi_computers', ['id' => 501]);
-$blockedLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 501, 'production');
+$latestWinsLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 501, 'production');
 
-if (($localComputer['name'] ?? '') !== 'Remote Laptop Rechecked') {
-    throw new RuntimeException('Both source conflict should not change the local field.');
+if (($localComputer['name'] ?? '') !== 'Conflicting Remote Laptop') {
+    throw new RuntimeException('Both source should pull a newer GLPI B value into GLPI A.');
 }
 
 if (($remoteClient->records['production:Computer'][$productionRemoteId]['name'] ?? '') !== 'Conflicting Remote Laptop') {
-    throw new RuntimeException('Both source conflict should not change the remote field.');
+    throw new RuntimeException('Both source should keep the newer GLPI B value unchanged.');
 }
 
-if (($blockedLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT) {
-    throw new RuntimeException('Both source conflict should block the link state.');
+if (($latestWinsLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED) {
+    throw new RuntimeException('Both source latest-update-wins should sync the link state.');
 }
 
 \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
