@@ -49,8 +49,13 @@ final class FieldMapping
             $glpiBField = self::safeRemoteSyncField($mapping);
 
             if ($glpiAField === '' || $glpiBField === '') {
+                if (FieldsText::isCustom($glpiBField)) {
+                    throw new \RuntimeException('The local field for the custom mapping could not be resolved: ' . $mapping['glpi_a_field_key']);
+                }
                 continue;
             }
+
+            self::validateCustomMapping($itemtype, $glpiAField, $glpiBField);
 
             $mappings[] = [
                 'glpi_a_field'    => $glpiAField,
@@ -60,6 +65,44 @@ final class FieldMapping
         }
 
         return $mappings;
+    }
+
+    /**
+     * @param list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}> $mappings
+     * @return array<string,string>
+     */
+    public static function expectedCustomTypes(string $itemtype, array $mappings): array
+    {
+        $itemtype = self::validItemtype($itemtype);
+        $localTypes = FieldsText::customTypes($itemtype, array_column($mappings, 'glpi_a_field'));
+        $expectedTypes = [];
+
+        foreach ($mappings as $mapping) {
+            $glpiAField = $mapping['glpi_a_field'];
+            $glpiBField = $mapping['glpi_b_field'];
+
+            if (FieldsText::isCustom($glpiAField) && !FieldsText::isCustom($glpiBField)
+                && !in_array($localTypes[$glpiAField] ?? '', ['text', 'textarea'], true)) {
+                throw new \RuntimeException('The mapped local Fields-plugin field requires a compatible remote Fields-plugin ' . ($localTypes[$glpiAField] ?? 'scalar') . ' field: ' . $glpiAField);
+            }
+
+            if (!FieldsText::isCustom($glpiBField)) {
+                continue;
+            }
+
+            $expectedType = FieldsText::isCustom($glpiAField) ? ($localTypes[$glpiAField] ?? '') : 'text';
+            if ($expectedType === '') {
+                throw new \RuntimeException('The mapped local Fields-plugin field type could not be resolved: ' . $glpiAField);
+            }
+
+            if (isset($expectedTypes[$glpiBField]) && $expectedTypes[$glpiBField] !== $expectedType) {
+                throw new \RuntimeException('The mapped remote Fields-plugin field has conflicting expected types: ' . $glpiBField);
+            }
+
+            $expectedTypes[$glpiBField] = $expectedType;
+        }
+
+        return $expectedTypes;
     }
 
     /**
@@ -187,11 +230,21 @@ final class FieldMapping
         }
 
         $cleanMappings = [];
+        $customOptions = FieldsText::localOptions($itemtype);
 
         foreach ($fieldMappings as $fieldKey => $mapping) {
             $fieldKey = (string) $fieldKey;
 
-            if (!isset($validGlpiAFields[$fieldKey])) {
+            foreach ($customOptions as $optionId => $option) {
+                if ((string) $optionId === $fieldKey) {
+                    $fieldKey = FieldsText::key($itemtype, $option);
+                    break;
+                }
+            }
+
+            $savedCustomMapping = $keepRowsWithoutGlpiB && (FieldsText::isCustom($fieldKey)
+                || (is_array($mapping) && FieldsText::isCustom((string) ($mapping['glpi_b_field_uid'] ?? $mapping['glpi_b_field_key'] ?? ''))));
+            if (!isset($validGlpiAFields[$fieldKey]) && !$savedCustomMapping) {
                 continue;
             }
 
@@ -314,6 +367,9 @@ final class FieldMapping
             if (!is_array($option) || !isset($option['name']) || !is_scalar($option['name'])) {
                 continue;
             }
+            if (str_starts_with((string) ($option['table'] ?? ''), 'glpi_plugin_fields_')) {
+                continue;
+            }
 
             $fieldKey = (string) $optionId;
             $hasFieldKey = is_int($optionId) || ctype_digit($fieldKey);
@@ -326,6 +382,18 @@ final class FieldMapping
                 'key'   => $fieldKey,
                 'label' => $label,
             ];
+        }
+
+        foreach (FieldsText::localOptions($itemtype) as $option) {
+            $key = FieldsText::key($itemtype, $option);
+            if ($key !== '') {
+                try {
+                    FieldsText::validate($option);
+                } catch (\RuntimeException) {
+                    continue;
+                }
+                $fields[] = ['key' => $key, 'label' => (string) $option['name']];
+            }
         }
 
         return $fields;
@@ -369,6 +437,17 @@ final class FieldMapping
 
     private static function safeLocalSyncField(string $itemtype, string $fieldKey): string
     {
+        foreach (FieldsText::localOptions($itemtype) as $optionId => $option) {
+            $key = FieldsText::key($itemtype, $option);
+            if ($fieldKey === (string) $optionId || $fieldKey === $key) {
+                FieldsText::validate($option);
+                return $key;
+            }
+        }
+        if (FieldsText::isCustom($fieldKey)) {
+            throw new \RuntimeException('The mapped local Fields-plugin field is unavailable: ' . $fieldKey);
+        }
+
         $directField = self::safeSyncFieldName($fieldKey);
         if ($directField !== '') {
             return $directField;
@@ -410,11 +489,27 @@ final class FieldMapping
         return '';
     }
 
+    private static function validateCustomMapping(string $itemtype, string $glpiAField, string $glpiBField): void
+    {
+        self::expectedCustomTypes($itemtype, [[
+            'glpi_a_field' => $glpiAField,
+            'glpi_b_field' => $glpiBField,
+            'source_of_truth' => 'glpi_a',
+        ]]);
+    }
+
     /**
      * @param array{glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string} $mapping
      */
     private static function safeRemoteSyncField(array $mapping): string
     {
+        foreach (['glpi_b_field_key', 'glpi_b_field_uid'] as $fieldName) {
+            $key = (string) ($mapping[$fieldName] ?? '');
+            if (FieldsText::isCustom($key)) {
+                return $key;
+            }
+        }
+
         foreach (['glpi_b_field_key', 'glpi_b_field_uid'] as $fieldName) {
             $safeField = self::safeSyncFieldName((string) ($mapping[$fieldName] ?? ''));
             if ($safeField !== '') {

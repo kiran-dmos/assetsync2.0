@@ -494,6 +494,188 @@ final class GlpiBConnection
         });
     }
 
+    /** Read and optionally write mapped Fields-plugin text/yesno values through child-row REST endpoints. */
+    public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
+    {
+        $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
+        if ($keys === []) {
+            return ['success' => true, 'item' => []];
+        }
+
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes): array {
+            $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
+            $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+            if (!$options['success']) {
+                return $options;
+            }
+
+            $containers = [];
+            foreach ($keys as $key) {
+                $descriptor = FieldsText::descriptor($itemtype, $key);
+                $metadata = null;
+                foreach ($options['body'] as $option) {
+                    if (!is_array($option)) {
+                        continue;
+                    }
+
+                    if (($option['table'] ?? '') !== $descriptor['table'] || ($option['field'] ?? '') !== $descriptor['field']) {
+                        continue;
+                    }
+
+                    $candidate = FieldsText::metadataFromOption($itemtype, $option);
+                    if ($candidate['key'] === $key) {
+                        $metadata = $candidate;
+                        break;
+                    }
+                }
+                if ($metadata === null) {
+                    throw new \RuntimeException('The mapped remote Fields-plugin field is unavailable: ' . $key);
+                }
+                if ($metadata['field_id'] <= 0) {
+                    throw new \RuntimeException('The mapped remote Fields-plugin field is missing its field id metadata: ' . $key);
+                }
+                $definition = self::request('GET', self::apiUrl($connection['base_url'], 'PluginFieldsField/' . $metadata['field_id']), $headers);
+                if (!$definition['success']) {
+                    $definition['message'] = 'Cannot read GLPI B Fields field configuration (PluginFieldsField). Verify that the API account has configuration-read permission for the Fields plugin. ' . $definition['message'];
+                    return $definition;
+                }
+                $metadata = FieldsText::metadataWithDefinition($metadata, $definition['body']);
+                $expectedType = (string) ($expectedTypes[$key] ?? 'text');
+                if ($metadata['type'] !== $expectedType) {
+                    $foundType = $metadata['type'] !== '' ? $metadata['type'] : 'unsupported';
+                    throw new \RuntimeException('The remote Fields-plugin definition is not an active ' . $expectedType . ' field: ' . $key . ' (found ' . $foundType . ').');
+                }
+                if (array_key_exists($key, $changes) && !$metadata['writable']) {
+                    throw new \RuntimeException('The remote Fields-plugin field is read-only: ' . $key);
+                }
+                $class = $metadata['class'];
+                $containers[$class]['id'] = $metadata['container_id'];
+                $containers[$class]['fields'][$key] = [
+                    'column' => $metadata['field'],
+                    'type' => $metadata['type'],
+                ];
+            }
+
+            $values = [];
+            foreach ($containers as $class => $container) {
+                if ($itemsId <= 0) {
+                    continue; // Validate before creating a native asset.
+                }
+                $writing = array_intersect_key($changes, $container['fields']) !== [];
+                self::assertCustomContainerAccess($itemtype, $itemsId, $container['id'], $writing, static function (string $endpoint) use ($connection, $headers): array {
+                    $result = self::request('GET', self::apiUrl($connection['base_url'], $endpoint), $headers);
+                    if (!$result['success']) {
+                        throw new \RuntimeException('Cannot establish GLPI B Fields container permission: cannot read ' . $endpoint . '. Verify the API account\'s Fields configuration/profile-read and asset/entity access. ' . $result['message']);
+                    }
+                    return $result['body'];
+                });
+                $endpoint = rawurlencode($itemtype) . '/' . $itemsId . '/' . rawurlencode($class);
+                $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, ['range' => '0-1']), $headers);
+                if (!$response['success']) {
+                    return $response;
+                }
+                $rows = $response['body'];
+                if (!array_is_list($rows) || count($rows) > 1) {
+                    throw new \RuntimeException('Expected at most one remote Fields-plugin container row.');
+                }
+                $row = $rows[0] ?? [];
+                if ($row !== [] && ((int) ($row['items_id'] ?? 0) !== $itemsId || ($row['itemtype'] ?? '') !== $itemtype || (int) ($row['plugin_fields_containers_id'] ?? 0) !== $container['id'] || (int) ($row['id'] ?? 0) <= 0)) {
+                    throw new \RuntimeException('The remote Fields-plugin row does not belong to the mapped asset/container.');
+                }
+                $input = [];
+                foreach ($container['fields'] as $key => $fieldInfo) {
+                    $column = $fieldInfo['column'];
+                    $type = $fieldInfo['type'];
+                    $values[$key] = $row === [] ? FieldsText::missingValue($type) : FieldsText::normalizeReadValue($type, $row[$column] ?? null);
+                    if (array_key_exists($key, $changes)) {
+                        $input[$column] = FieldsText::normalizeValue($type, $changes[$key]);
+                    }
+                }
+                if ($input === []) {
+                    continue;
+                }
+                if ($row === []) {
+                    $input += ['items_id' => $itemsId, 'itemtype' => $itemtype, 'plugin_fields_containers_id' => $container['id']];
+                    $written = self::request('POST', self::apiUrl($connection['base_url'], rawurlencode($class)), $headers, ['input' => $input]);
+                    $rowId = self::createdItemId($written['body']);
+                    if (!empty($written['success']) && $rowId <= 0) {
+                        throw new \RuntimeException('GLPI B did not return a Fields-plugin row id.');
+                    }
+                } else {
+                    $rowId = (int) $row['id'];
+                    $written = self::request('PUT', self::apiUrl($connection['base_url'], rawurlencode($class) . '/' . $rowId), $headers, ['input' => $input]);
+                }
+                if (empty($written['success'])) {
+                    return $written;
+                }
+                $verified = self::request('GET', self::apiUrl($connection['base_url'], rawurlencode($class) . '/' . $rowId), $headers);
+                if (empty($verified['success'])) {
+                    return $verified;
+                }
+                foreach ($container['fields'] as $key => $fieldInfo) {
+                    $column = $fieldInfo['column'];
+                    $type = $fieldInfo['type'];
+                    $persisted = array_key_exists($key, $changes)
+                        ? FieldsText::normalizeValue($type, $verified['body'][$column] ?? null)
+                        : FieldsText::normalizeReadValue($type, $verified['body'][$column] ?? null);
+                    if (array_key_exists($key, $changes) && $persisted !== FieldsText::normalizeValue($type, $changes[$key])) {
+                        throw new \RuntimeException('GLPI B did not persist the Fields-plugin ' . $type . ' value: ' . $key);
+                    }
+                    $values[$key] = $persisted;
+                }
+            }
+
+            return ['success' => true, 'item' => $values];
+        });
+    }
+
+    /** Mirror Fields' profile and container entity checks before accessing a generated child row. */
+    private static function assertCustomContainerAccess(string $itemtype, int $itemsId, int $containerId, bool $writing, callable $read): void
+    {
+        $profile = $read('getActiveProfile')['active_profile'] ?? [];
+        $profileId = (int) ($profile['id'] ?? 0);
+        // Generated child rows do not consistently enforce the parent's update permission.
+        $parentRight = $writing ? 2 : 1; // GLPI UPDATE / READ.
+        if ($profileId <= 0 || (((int) ($profile[strtolower($itemtype)] ?? 0)) & $parentRight) === 0) {
+            throw new \RuntimeException('GLPI B Fields access denied: an active profile with parent asset ' . ($writing ? 'update' : 'read') . ' permission is required.');
+        }
+        $container = $read('PluginFieldsContainer/' . $containerId);
+        $itemtypes = json_decode((string) ($container['itemtypes'] ?? ''), true);
+        if ((int) ($container['id'] ?? 0) !== $containerId || (int) ($container['is_active'] ?? 0) !== 1 || !is_array($itemtypes) || !in_array($itemtype, $itemtypes, true)
+            || !isset($container['entities_id'], $container['is_recursive'])) {
+            throw new \RuntimeException('Cannot establish GLPI B Fields container permission: container is unavailable, inactive, or not applicable to this asset type.');
+        }
+        $rights = $read('PluginFieldsContainer/' . $containerId . '/PluginFieldsProfile?range=0-999');
+        $right = 0;
+        foreach ($rights as $row) {
+            if (is_array($row) && (int) ($row['profiles_id'] ?? 0) === $profileId && (int) ($row['plugin_fields_containers_id'] ?? 0) === $containerId) {
+                $right = max($right, (int) ($row['right'] ?? 0));
+            }
+        }
+        // Fields uses right > READ for writes, and right >= READ for reads.
+        if ($right < 1 || ($writing && $right <= 1)) {
+            throw new \RuntimeException('GLPI B Fields container permission denied or unavailable for the active API profile. Grant the required container ' . ($writing ? 'write' : 'read') . ' right in the Fields plugin profile settings.');
+        }
+        $asset = $read(rawurlencode($itemtype) . '/' . $itemsId);
+        if ((int) ($asset['id'] ?? 0) !== $itemsId || !isset($asset['entities_id']) || !empty($asset['is_deleted'])) {
+            throw new \RuntimeException('Cannot establish GLPI B Fields container permission: parent asset is unavailable.');
+        }
+        $entityId = (int) $asset['entities_id'];
+        $containerEntityId = (int) $container['entities_id'];
+        $seen = [];
+        while ($entityId !== $containerEntityId) {
+            if ((int) $container['is_recursive'] !== 1 || $entityId <= 0 || isset($seen[$entityId]) || count($seen) >= 100) {
+                throw new \RuntimeException('GLPI B Fields container permission denied: the parent asset entity is outside the container scope.');
+            }
+            $seen[$entityId] = true;
+            $entity = $read('Entity/' . $entityId);
+            if ((int) ($entity['id'] ?? -1) !== $entityId || !isset($entity['entities_id'])) {
+                throw new \RuntimeException('Cannot establish GLPI B Fields container permission: entity ancestry is unavailable.');
+            }
+            $entityId = (int) $entity['entities_id'];
+        }
+    }
+
     private static function cleanBaseUrl(string $baseUrl): string
     {
         $baseUrl = rtrim(trim($baseUrl), '/');

@@ -124,7 +124,14 @@ final class AssetSyncService
         }
 
         $route = $scope['route'];
-        $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+        try {
+            $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+            FieldMapping::expectedCustomTypes($itemtype, $mappings);
+            $asset += FieldsText::localValues($itemtype, $itemsId, array_column($mappings, 'glpi_a_field'));
+        } catch (\Throwable $error) {
+            AssetSyncLink::saveStatus($itemtype, $itemsId, $connectionId, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
+            return false;
+        }
         $payloadHash = $this->payloadHash($asset, $route, $mappings);
         $payloadDate = $this->payloadDate($asset);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
@@ -237,7 +244,22 @@ final class AssetSyncService
             return;
         }
 
-        $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+        try {
+            $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+            $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
+            $asset += FieldsText::localValues($itemtype, $itemsId, array_column($mappings, 'glpi_a_field'));
+        } catch (\Throwable $error) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
+            return;
+        }
+        $customKeys = array_keys($customTypes);
+        if ($customKeys !== []) {
+            $validation = $this->callRemote('customTextValues', [$connection, $itemtype, 0, $customKeys, [], $customTypes]);
+            if (!$this->remoteSucceeded($validation)) {
+                $this->handleRemoteFailure($job, $route['id'], $validation, $attempts, null);
+                return;
+            }
+        }
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
         $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : (int) ($job['remote_items_id'] ?? 0);
         $remoteItem = null;
@@ -314,9 +336,22 @@ final class AssetSyncService
             return;
         }
 
-        $changes = $createdRemote
-            ? ['remote' => [], 'local' => [], 'conflicts' => []]
-            : $this->existingChanges($asset, $remoteItem ?? [], $route, $mappings);
+        if ($customKeys !== []) {
+            $customResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, [], $customTypes]);
+            if (!$this->remoteSucceeded($customResult)) {
+                $this->handleRemoteFailure($job, $route['id'], $customResult, $attempts, $remoteItemsId);
+                return;
+            }
+            $remoteItem = array_merge($remoteItem ?? [], $customResult['item']);
+        }
+        // Native creation already applied its mappings; custom rows are written separately.
+        $comparisonMappings = $createdRemote ? array_values(array_filter($mappings, static fn (array $mapping): bool => FieldsText::isCustom($mapping['glpi_b_field']) || FieldsText::isCustom($mapping['glpi_a_field']))) : $mappings;
+        try {
+            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes);
+        } catch (\Throwable $error) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
+            return;
+        }
 
         if ($changes['conflicts'] !== []) {
             $this->blockJob(
@@ -329,8 +364,18 @@ final class AssetSyncService
             return;
         }
 
-        if ($changes['remote'] !== []) {
-            $updateResult = $this->callRemote('updateItem', [$connection, $itemtype, $remoteItemsId, $changes['remote']]);
+        $nativeChanges = array_filter($changes['remote'], static fn (string $key): bool => !FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
+        $customChanges = array_diff_key($changes['remote'], $nativeChanges);
+        if ($nativeChanges !== []) {
+            $updateResult = $this->callRemote('updateItem', [$connection, $itemtype, $remoteItemsId, $nativeChanges]);
+            if (!$this->remoteSucceeded($updateResult)) {
+                $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
+                return;
+            }
+        }
+
+        if ($customChanges !== []) {
+            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, $customChanges, $customTypes]);
             if (!$this->remoteSucceeded($updateResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;
@@ -581,6 +626,15 @@ final class AssetSyncService
      */
     private function updateLocalAsset(string $itemtype, int $itemsId, array $fields): bool
     {
+        $customFields = array_filter($fields, static fn (string $key): bool => FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
+        try {
+            if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields)) {
+                return false;
+            }
+        } catch (\Throwable) {
+            return false;
+        }
+        $fields = array_diff_key($fields, $customFields);
         if ($fields === [] || !class_exists($itemtype)) {
             return true;
         }
@@ -643,6 +697,9 @@ final class AssetSyncService
 
         foreach ($mappings as $mapping) {
             $source = $mapping['source_of_truth'];
+            if (FieldsText::isCustom($mapping['glpi_b_field'])) {
+                continue;
+            }
             $localValue = $this->value($asset[$mapping['glpi_a_field']] ?? '');
 
             if ($source === 'glpi_a') {
@@ -662,9 +719,10 @@ final class AssetSyncService
      * @param array<string,mixed> $remoteItem
      * @param array<string,mixed> $route
      * @param list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}> $mappings
+     * @param array<string,string> $fieldTypes
      * @return array{remote:array<string,mixed>,local:array<string,mixed>,conflicts:list<string>}
      */
-    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings): array
+    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings, array $fieldTypes = []): array
     {
         $remoteChanges = [];
         $localChanges = [];
@@ -676,16 +734,17 @@ final class AssetSyncService
         }
 
         foreach ($mappings as $mapping) {
-            $localValue = $this->value($asset[$mapping['glpi_a_field']] ?? '');
-            $remoteValue = $this->value($remoteItem[$mapping['glpi_b_field']] ?? '');
+            $fieldType = $this->mappingFieldType($mapping, $fieldTypes);
+            $localValue = $this->mappedValue($asset[$mapping['glpi_a_field']] ?? '', $fieldType);
+            $remoteValue = $this->mappedValue($remoteItem[$mapping['glpi_b_field']] ?? '', $fieldType);
 
             if ($mapping['source_of_truth'] === 'glpi_a' && $localValue !== $remoteValue) {
-                $remoteChanges[$mapping['glpi_b_field']] = $localValue;
+                $remoteChanges[$mapping['glpi_b_field']] = $this->changeValue($localValue, $fieldType);
                 continue;
             }
 
             if ($mapping['source_of_truth'] === 'glpi_b' && $localValue !== $remoteValue) {
-                $localChanges[$mapping['glpi_a_field']] = $remoteValue;
+                $localChanges[$mapping['glpi_a_field']] = $this->changeValue($remoteValue, $fieldType);
                 continue;
             }
 
@@ -694,12 +753,12 @@ final class AssetSyncService
             }
 
             if ($this->isBlank($localValue) && !$this->isBlank($remoteValue)) {
-                $localChanges[$mapping['glpi_a_field']] = $remoteValue;
+                $localChanges[$mapping['glpi_a_field']] = $this->changeValue($remoteValue, $fieldType);
                 continue;
             }
 
             if (!$this->isBlank($localValue) && $this->isBlank($remoteValue)) {
-                $remoteChanges[$mapping['glpi_b_field']] = $localValue;
+                $remoteChanges[$mapping['glpi_b_field']] = $this->changeValue($localValue, $fieldType);
                 continue;
             }
 
@@ -713,6 +772,44 @@ final class AssetSyncService
             'local' => $localChanges,
             'conflicts' => $conflicts,
         ];
+    }
+
+    /**
+     * @param array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string} $mapping
+     * @param array<string,string> $fieldTypes
+     */
+    private function mappingFieldType(array $mapping, array $fieldTypes): string
+    {
+        foreach (['glpi_b_field', 'glpi_a_field'] as $fieldName) {
+            $key = $mapping[$fieldName] ?? '';
+            if (isset($fieldTypes[$key])) {
+                return $fieldTypes[$key];
+            }
+        }
+
+        return 'text';
+    }
+
+    private function mappedValue($value, string $fieldType): string
+    {
+        if ($fieldType === 'text' || $fieldType === 'textarea') {
+            return $this->value($value);
+        }
+
+        if ($value === null || $value === '') {
+            return '';
+        }
+
+        return (string) FieldsText::normalizeValue($fieldType, $value);
+    }
+
+    private function changeValue(string $value, string $fieldType)
+    {
+        if ($fieldType === 'text') {
+            return $value;
+        }
+
+        return FieldsText::normalizeValue($fieldType, $value);
     }
 
     /**
@@ -784,7 +881,7 @@ final class AssetSyncService
             return [
                 'success' => false,
                 'message' => 'GLPI B request failed: ' . $error->getMessage(),
-                'transient' => true,
+                'transient' => !($error instanceof \RuntimeException),
             ];
         }
 
