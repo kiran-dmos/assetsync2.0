@@ -401,6 +401,10 @@ function getItemTypeForTable($table): string
 
 function getTableForItemType($class): string
 {
+    if ($class === 'PluginFieldsDepartmentfieldDropdown') {
+        return 'glpi_plugin_fields_departmentfielddropdowns';
+    }
+
     return 'glpi_plugin_fields_computerdmosassets';
 }
 
@@ -421,6 +425,15 @@ class PluginFieldsField
             'id' => 1,
             'name' => 'namefield',
             'type' => 'text',
+            'is_active' => 1,
+            'plugin_fields_containers_id' => 1,
+            'is_readonly' => 0,
+        ],
+        8 => [
+            'id' => 8,
+            'name' => 'departmentfield',
+            'type' => 'dropdown',
+            'multiple' => 0,
             'is_active' => 1,
             'plugin_fields_containers_id' => 1,
             'is_readonly' => 0,
@@ -503,12 +516,41 @@ class PluginFieldsComputerdmosasset
     }
 }
 
+class PluginFieldsDepartmentfieldDropdown
+{
+    public static array $rows = [
+        10 => ['id' => 10, 'name' => 'Hardware', 'completename' => 'Operations > Hardware'],
+        11 => ['id' => 11, 'name' => 'Software', 'completename' => 'Operations > Software'],
+        12 => ['id' => 12, 'name' => 'Empty branch', 'completename' => 'Operations > Empty'],
+    ];
+    public array $fields = [];
+
+    public static function getTable(): string
+    {
+        return 'glpi_plugin_fields_departmentfielddropdowns';
+    }
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$rows[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+
+    public function find(array $criteria = []): array
+    {
+        return self::$rows;
+    }
+}
+
 final class FakeGlpiBClient
 {
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $records = [];
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $customRecords = [];
+    /** @var array<string,array<int,array<string,mixed>>> */
+    public array $customDropdownOptions = [];
     /** @var array<string,string> */
     public array $customHistoryOptionIds = [];
     /** @var array<string,array<int,array<string,string>>> */
@@ -622,13 +664,20 @@ final class FakeGlpiBClient
         if ($itemsId > 0) {
             $this->customRecords[$recordKey][$itemsId] ??= [];
             foreach ($changes as $key => $value) {
-                $this->customRecords[$recordKey][$itemsId][(string) $key] = $value;
+                $key = (string) $key;
+                $type = (string) ($expectedTypes[$key] ?? 'text');
+                $this->customRecords[$recordKey][$itemsId][$key] = $type === 'dropdown'
+                    ? $this->dropdownIdForLabel($key, (string) $value)
+                    : $value;
             }
 
             foreach ($keys as $key) {
                 $key = (string) $key;
                 $type = (string) ($expectedTypes[$key] ?? 'text');
-                $values[$key] = $this->customRecords[$recordKey][$itemsId][$key] ?? \GlpiPlugin\Assetsync20\FieldsText::missingValue($type);
+                $storedValue = $this->customRecords[$recordKey][$itemsId][$key] ?? \GlpiPlugin\Assetsync20\FieldsText::missingValue($type);
+                $values[$key] = $type === 'dropdown'
+                    ? $this->dropdownLabelForId($key, $storedValue)
+                    : $storedValue;
             }
         }
 
@@ -709,6 +758,57 @@ final class FakeGlpiBClient
     {
         return $connection['id'] . ':' . $itemtype;
     }
+
+    private function dropdownIdForLabel(string $key, string $label): int
+    {
+        $label = \GlpiPlugin\Assetsync20\FieldsText::normalizeValue('dropdown', $label);
+        if ($label === '') {
+            return 0;
+        }
+
+        $matches = [];
+        foreach ($this->customDropdownOptions[$key] ?? [] as $row) {
+            if (!is_array($row) || \GlpiPlugin\Assetsync20\FieldsText::dropdownLabel($row) !== $label) {
+                continue;
+            }
+
+            $id = (int) ($row['id'] ?? 0);
+            if ($id > 0) {
+                $matches[$id] = true;
+            }
+        }
+
+        if ($matches === []) {
+            throw new RuntimeException('The destination GLPI B Fields-plugin dropdown option is missing for ' . $key . ': ' . $label);
+        }
+
+        if (count($matches) > 1) {
+            throw new RuntimeException('The destination GLPI B Fields-plugin dropdown option label is duplicated for ' . $key . ': ' . $label);
+        }
+
+        return (int) array_key_first($matches);
+    }
+
+    private function dropdownLabelForId(string $key, $value): string
+    {
+        $id = is_scalar($value) && ctype_digit((string) $value) ? (int) $value : 0;
+        if ($id <= 0) {
+            return '';
+        }
+
+        foreach ($this->customDropdownOptions[$key] ?? [] as $row) {
+            if (!is_array($row) || (int) ($row['id'] ?? 0) !== $id) {
+                continue;
+            }
+
+            $label = \GlpiPlugin\Assetsync20\FieldsText::dropdownLabel($row);
+            if ($label !== '') {
+                return $label;
+            }
+        }
+
+        throw new RuntimeException('The remote Fields-plugin dropdown option is missing for ' . $key . ': ' . $id);
+    }
 }
 
 function configureCustomNameMapping(string $source, string $customKey, string $remoteOptionId): array
@@ -725,6 +825,27 @@ function configureCustomNameMapping(string $source, string $customKey, string $r
             'glpi_b_field_key' => $customKey,
             'glpi_b_field_uid' => $customKey,
             'glpi_b_field_label' => 'DMOS Name',
+            'source_of_truth' => $source,
+        ],
+    ], $remoteFields);
+
+    return $remoteFields;
+}
+
+function configureCustomDropdownMapping(string $source, string $customKey, string $remoteOptionId): array
+{
+    $remoteFields = [[
+        'key' => $customKey,
+        'id' => $remoteOptionId,
+        'uid' => $customKey,
+        'label' => 'DMOS Department',
+    ]];
+
+    \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+        $customKey => [
+            'glpi_b_field_key' => $customKey,
+            'glpi_b_field_uid' => $customKey,
+            'glpi_b_field_label' => 'DMOS Department',
             'source_of_truth' => $source,
         ],
     ], $remoteFields);
@@ -792,6 +913,55 @@ function seedLinkedCustomComputer(
     $remoteClient->customHistoryDates['production:Computer'][$remoteId] = $remoteHistoryDate === null
         ? []
         : [$remoteOptionId => $remoteHistoryDate];
+
+    \GlpiPlugin\Assetsync20\AssetSyncLink::save([
+        'itemtype' => 'Computer',
+        'items_id' => $assetId,
+        'glpi_b_connection_id' => 'production',
+        'route_id' => 'prod-child',
+        'remote_items_id' => $remoteId,
+        'status' => \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED,
+        'last_payload_hash' => '',
+        'last_payload_date' => '2026-09-14 06:05:43',
+    ]);
+}
+
+function seedLinkedDropdownComputer(
+    FakeDB $DB,
+    FakeGlpiBClient $remoteClient,
+    int $assetId,
+    int $remoteId,
+    string $customKey,
+    int $localDropdownId,
+    int $remoteDropdownId
+): void {
+    $DB->insert('glpi_computers', [
+        'id' => $assetId,
+        'entities_id' => 20,
+        'is_deleted' => 0,
+        'name' => 'Dropdown test ' . $assetId,
+        'serial' => 'SER-' . $assetId,
+        'otherserial' => '',
+        'comment' => '',
+        'date_mod' => '2026-09-14 06:05:43',
+    ]);
+    PluginFieldsComputerdmosasset::$rows[$assetId] = [
+        'id' => 1000 + $assetId,
+        'items_id' => $assetId,
+        'itemtype' => 'Computer',
+        'plugin_fields_containers_id' => 1,
+        'plugin_fields_departmentfielddropdowns_id' => $localDropdownId,
+    ];
+
+    $remoteClient->records['production:Computer'][$remoteId] = [
+        'id' => $remoteId,
+        'entities_id' => 200,
+        'is_deleted' => 0,
+        'name' => 'Dropdown remote test ' . $remoteId,
+        'serial' => 'SER-' . $assetId,
+        'date_mod' => '2026-09-14 06:05:49',
+    ];
+    $remoteClient->customRecords['production:Computer'][$remoteId] = [$customKey => $remoteDropdownId];
 
     \GlpiPlugin\Assetsync20\AssetSyncLink::save([
         'itemtype' => 'Computer',
@@ -2046,6 +2216,105 @@ $customRow->fields = PluginFieldsComputerdmosasset::$rows[605];
 if (!hasPendingProductionQueue($DB, 605)) {
     throw new RuntimeException('Fields-plugin update hook should queue parent assets after custom GLPI A edits.');
 }
+
+$dropdownKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_departmentfielddropdowns_id';
+$dropdownSearchOptionId = '884783';
+$remoteDropdownSearchOptionId = '76667';
+PluginFieldsContainer::$options = [
+    (int) $dropdownSearchOptionId => [
+        'name' => 'DMOS Department',
+        'field' => 'completename',
+        'table' => 'glpi_plugin_fields_departmentfielddropdowns',
+        'linkfield' => 'plugin_fields_departmentfielddropdowns_id',
+        'datatype' => 'dropdown',
+        'pfields_type' => 'dropdown',
+        'pfields_fields_id' => 8,
+        'plugin_fields_containers_id' => 1,
+        'is_multiple' => 0,
+        'joinparams' => [
+            'beforejoin' => [
+                'table' => 'glpi_plugin_fields_computerdmosassets',
+            ],
+        ],
+    ],
+];
+$fieldsWithDropdown = \GlpiPlugin\Assetsync20\FieldMapping::fieldsFor('Computer');
+if (!in_array($dropdownKey, array_column($fieldsWithDropdown, 'key'), true)) {
+    throw new RuntimeException('Fields-plugin dropdown fields should appear in the GLPI A mapping list.');
+}
+$remoteClient->customHistoryOptionIds[$dropdownKey] = $remoteDropdownSearchOptionId;
+$remoteClient->customDropdownOptions[$dropdownKey] = [
+    210 => ['id' => 210, 'name' => 'Hardware remote', 'completename' => 'Operations > Hardware'],
+    211 => ['id' => 211, 'name' => 'Software remote', 'completename' => 'Operations > Software'],
+    212 => ['id' => 212, 'name' => 'Empty remote', 'completename' => 'Operations > Empty'],
+];
+
+configureCustomDropdownMapping('glpi_a', $dropdownKey, $remoteDropdownSearchOptionId);
+seedLinkedDropdownComputer($DB, $remoteClient, 606, 2606, $dropdownKey, 10, 211);
+if (!$syncService->queueAssetIfNeeded('Computer', 606, 'production')) {
+    throw new RuntimeException('One-way custom dropdown A source should queue when labels differ.');
+}
+$syncService->processQueue(10);
+if (($remoteClient->customRecords['production:Computer'][2606][$dropdownKey] ?? null) !== 210) {
+    throw new RuntimeException('Custom dropdown A-to-B sync should write the matching GLPI B option id, not the GLPI A option id.');
+}
+
+seedLinkedDropdownComputer($DB, $remoteClient, 607, 2607, $dropdownKey, 10, 211);
+configureCustomDropdownMapping('glpi_b', $dropdownKey, $remoteDropdownSearchOptionId);
+if (!$syncService->queueAssetIfNeeded('Computer', 607, 'production')) {
+    throw new RuntimeException('One-way custom dropdown B source should queue when labels differ.');
+}
+$syncService->processQueue(10);
+if ((PluginFieldsComputerdmosasset::$rows[607]['plugin_fields_departmentfielddropdowns_id'] ?? null) !== 11) {
+    throw new RuntimeException('Custom dropdown B-to-A sync should write the matching GLPI A option id, not the GLPI B option id.');
+}
+
+seedLinkedDropdownComputer($DB, $remoteClient, 608, 2608, $dropdownKey, 0, 211);
+configureCustomDropdownMapping('glpi_a', $dropdownKey, $remoteDropdownSearchOptionId);
+if (!$syncService->queueAssetIfNeeded('Computer', 608, 'production')) {
+    throw new RuntimeException('One-way custom dropdown blank A source should queue when B is filled.');
+}
+$syncService->processQueue(10);
+if (!array_key_exists($dropdownKey, $remoteClient->customRecords['production:Computer'][2608]) || $remoteClient->customRecords['production:Computer'][2608][$dropdownKey] !== 0) {
+    throw new RuntimeException('Custom dropdown A-to-B blank sync should clear the GLPI B option id.');
+}
+
+seedLinkedDropdownComputer($DB, $remoteClient, 609, 2609, $dropdownKey, 10, 211);
+$remoteClient->customDropdownOptions[$dropdownKey] = [
+    211 => ['id' => 211, 'name' => 'Software remote', 'completename' => 'Operations > Software'],
+];
+configureCustomDropdownMapping('glpi_a', $dropdownKey, $remoteDropdownSearchOptionId);
+if (!$syncService->queueAssetIfNeeded('Computer', 609, 'production')) {
+    throw new RuntimeException('Missing remote dropdown destination should still queue for blocking.');
+}
+$syncService->processQueue(10);
+$missingDropdownLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 609, 'production');
+if (($missingDropdownLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_BLOCKED_REMOTE_ERROR
+    || !str_contains((string) ($missingDropdownLink['last_error'] ?? ''), 'dropdown option is missing')) {
+    throw new RuntimeException('Missing remote dropdown destination should block with a clear error.');
+}
+
+seedLinkedDropdownComputer($DB, $remoteClient, 610, 2610, $dropdownKey, 10, 211);
+$remoteClient->customDropdownOptions[$dropdownKey] = [
+    210 => ['id' => 210, 'name' => 'Hardware remote', 'completename' => 'Operations > Hardware'],
+    211 => ['id' => 211, 'name' => 'Software remote', 'completename' => 'Operations > Software'],
+    213 => ['id' => 213, 'name' => 'Duplicate hardware remote', 'completename' => 'Operations > Hardware'],
+];
+configureCustomDropdownMapping('glpi_a', $dropdownKey, $remoteDropdownSearchOptionId);
+if (!$syncService->queueAssetIfNeeded('Computer', 610, 'production')) {
+    throw new RuntimeException('Duplicate remote dropdown destination should still queue for blocking.');
+}
+$syncService->processQueue(10);
+$duplicateDropdownLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 610, 'production');
+if (($duplicateDropdownLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_BLOCKED_REMOTE_ERROR
+    || !str_contains((string) ($duplicateDropdownLink['last_error'] ?? ''), 'dropdown option label is duplicated')) {
+    throw new RuntimeException('Duplicate remote dropdown destination should block with a clear error.');
+}
+$remoteClient->customDropdownOptions[$dropdownKey] = [
+    210 => ['id' => 210, 'name' => 'Hardware remote', 'completename' => 'Operations > Hardware'],
+    211 => ['id' => 211, 'name' => 'Software remote', 'completename' => 'Operations > Software'],
+    212 => ['id' => 212, 'name' => 'Empty remote', 'completename' => 'Operations > Empty'],
+];
 
 Config::$values = [
     'plugin:assetsync20' => [

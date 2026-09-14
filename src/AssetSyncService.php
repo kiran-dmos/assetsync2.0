@@ -402,9 +402,14 @@ final class AssetSyncService
         }
 
         if ($changes['local'] !== []) {
-            $updatedLocal = AssetChangeHook::withoutQueue(
-                fn (): bool => $this->updateLocalAsset($itemtype, $itemsId, $changes['local'])
-            );
+            try {
+                $updatedLocal = AssetChangeHook::withoutQueue(
+                    fn (): bool => $this->updateLocalAsset($itemtype, $itemsId, $changes['local'])
+                );
+            } catch (\RuntimeException $error) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, $error->getMessage(), $remoteItemsId);
+                return;
+            }
             if (!$updatedLocal) {
                 $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, 'GLPI A rejected the local field update.', $remoteItemsId);
                 return;
@@ -655,6 +660,8 @@ final class AssetSyncService
             if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields)) {
                 return false;
             }
+        } catch (\RuntimeException $error) {
+            throw $error;
         } catch (\Throwable) {
             return false;
         }

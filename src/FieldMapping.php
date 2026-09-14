@@ -80,17 +80,26 @@ final class FieldMapping
         foreach ($mappings as $mapping) {
             $glpiAField = $mapping['glpi_a_field'];
             $glpiBField = $mapping['glpi_b_field'];
+            $localType = FieldsText::isCustom($glpiAField) ? ($localTypes[$glpiAField] ?? '') : 'text';
 
             if (FieldsText::isCustom($glpiAField) && !FieldsText::isCustom($glpiBField)
-                && !in_array($localTypes[$glpiAField] ?? '', ['text', 'textarea'], true)) {
-                throw new \RuntimeException('The mapped local Fields-plugin field requires a compatible remote Fields-plugin ' . ($localTypes[$glpiAField] ?? 'scalar') . ' field: ' . $glpiAField);
+                && !in_array($localType, ['text', 'textarea'], true)) {
+                throw new \RuntimeException('The mapped local Fields-plugin field requires a compatible remote Fields-plugin ' . ($localType !== '' ? $localType : 'scalar') . ' field: ' . $glpiAField);
+            }
+
+            if ($localType === 'dropdown' && (!FieldsText::isCustom($glpiBField) || !FieldsText::isDropdownKey($glpiBField))) {
+                throw new \RuntimeException('The mapped local Fields-plugin dropdown field requires a compatible remote Fields-plugin dropdown field: ' . $glpiAField);
+            }
+
+            if (FieldsText::isCustom($glpiBField) && FieldsText::isDropdownKey($glpiBField) && $localType !== 'dropdown') {
+                throw new \RuntimeException('The mapped remote Fields-plugin dropdown field requires a compatible local Fields-plugin dropdown field: ' . $glpiBField);
             }
 
             if (!FieldsText::isCustom($glpiBField)) {
                 continue;
             }
 
-            $expectedType = FieldsText::isCustom($glpiAField) ? ($localTypes[$glpiAField] ?? '') : 'text';
+            $expectedType = $localType;
             if ($expectedType === '') {
                 throw new \RuntimeException('The mapped local Fields-plugin field type could not be resolved: ' . $glpiAField);
             }

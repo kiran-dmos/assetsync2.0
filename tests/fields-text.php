@@ -23,7 +23,14 @@ class Computer
     public static function getTable(): string { return 'glpi_computers'; }
 }
 function getItemTypeForTable($table): string { return 'PluginFieldsComputerdmosasset'; }
-function getTableForItemType($class): string { return 'glpi_plugin_fields_computerdmosassets'; }
+function getTableForItemType($class): string
+{
+    if ($class === 'PluginFieldsDepartmentfieldDropdown') {
+        return 'glpi_plugin_fields_departmentfielddropdowns';
+    }
+
+    return 'glpi_plugin_fields_computerdmosassets';
+}
 class PluginFieldsContainer
 {
     public static string $type = 'text';
@@ -48,6 +55,7 @@ class PluginFieldsField
         5 => ['id' => 5, 'name' => 'countfield', 'type' => 'number', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
         6 => ['id' => 6, 'name' => 'datefield', 'type' => 'date', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
         7 => ['id' => 7, 'name' => 'datetimefield', 'type' => 'datetime', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
+        8 => ['id' => 8, 'name' => 'departmentfield', 'type' => 'dropdown', 'multiple' => 0, 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
     ];
     public array $fields = [];
     public function getFromDB($id): bool
@@ -87,6 +95,27 @@ class PluginFieldsComputerdmosasset
         return true;
     }
 }
+class PluginFieldsDepartmentfieldDropdown
+{
+    public static array $rows = [
+        10 => ['id' => 10, 'name' => 'Hardware', 'completename' => 'Operations > Hardware'],
+        11 => ['id' => 11, 'name' => 'Software', 'completename' => 'Operations > Software'],
+        12 => ['id' => 12, 'name' => 'Fallback Only', 'completename' => ''],
+    ];
+    public array $fields = [];
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$rows[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+
+    public function find(array $criteria = []): array
+    {
+        return self::$rows;
+    }
+}
 function check(bool $condition, string $message): void
 {
     if (!$condition) { throw new RuntimeException($message); }
@@ -113,6 +142,25 @@ function fieldOption(int $fieldId, string $label, string $column, string $type):
         'pfields_type' => $type,
         'pfields_fields_id' => $fieldId,
         'plugin_fields_containers_id' => 1,
+    ];
+}
+
+function dropdownFieldOption(int $fieldId, string $label, string $fieldName, int $multiple = 0): array
+{
+    return [
+        'name' => $label,
+        'field' => 'completename',
+        'table' => 'glpi_plugin_fields_' . $fieldName . 'dropdowns',
+        'linkfield' => 'plugin_fields_' . $fieldName . 'dropdowns_id',
+        'datatype' => 'dropdown',
+        'pfields_type' => 'dropdown',
+        'pfields_fields_id' => $fieldId,
+        'is_multiple' => $multiple,
+        'joinparams' => [
+            'beforejoin' => [
+                'table' => 'glpi_plugin_fields_computerdmosassets',
+            ],
+        ],
     ];
 }
 
@@ -307,6 +355,108 @@ check($yesChanges['remote'][$noKeyB] === 0, 'A false yesno source must write rem
 check(FieldsText::updateLocal('Computer', 2, [$noKeyA => false]), 'Local yesno false update should be accepted');
 check(PluginFieldsComputerdmosasset::$row['swsdbillablefieldtwo'] === 0, 'Local yesno false update must persist 0');
 
+$dropdownKeyA = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_departmentfielddropdowns_id';
+$dropdownKeyB = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_departmentfieldbdropdowns_id';
+$dropdownOption = dropdownFieldOption(8, 'DMOS Asset - Department', 'departmentfield');
+PluginFieldsContainer::$options = [884783 => $dropdownOption];
+PluginFieldsComputerdmosasset::$found = true;
+PluginFieldsComputerdmosasset::$row = ['id' => 10, 'plugin_fields_departmentfielddropdowns_id' => 10];
+$fields = FieldMapping::fieldsFor('Computer');
+check(in_array($dropdownKeyA, array_column($fields, 'key'), true), 'Discovery includes local Fields-plugin dropdown identifiers');
+$dropdownMetadata = FieldsText::customMetadata('Computer', [$dropdownKeyA])[$dropdownKeyA];
+check($dropdownMetadata['field'] === 'plugin_fields_departmentfielddropdowns_id', 'Dropdown metadata must use the generated row foreign key column');
+check($dropdownMetadata['definition_name'] === 'departmentfield', 'Dropdown metadata must keep the Fields field definition name');
+check($dropdownMetadata['type'] === 'dropdown', 'Dropdown metadata must identify the canonical dropdown type');
+check($dropdownMetadata['dropdown_class'] === 'PluginFieldsDepartmentfieldDropdown', 'Dropdown metadata must identify the generated dropdown class');
+check($dropdownMetadata['dropdown_table'] === 'glpi_plugin_fields_departmentfielddropdowns', 'Dropdown metadata must identify the generated dropdown option table');
+$dropdownMetadata = FieldsText::metadataWithDefinition($dropdownMetadata, PluginFieldsField::$definitions[8]);
+check($dropdownMetadata['field'] === 'plugin_fields_departmentfielddropdowns_id', 'Definition validation must preserve the generated dropdown FK column');
+$dropdownAsset = ['id' => 2, 'serial' => 'test'] + FieldsText::localValues('Computer', 2, [$dropdownKeyA]);
+check($dropdownAsset[$dropdownKeyA] === 'Operations > Hardware', 'Local dropdown IDs must resolve to completename labels');
+PluginFieldsComputerdmosasset::$row = ['id' => 10, 'plugin_fields_departmentfielddropdowns_id' => 12];
+$fallbackAsset = FieldsText::localValues('Computer', 2, [$dropdownKeyA]);
+check($fallbackAsset[$dropdownKeyA] === 'Fallback Only', 'Local dropdown labels must fall back to name when completename is blank');
+PluginFieldsComputerdmosasset::$row = ['id' => 10, 'plugin_fields_departmentfielddropdowns_id' => 10];
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    '884783' => [
+        'glpi_b_field_key' => $dropdownKeyB,
+        'glpi_b_field_uid' => $dropdownKeyB,
+        'glpi_b_field_label' => 'Department',
+        'source_of_truth' => 'glpi_a',
+    ],
+]]]);
+$dropdownMappings = FieldMapping::syncMappings('test', 'Computer');
+$dropdownTypes = FieldMapping::expectedCustomTypes('Computer', $dropdownMappings);
+check($dropdownMappings === [['glpi_a_field' => $dropdownKeyA, 'glpi_b_field' => $dropdownKeyB, 'source_of_truth' => 'glpi_a']], 'Dropdown custom mappings must keep stable generated FK identifiers');
+check($dropdownTypes === [$dropdownKeyB => 'dropdown'], 'Dropdown custom mappings must expect remote dropdown fields');
+$dropdownRemote = ['entities_id' => 0, $dropdownKeyB => 'Operations > Software'];
+$dropdownChanges = $compare->invoke($service, $dropdownAsset, $dropdownRemote, $route, $dropdownMappings, $dropdownTypes);
+check($dropdownChanges['remote'] === [$dropdownKeyB => 'Operations > Hardware'], 'Dropdown comparisons must use labels, not copied option IDs');
+$dropdownAsset[$dropdownKeyA] = '';
+check($compare->invoke($service, $dropdownAsset, $dropdownRemote, $route, $dropdownMappings, $dropdownTypes)['remote'] === [$dropdownKeyB => ''], 'A blank dropdown source must clear the destination');
+check(FieldsText::updateLocal('Computer', 2, [$dropdownKeyA => 'Operations > Software']), 'Local dropdown update should resolve a destination label');
+check(PluginFieldsComputerdmosasset::$row['plugin_fields_departmentfielddropdowns_id'] === 11, 'Local dropdown update must persist the matching destination option ID');
+check(FieldsText::updateLocal('Computer', 2, [$dropdownKeyA => '']), 'Local dropdown blank update should be accepted');
+check(PluginFieldsComputerdmosasset::$row['plugin_fields_departmentfielddropdowns_id'] === 0, 'Local dropdown blank update must clear the FK value');
+expectRuntime(static fn (): bool => FieldsText::updateLocal('Computer', 2, [$dropdownKeyA => 'Missing department']), 'dropdown option is missing', 'Missing local destination dropdown labels must block clearly');
+PluginFieldsDepartmentfieldDropdown::$rows[13] = ['id' => 13, 'name' => 'Hardware duplicate', 'completename' => 'Operations > Hardware'];
+expectRuntime(static fn (): bool => FieldsText::updateLocal('Computer', 2, [$dropdownKeyA => 'Operations > Hardware']), 'dropdown option label is duplicated', 'Duplicate local destination dropdown labels must block clearly');
+unset(PluginFieldsDepartmentfieldDropdown::$rows[13]);
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    '884783' => [
+        'glpi_b_field_key' => 'Computer.comment',
+        'glpi_b_field_uid' => 'Computer.comment',
+        'glpi_b_field_label' => 'Comments',
+        'source_of_truth' => 'glpi_a',
+    ],
+]]]);
+expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible remote Fields-plugin dropdown field', 'Dropdown-to-text mappings must be rejected clearly');
+PluginFieldsContainer::$options = [
+    884776 => fieldOption(1, 'DMOS Asset - Name', 'namefield', 'text'),
+    884783 => $dropdownOption,
+];
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    $key => [
+        'glpi_b_field_key' => $dropdownKeyB,
+        'glpi_b_field_uid' => $dropdownKeyB,
+        'glpi_b_field_label' => 'Department',
+        'source_of_truth' => 'glpi_a',
+    ],
+]]]);
+expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible local Fields-plugin dropdown field', 'Text-to-dropdown mappings must be rejected clearly');
+$fieldsFromSearchOptions = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'fieldsFromSearchOptions');
+$fieldsFromSearchOptions->setAccessible(true);
+$remoteFields = $fieldsFromSearchOptions->invoke(null, [884783 => ['id' => 884783] + $dropdownOption], 'Computer');
+check($remoteFields === [[
+    'key' => $dropdownKeyA,
+    'id' => '884783',
+    'uid' => $dropdownKeyA,
+    'label' => 'DMOS Asset - Department',
+]], 'GLPI B field discovery must expose Fields-plugin dropdowns with stable generated FK identifiers');
+$restDropdownKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_companyfielddropdowns_id';
+$restDropdownOption = [
+    'name' => 'DMOS Asset - Company',
+    'table' => 'glpi_plugin_fields_companyfielddropdowns',
+    'field' => 'completename',
+    'datatype' => 'dropdown',
+    'uid' => 'Computer.PluginFieldsComputerdmosasset.PluginFieldsCompanyfieldDropdown.completename',
+];
+$restRemoteFields = $fieldsFromSearchOptions->invoke(null, [76680 => $restDropdownOption], 'Computer');
+check($restRemoteFields === [[
+    'key' => $restDropdownKey,
+    'id' => '76680',
+    'uid' => $restDropdownKey,
+    'label' => 'DMOS Asset - Company',
+]], 'GLPI B REST dropdown discovery must convert joined display options to stable generated FK identifiers');
+$multiDropdownOption = dropdownFieldOption(8, 'DMOS Asset - Department', 'departmentfield', 1);
+expectRuntime(static fn (): string => FieldsText::validate($multiDropdownOption), 'multi-select dropdown fields are not supported', 'Multi-select Fields dropdowns must block clearly');
+$itemDropdownOption = fieldOption(8, 'DMOS Asset - Assigned User', 'assigneduserfield', 'dropdown-User');
+expectRuntime(static fn (): string => FieldsText::validate($itemDropdownOption), 'Only Fields-plugin scalar fields', 'Non-Fields item dropdowns must stay unsupported');
+
+PluginFieldsContainer::$options = [
+    884777 => ['name' => 'DMOS Asset - HW Billable', 'field' => 'hwbillablefieldtwo',
+        'table' => 'glpi_plugin_fields_computerdmosassets', 'pfields_type' => 'yesno', 'pfields_fields_id' => 2],
+];
 Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
     '884777' => [
         'glpi_b_field_key' => 'Computer.comment',
@@ -329,21 +479,16 @@ try {
 }
 
 PluginFieldsContainer::$options = [];
-PluginFieldsContainer::$type = 'dropdown';
+PluginFieldsContainer::$type = 'url';
 Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => ['884776' => [
     'glpi_b_field_key' => $key, 'glpi_b_field_uid' => $key,
     'glpi_b_field_label' => 'Name', 'source_of_truth' => 'glpi_a',
 ]]]]);
-try {
-    FieldMapping::syncMappings('test', 'Computer');
-    throw new LogicException('Unsupported custom type was silently accepted');
-} catch (RuntimeException $error) {
-    check(str_contains($error->getMessage(), 'Only Fields-plugin scalar fields'), 'Unsupported custom type must be explicit');
-}
+expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'Only Fields-plugin scalar fields', 'Unsupported custom types must be explicit');
 try {
     FieldsText::descriptor('Computer', 'Monitor.PluginFieldsComputerdmosasset.namefield');
     throw new LogicException('Wrong asset type accepted');
 } catch (RuntimeException $error) {
     check(str_contains($error->getMessage(), 'Invalid Fields-plugin'), 'Reject wrong asset type before row access');
 }
-echo "Fields-plugin scalar tests passed.\n";
+echo "Fields-plugin custom field tests passed.\n";

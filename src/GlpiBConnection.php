@@ -265,7 +265,7 @@ final class GlpiBConnection
             ];
         }
 
-        $fields = self::fieldsFromSearchOptions($fieldsResponse['body']);
+        $fields = self::fieldsFromSearchOptions($fieldsResponse['body'], $itemtype);
         if ($fields === []) {
             return [
                 'success' => false,
@@ -495,7 +495,7 @@ final class GlpiBConnection
         });
     }
 
-    /** Read and optionally write mapped Fields-plugin text/yesno values through child-row REST endpoints. */
+    /** Read and optionally write mapped Fields-plugin values through child-row REST endpoints. */
     public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
     {
         $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
@@ -514,14 +514,13 @@ final class GlpiBConnection
             $historyOptionIds = [];
             $historyRefs = [];
             foreach ($keys as $key) {
-                $descriptor = FieldsText::descriptor($itemtype, $key);
                 $metadata = null;
                 foreach ($options['body'] as $optionId => $option) {
                     if (!is_array($option)) {
                         continue;
                     }
 
-                    if (($option['table'] ?? '') !== $descriptor['table'] || ($option['field'] ?? '') !== $descriptor['field']) {
+                    if (FieldsText::key($itemtype, $option) !== $key) {
                         continue;
                     }
 
@@ -563,6 +562,7 @@ final class GlpiBConnection
                 $containers[$class]['fields'][$key] = [
                     'column' => $metadata['field'],
                     'type' => $metadata['type'],
+                    'metadata' => $metadata,
                 ];
             }
 
@@ -596,9 +596,9 @@ final class GlpiBConnection
                 foreach ($container['fields'] as $key => $fieldInfo) {
                     $column = $fieldInfo['column'];
                     $type = $fieldInfo['type'];
-                    $values[$key] = $row === [] ? FieldsText::missingValue($type) : FieldsText::normalizeReadValue($type, $row[$column] ?? null);
+                    $values[$key] = $row === [] ? FieldsText::missingValue($type) : self::customReadValue($connection, $headers, $fieldInfo['metadata'], $row[$column] ?? null);
                     if (array_key_exists($key, $changes)) {
-                        $input[$column] = FieldsText::normalizeValue($type, $changes[$key]);
+                        $input[$column] = self::customWriteValue($connection, $headers, $fieldInfo['metadata'], $changes[$key]);
                     }
                 }
                 if ($input === []) {
@@ -625,9 +625,7 @@ final class GlpiBConnection
                 foreach ($container['fields'] as $key => $fieldInfo) {
                     $column = $fieldInfo['column'];
                     $type = $fieldInfo['type'];
-                    $persisted = array_key_exists($key, $changes)
-                        ? FieldsText::normalizeValue($type, $verified['body'][$column] ?? null)
-                        : FieldsText::normalizeReadValue($type, $verified['body'][$column] ?? null);
+                    $persisted = self::customReadValue($connection, $headers, $fieldInfo['metadata'], $verified['body'][$column] ?? null);
                     if (array_key_exists($key, $changes) && $persisted !== FieldsText::normalizeValue($type, $changes[$key])) {
                         throw new \RuntimeException('GLPI B did not persist the Fields-plugin ' . $type . ' value: ' . $key);
                     }
@@ -637,6 +635,144 @@ final class GlpiBConnection
 
             return ['success' => true, 'item' => $values, 'history_option_ids' => $historyOptionIds, 'history_refs' => $historyRefs];
         });
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param list<string> $headers
+     * @param array<string,mixed> $metadata
+     */
+    private static function customReadValue(array $connection, array $headers, array $metadata, $value)
+    {
+        $type = (string) ($metadata['type'] ?? '');
+        if ($type !== 'dropdown') {
+            return FieldsText::normalizeReadValue($type, $value);
+        }
+
+        $id = self::cleanRemoteId($value);
+        if ($id <= 0) {
+            return '';
+        }
+
+        return self::remoteDropdownLabelForId(
+            self::remoteDropdownRows($connection, $headers, $metadata),
+            $id,
+            (string) ($metadata['key'] ?? 'unknown')
+        );
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param list<string> $headers
+     * @param array<string,mixed> $metadata
+     */
+    private static function customWriteValue(array $connection, array $headers, array $metadata, $value)
+    {
+        $type = (string) ($metadata['type'] ?? '');
+        if ($type !== 'dropdown') {
+            return FieldsText::normalizeValue($type, $value);
+        }
+
+        $label = FieldsText::normalizeValue($type, $value);
+        if ($label === '') {
+            return 0;
+        }
+
+        return self::remoteDropdownIdForLabel(
+            self::remoteDropdownRows($connection, $headers, $metadata),
+            $label,
+            (string) ($metadata['key'] ?? 'unknown')
+        );
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param list<string> $headers
+     * @param array<string,mixed> $metadata
+     * @return list<array<string,mixed>>
+     */
+    private static function remoteDropdownRows(array $connection, array $headers, array $metadata): array
+    {
+        $class = (string) ($metadata['dropdown_class'] ?? '');
+        if ($class === '') {
+            throw new \RuntimeException('The remote Fields-plugin dropdown class is unavailable: ' . ($metadata['key'] ?? 'unknown'));
+        }
+
+        $response = self::request(
+            'GET',
+            self::apiUrlWithQuery($connection['base_url'], rawurlencode($class), ['range' => '0-999', 'get_hateoas' => 0]),
+            $headers
+        );
+        if (!$response['success']) {
+            throw new \RuntimeException('Cannot read GLPI B Fields-plugin dropdown options for ' . ($metadata['key'] ?? 'unknown') . '. ' . $response['message']);
+        }
+
+        $body = $response['body'];
+        if (isset($body['data']) && is_array($body['data'])) {
+            $body = $body['data'];
+        }
+
+        if (!is_array($body)) {
+            return [];
+        }
+
+        $rows = [];
+        foreach ($body as $row) {
+            if (is_array($row)) {
+                $rows[] = $row;
+            }
+        }
+
+        return $rows;
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     */
+    private static function remoteDropdownLabelForId(array $rows, int $id, string $key): string
+    {
+        foreach ($rows as $row) {
+            if (self::cleanRemoteId($row['id'] ?? 0) !== $id) {
+                continue;
+            }
+
+            $label = FieldsText::dropdownLabel($row);
+            if ($label === '') {
+                throw new \RuntimeException('The remote Fields-plugin dropdown option has no label for ' . $key . ': ' . $id);
+            }
+
+            return $label;
+        }
+
+        throw new \RuntimeException('The remote Fields-plugin dropdown option is missing for ' . $key . ': ' . $id);
+    }
+
+    /**
+     * @param list<array<string,mixed>> $rows
+     */
+    private static function remoteDropdownIdForLabel(array $rows, string $label, string $key): int
+    {
+        $matches = [];
+        foreach ($rows as $row) {
+            if (FieldsText::dropdownLabel($row) !== $label) {
+                continue;
+            }
+
+            $id = self::cleanRemoteId($row['id'] ?? 0);
+            if ($id > 0) {
+                $matches[$id] = true;
+            }
+        }
+
+        if ($matches === []) {
+            throw new \RuntimeException('The destination GLPI B Fields-plugin dropdown option is missing for ' . $key . ': ' . $label);
+        }
+
+        if (count($matches) > 1) {
+            throw new \RuntimeException('The destination GLPI B Fields-plugin dropdown option label is duplicated for ' . $key . ': ' . $label);
+        }
+
+        return (int) array_key_first($matches);
     }
 
     /**
@@ -861,7 +997,7 @@ final class GlpiBConnection
      * @param array<string,mixed> $options
      * @return list<array{key:string,id:string,uid:string,label:string}>
      */
-    private static function fieldsFromSearchOptions(array $options): array
+    private static function fieldsFromSearchOptions(array $options, string $itemtype = 'Computer'): array
     {
         $fields = [];
         $seenKeys = [];
@@ -877,6 +1013,28 @@ final class GlpiBConnection
             }
 
             $id = self::searchOptionId($optionId, $option);
+            $customKey = FieldsText::key($itemtype, $option);
+            if ($customKey !== '') {
+                try {
+                    FieldsText::validate($option);
+                } catch (\RuntimeException) {
+                    continue;
+                }
+
+                if (isset($seenKeys[$customKey])) {
+                    continue;
+                }
+
+                $seenKeys[$customKey] = true;
+                $fields[] = [
+                    'key' => $customKey,
+                    'id' => $id,
+                    'uid' => $customKey,
+                    'label' => $label,
+                ];
+                continue;
+            }
+
             if ($id === '' && self::isHeaderOnlySearchOption($option)) {
                 continue;
             }
