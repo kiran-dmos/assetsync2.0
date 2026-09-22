@@ -13,13 +13,15 @@ final class AssetSyncService
 
     /** @var object|string */
     private $remoteClient;
+    private ?\DateTimeImmutable $billingDate;
 
     /**
      * @param object|string|null $remoteClient
      */
-    public function __construct($remoteClient = null)
+    public function __construct($remoteClient = null, ?\DateTimeImmutable $billingDate = null)
     {
         $this->remoteClient = $remoteClient ?? GlpiBConnection::class;
+        $this->billingDate = $billingDate;
     }
 
     public static function uninstall(): void
@@ -126,8 +128,10 @@ final class AssetSyncService
         $route = $scope['route'];
         try {
             $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
-            FieldMapping::expectedCustomTypes($itemtype, $mappings);
-            $asset += FieldsText::localValues($itemtype, $itemsId, array_column($mappings, 'glpi_a_field'));
+            $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
+            $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, $customTypes);
+            $asset = $prepared['asset'];
+            $mappings = $prepared['mappings'];
         } catch (\Throwable $error) {
             AssetSyncLink::saveStatus($itemtype, $itemsId, $connectionId, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
             return false;
@@ -253,7 +257,10 @@ final class AssetSyncService
         try {
             $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
             $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
-            $asset += FieldsText::localValues($itemtype, $itemsId, array_column($mappings, 'glpi_a_field'));
+            $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, $customTypes);
+            $asset = $prepared['asset'];
+            $mappings = $prepared['mappings'];
+            $customTypes = $prepared['custom_types'];
         } catch (\Throwable $error) {
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
             return;
@@ -417,6 +424,14 @@ final class AssetSyncService
         }
 
         $finalAsset = array_merge($asset, $changes['local']);
+        if ($changes['local'] !== []) {
+            try {
+                $finalAsset = $this->applyHardwareBilling($itemtype, $itemsId, $finalAsset);
+            } catch (\RuntimeException $error) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, $error->getMessage(), $remoteItemsId);
+                return;
+            }
+        }
         AssetSyncLink::save([
             'itemtype'             => $itemtype,
             'items_id'             => $itemsId,
@@ -648,6 +663,64 @@ final class AssetSyncService
         $fields['id'] = (int) ($fields['id'] ?? $itemsId);
 
         return $fields;
+    }
+
+    /**
+     * @param array<string,mixed> $asset
+     * @param list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}> $mappings
+     * @param array<string,string> $customTypes
+     * @return array{
+     *     asset:array<string,mixed>,
+     *     mappings:list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}>,
+     *     custom_types:array<string,string>
+     * }
+     */
+    private function prepareAssetForSync(string $itemtype, int $itemsId, array $asset, array $mappings, array $customTypes): array
+    {
+        $localValueKeys = array_merge(
+            array_column($mappings, 'glpi_a_field'),
+            HardwareBilling::localInputKeys($itemtype),
+            HardwareBilling::localOutputKeys($itemtype)
+        );
+        $asset += FieldsText::localValues($itemtype, $itemsId, $localValueKeys);
+
+        $asset = $this->applyHardwareBilling($itemtype, $itemsId, $asset);
+
+        return [
+            'asset' => $asset,
+            'mappings' => $mappings,
+            'custom_types' => $customTypes,
+        ];
+    }
+
+    /**
+     * @param array<string,mixed> $asset
+     * @return array<string,mixed>
+     */
+    private function applyHardwareBilling(string $itemtype, int $itemsId, array $asset): array
+    {
+        $billing = HardwareBilling::syncData($itemtype, $asset, $this->billingDate ?? new \DateTimeImmutable('today'));
+        if ($billing['values'] !== []) {
+            $billingChanges = [];
+            foreach ($billing['values'] as $key => $value) {
+                if (($asset[$key] ?? null) !== $value) {
+                    $billingChanges[$key] = $value;
+                }
+            }
+
+            if ($billingChanges !== []) {
+                $updatedBilling = AssetChangeHook::withoutQueue(
+                    fn (): bool => FieldsText::updateLocal($itemtype, $itemsId, $billingChanges, true)
+                );
+                if (!$updatedBilling) {
+                    throw new \RuntimeException('GLPI A rejected the HW Billing field update.');
+                }
+            }
+
+            $asset = array_merge($asset, $billing['values']);
+        }
+
+        return $asset;
     }
 
     /**

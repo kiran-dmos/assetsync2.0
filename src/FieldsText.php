@@ -116,10 +116,18 @@ final class FieldsText
         }
 
         if ($type === self::TYPE_DATE) {
+            if ($value === null || $value === '') {
+                return '';
+            }
+
             return self::normalizeDate($value);
         }
 
         if ($type === self::TYPE_DATETIME) {
+            if ($value === null || $value === '') {
+                return '';
+            }
+
             return self::normalizeDateTime($value);
         }
 
@@ -305,7 +313,7 @@ final class FieldsText
         return $values;
     }
 
-    public static function updateLocal(string $itemtype, int $itemsId, array $values): bool
+    public static function updateLocal(string $itemtype, int $itemsId, array $values, bool $allowReadonly = false): bool
     {
         foreach ($values as $key => $value) {
             $metadata = null;
@@ -320,7 +328,7 @@ final class FieldsText
                     break;
                 }
             }
-            if ($metadata === null || !$metadata['writable']) {
+            if ($metadata === null || (!$allowReadonly && !$metadata['writable'])) {
                 return false;
             }
             $value = self::normalizeValue($metadata['type'], $value);

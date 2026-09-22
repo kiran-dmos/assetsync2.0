@@ -405,6 +405,10 @@ function getTableForItemType($class): string
         return 'glpi_plugin_fields_departmentfielddropdowns';
     }
 
+    if ($class === 'PluginFieldsHwbillingfrequencyfieldDropdown') {
+        return 'glpi_plugin_fields_hwbillingfrequencyfielddropdowns';
+    }
+
     return 'glpi_plugin_fields_computerdmosassets';
 }
 
@@ -528,6 +532,32 @@ class PluginFieldsDepartmentfieldDropdown
     public static function getTable(): string
     {
         return 'glpi_plugin_fields_departmentfielddropdowns';
+    }
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$rows[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+
+    public function find(array $criteria = []): array
+    {
+        return self::$rows;
+    }
+}
+
+class PluginFieldsHwbillingfrequencyfieldDropdown
+{
+    public static array $rows = [
+        1 => ['id' => 1, 'name' => 'Monthly', 'completename' => 'Monthly'],
+        2 => ['id' => 2, 'name' => 'Annual', 'completename' => 'Annual'],
+    ];
+    public array $fields = [];
+
+    public static function getTable(): string
+    {
+        return 'glpi_plugin_fields_hwbillingfrequencyfielddropdowns';
     }
 
     public function getFromDB($id): bool
@@ -2315,6 +2345,316 @@ $remoteClient->customDropdownOptions[$dropdownKey] = [
     211 => ['id' => 211, 'name' => 'Software remote', 'completename' => 'Operations > Software'],
     212 => ['id' => 212, 'name' => 'Empty remote', 'completename' => 'Operations > Empty'],
 ];
+
+$billingStartKey = 'Computer.PluginFieldsComputerdmosasset.hwbillingstartdatefield';
+$billingEndKey = 'Computer.PluginFieldsComputerdmosasset.hwbillingenddatefield';
+$billingFrequencyKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_hwbillingfrequencyfielddropdowns_id';
+$billingMonthKey = 'Computer.PluginFieldsComputerdmosasset.hwbillingmonthfield';
+PluginFieldsField::$definitions += [
+    20 => [
+        'id' => 20,
+        'name' => 'statusfield',
+        'type' => 'text',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    21 => [
+        'id' => 21,
+        'name' => 'ownershipfield',
+        'type' => 'text',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    22 => [
+        'id' => 22,
+        'name' => 'hwbillablefieldtwo',
+        'type' => 'yesno',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    23 => [
+        'id' => 23,
+        'name' => 'installeddatevariantfield',
+        'type' => 'date',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    24 => [
+        'id' => 24,
+        'name' => 'computermodelfield',
+        'type' => 'text',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    25 => [
+        'id' => 25,
+        'name' => 'hwbillingstartdatefield',
+        'type' => 'date',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    26 => [
+        'id' => 26,
+        'name' => 'hwbillingenddatefield',
+        'type' => 'date',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    27 => [
+        'id' => 27,
+        'name' => 'hwbillingfrequencyfield',
+        'type' => 'dropdown',
+        'multiple' => 0,
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    28 => [
+        'id' => 28,
+        'name' => 'hwbillingmonthfield',
+        'type' => 'number',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+];
+PluginFieldsContainer::$options = [
+    884790 => [
+        'name' => 'DMOS Asset - Status',
+        'field' => 'statusfield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'text',
+        'pfields_fields_id' => 20,
+    ],
+    884791 => [
+        'name' => 'DMOS Asset - Ownership',
+        'field' => 'ownershipfield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'text',
+        'pfields_fields_id' => 21,
+    ],
+    884792 => [
+        'name' => 'DMOS Asset - HW Billable',
+        'field' => 'hwbillablefieldtwo',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'yesno',
+        'pfields_fields_id' => 22,
+    ],
+    884793 => [
+        'name' => 'DMOS Asset - Installed Date',
+        'field' => 'installeddatevariantfield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'date',
+        'pfields_fields_id' => 23,
+    ],
+    884794 => [
+        'name' => 'DMOS Asset - Computer Model',
+        'field' => 'computermodelfield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'text',
+        'pfields_fields_id' => 24,
+    ],
+    884795 => [
+        'name' => 'DMOS Asset - HW Billing Start Date',
+        'field' => 'hwbillingstartdatefield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'date',
+        'pfields_fields_id' => 25,
+    ],
+    884796 => [
+        'name' => 'DMOS Asset - HW Billing End Date',
+        'field' => 'hwbillingenddatefield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'date',
+        'pfields_fields_id' => 26,
+    ],
+    884797 => [
+        'name' => 'DMOS Asset - HW Billing Frequency',
+        'field' => 'completename',
+        'table' => 'glpi_plugin_fields_hwbillingfrequencyfielddropdowns',
+        'linkfield' => 'plugin_fields_hwbillingfrequencyfielddropdowns_id',
+        'datatype' => 'dropdown',
+        'pfields_type' => 'dropdown',
+        'pfields_fields_id' => 27,
+        'is_multiple' => 0,
+        'joinparams' => [
+            'beforejoin' => [
+                'table' => 'glpi_plugin_fields_computerdmosassets',
+            ],
+        ],
+    ],
+    884798 => [
+        'name' => 'DMOS Asset - HW Billing Month',
+        'field' => 'hwbillingmonthfield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'number',
+        'pfields_fields_id' => 28,
+    ],
+];
+\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    'name' => [
+        'glpi_b_field_key' => 'Computer.name',
+        'source_of_truth' => 'glpi_a',
+    ],
+    'serial' => [
+        'glpi_b_field_key' => 'Computer.serial',
+        'source_of_truth' => 'glpi_a',
+    ],
+    $billingStartKey => [
+        'glpi_b_field_key' => $billingStartKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+    $billingEndKey => [
+        'glpi_b_field_key' => $billingEndKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+    $billingFrequencyKey => [
+        'glpi_b_field_key' => $billingFrequencyKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+    $billingMonthKey => [
+        'glpi_b_field_key' => $billingMonthKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+], [
+    [
+        'key' => 'Computer.name',
+        'id' => '1',
+        'uid' => 'Computer.name',
+        'label' => 'Name',
+    ],
+    [
+        'key' => 'Computer.serial',
+        'id' => '5',
+        'uid' => 'Computer.serial',
+        'label' => 'Serial number',
+    ],
+    [
+        'key' => $billingStartKey,
+        'id' => '884795',
+        'uid' => $billingStartKey,
+        'label' => 'HW Billing Start Date',
+    ],
+    [
+        'key' => $billingEndKey,
+        'id' => '884796',
+        'uid' => $billingEndKey,
+        'label' => 'HW Billing End Date',
+    ],
+    [
+        'key' => $billingFrequencyKey,
+        'id' => '884797',
+        'uid' => $billingFrequencyKey,
+        'label' => 'HW Billing Frequency',
+    ],
+    [
+        'key' => $billingMonthKey,
+        'id' => '884798',
+        'uid' => $billingMonthKey,
+        'label' => 'HW Billing Month',
+    ],
+]);
+$DB->insert('glpi_computers', [
+    'id' => 611,
+    'entities_id' => 20,
+    'is_deleted' => 0,
+    'name' => 'Billing Local',
+    'serial' => 'SER-611',
+    'otherserial' => '',
+    'comment' => '',
+    'date_mod' => '2026-01-01 00:00:00',
+]);
+PluginFieldsComputerdmosasset::$rows[611] = [
+    'id' => 1611,
+    'items_id' => 611,
+    'itemtype' => 'Computer',
+    'plugin_fields_containers_id' => 1,
+    'statusfield' => 'Active',
+    'ownershipfield' => 'Customer Leased',
+    'hwbillablefieldtwo' => 1,
+    'installeddatevariantfield' => '2026-01-06',
+    'computermodelfield' => 'Lenovo ThinkPad L14 Gen 6',
+];
+$remoteClient->records['production:Computer'][2611] = [
+    'id' => 2611,
+    'entities_id' => 200,
+    'is_deleted' => 0,
+    'name' => 'Billing Remote',
+    'serial' => 'SER-611',
+    'date_mod' => '2026-01-01 00:00:00',
+];
+$remoteClient->customDropdownOptions[$billingFrequencyKey] = [
+    310 => ['id' => 310, 'name' => 'Monthly', 'completename' => 'Monthly'],
+    311 => ['id' => 311, 'name' => 'Annual', 'completename' => 'Annual'],
+];
+$billingAprilService = new \GlpiPlugin\Assetsync20\AssetSyncService($remoteClient, new DateTimeImmutable('2026-04-20'));
+if (!$billingAprilService->queueAssetIfNeeded('Computer', 611, 'production')) {
+    throw new RuntimeException('Hardware Billing should queue an eligible asset when billing fields are mapped.');
+}
+$billingLocal = PluginFieldsComputerdmosasset::$rows[611] ?? [];
+if (
+    ($billingLocal['hwbillingstartdatefield'] ?? null) !== '2026-02-01'
+    || ($billingLocal['hwbillingenddatefield'] ?? null) !== '2030-01-31'
+    || ($billingLocal['plugin_fields_hwbillingfrequencyfielddropdowns_id'] ?? null) !== 1
+    || ($billingLocal['hwbillingmonthfield'] ?? null) !== 3
+) {
+    throw new RuntimeException('Hardware Billing should write calculated monthly values to GLPI A custom fields.');
+}
+$billingAprilService->processQueue(10);
+$billingRecord = $remoteClient->customRecords['production:Computer'][2611] ?? [];
+if (
+    ($billingRecord[$billingStartKey] ?? null) !== '2026-02-01'
+    || ($billingRecord[$billingEndKey] ?? null) !== '2030-01-31'
+    || ($billingRecord[$billingFrequencyKey] ?? null) !== 310
+    || ($billingRecord[$billingMonthKey] ?? null) !== 3
+) {
+    throw new RuntimeException('Mapped Hardware Billing fields should sync calculated monthly values to GLPI B custom fields.');
+}
+
+$billingMayService = new \GlpiPlugin\Assetsync20\AssetSyncService($remoteClient, new DateTimeImmutable('2026-05-01'));
+if (!$billingMayService->queueAssetIfNeeded('Computer', 611, 'production')) {
+    throw new RuntimeException('Hardware Billing month rollover should queue without normal payload changes.');
+}
+$billingMayService->processQueue(10);
+$billingLocal = PluginFieldsComputerdmosasset::$rows[611] ?? [];
+if (($billingLocal['hwbillingmonthfield'] ?? null) !== 4) {
+    throw new RuntimeException('Hardware Billing month rollover should update the GLPI A billing month.');
+}
+$billingRecord = $remoteClient->customRecords['production:Computer'][2611] ?? [];
+if (($billingRecord[$billingMonthKey] ?? null) !== 4) {
+    throw new RuntimeException('Hardware Billing month rollover should update the GLPI B billing month.');
+}
+
+PluginFieldsComputerdmosasset::$rows[611]['hwbillablefieldtwo'] = 0;
+if (!$billingMayService->queueAssetIfNeeded('Computer', 611, 'production')) {
+    throw new RuntimeException('Hardware Billing should queue when an asset becomes ineligible.');
+}
+$billingMayService->processQueue(10);
+$billingLocal = PluginFieldsComputerdmosasset::$rows[611] ?? [];
+if (
+    ($billingLocal['hwbillingstartdatefield'] ?? null) !== ''
+    || ($billingLocal['hwbillingenddatefield'] ?? null) !== ''
+    || ($billingLocal['plugin_fields_hwbillingfrequencyfielddropdowns_id'] ?? null) !== 0
+    || ($billingLocal['hwbillingmonthfield'] ?? null) !== 0
+) {
+    throw new RuntimeException('Hardware Billing should clear/reset GLPI A values when an asset becomes ineligible.');
+}
+$billingRecord = $remoteClient->customRecords['production:Computer'][2611] ?? [];
+if (
+    ($billingRecord[$billingStartKey] ?? null) !== ''
+    || ($billingRecord[$billingEndKey] ?? null) !== ''
+    || ($billingRecord[$billingFrequencyKey] ?? null) !== 0
+    || ($billingRecord[$billingMonthKey] ?? null) !== 0
+) {
+    throw new RuntimeException('Hardware Billing should clear/reset GLPI B values when an asset becomes ineligible.');
+}
 
 Config::$values = [
     'plugin:assetsync20' => [

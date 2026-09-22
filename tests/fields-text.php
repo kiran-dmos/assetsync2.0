@@ -7,6 +7,7 @@ require_once __DIR__ . '/../src/autoload.php';
 use GlpiPlugin\Assetsync20\AssetSyncService;
 use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\FieldsText;
+use GlpiPlugin\Assetsync20\HardwareBilling;
 
 class Config
 {
@@ -304,8 +305,10 @@ expectRuntime(static fn (): array => FieldsText::customMetadata('Computer', ['Co
 expectRuntime(static fn (): int => FieldsText::normalizeValue('int', '42.5'), 'number value', 'Decimal number values must block clearly');
 expectRuntime(static fn (): int => FieldsText::normalizeValue('int', 'forty-two'), 'number value', 'Invalid number strings must block clearly');
 check(FieldsText::normalizeValue('date', '2026-09-14') === '2026-09-14', 'Valid dates must normalize');
+check(FieldsText::normalizeValue('date', '') === '', 'Blank dates must be accepted for clear/reset writes');
 expectRuntime(static fn (): string => FieldsText::normalizeValue('date', '2026-02-29'), 'date value', 'Invalid dates must block clearly');
 check(FieldsText::normalizeValue('datetime', '2026-09-14 08:09:10') === '2026-09-14 08:09:10', 'Valid datetimes must normalize');
+check(FieldsText::normalizeValue('datetime', '') === '', 'Blank datetimes must be accepted for clear/reset writes');
 expectRuntime(static fn (): string => FieldsText::normalizeValue('datetime', '2026-09-14T08:09:10'), 'datetime value', 'Invalid datetimes must block clearly');
 $notesMetadata = FieldsText::customMetadata('Computer', [$notesKeyA])[$notesKeyA];
 expectRuntime(static fn (): array => FieldsText::metadataWithDefinition($notesMetadata, PluginFieldsField::$definitions[5]), 'definition type', 'Type mismatches must block clearly');
@@ -314,7 +317,115 @@ $inactiveDefinition['is_active'] = 0;
 expectRuntime(static fn (): array => FieldsText::metadataWithDefinition($notesMetadata, $inactiveDefinition), 'inactive', 'Inactive Fields metadata must block clearly');
 PluginFieldsField::$definitions[4]['is_readonly'] = 1;
 check(!FieldsText::updateLocal('Computer', 2, [$notesKeyA => 'Blocked']), 'Read-only destination custom fields must block');
+check(FieldsText::updateLocal('Computer', 2, [$notesKeyA => 'Calculated'], true), 'Internal calculated custom field updates may write read-only fields');
+check(PluginFieldsComputerdmosasset::$row['notesfield'] === 'Calculated', 'Internal calculated custom field update must persist read-only values');
 PluginFieldsField::$definitions[4]['is_readonly'] = 0;
+
+$billingKeys = [
+    'status' => 'status',
+    'ownership' => 'ownership',
+    'billable' => 'billable',
+    'installed_date' => 'installed_date',
+    'model' => 'model',
+];
+$monthlyBilling = HardwareBilling::calculateValues([
+    'status' => 'Active',
+    'ownership' => 'Customer Leased',
+    'billable' => 1,
+    'installed_date' => '2026-01-05',
+    'model' => 'Lenovo ThinkPad L14 Gen 6',
+], $billingKeys, new DateTimeImmutable('2026-01-31'));
+check($monthlyBilling === [
+    'start_date' => '2026-01-01',
+    'end_date' => '2029-12-31',
+    'frequency' => 'Monthly',
+    'month' => 1,
+], 'Hardware Billing should start in the installed month when installed by day 5');
+$annualBilling = HardwareBilling::calculateValues([
+    'status' => 'Active',
+    'ownership' => 'Customer Leased',
+    'billable' => 1,
+    'installed_date' => '2026-01-06',
+    'model' => 'Lenovo ThinkStation P7',
+], $billingKeys, new DateTimeImmutable('2026-01-31'));
+check($annualBilling === [
+    'start_date' => '2026-02-01',
+    'end_date' => '2030-01-31',
+    'frequency' => 'Annual',
+    'month' => 0,
+], 'Hardware Billing should start next month after day 5 and use Annual for the exact P7 label');
+$cappedBilling = HardwareBilling::calculateValues([
+    'status' => 'In Use',
+    'ownership' => 'Customer Leased',
+    'billable' => 'yes',
+    'installed_date' => '2026-01-06',
+    'model' => 'Lenovo ThinkStation P7',
+], $billingKeys, new DateTimeImmutable('2032-05-10'));
+check($cappedBilling['month'] === 48, 'Hardware Billing month must cap at the 48 month cycle');
+$resetBilling = HardwareBilling::calculateValues([
+    'status' => 'Retired - Disposed',
+    'ownership' => 'Customer Leased',
+    'billable' => 1,
+    'installed_date' => '2026-01-05',
+    'model' => 'Lenovo ThinkStation P7',
+], $billingKeys, new DateTimeImmutable('2026-01-31'));
+check($resetBilling === [
+    'start_date' => '',
+    'end_date' => '',
+    'frequency' => '',
+    'month' => 0,
+], 'Ineligible Hardware Billing assets must reset calculated fields');
+$unsupportedModelBilling = HardwareBilling::calculateValues([
+    'status' => 'Active',
+    'ownership' => 'Customer Leased',
+    'billable' => 1,
+    'installed_date' => '2026-01-05',
+    'model' => 'Lenovo ThinkPad T14',
+], $billingKeys, new DateTimeImmutable('2026-01-31'));
+check($unsupportedModelBilling === [
+    'start_date' => '',
+    'end_date' => '',
+    'frequency' => '',
+    'month' => 0,
+], 'Unsupported Hardware Billing models must reset calculated fields');
+
+$statusKey = 'Computer.PluginFieldsComputerdmosasset.statusfield';
+$ownershipKey = 'Computer.PluginFieldsComputerdmosasset.ownershipfield';
+$billableKey = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
+$installedKey = 'Computer.PluginFieldsComputerdmosasset.installedonfield';
+$modelKey = 'Computer.PluginFieldsComputerdmosasset.computermodelfield';
+PluginFieldsContainer::$options = [
+    884790 => fieldOption(9, 'DMOS Asset - Status', 'statusfield', 'text'),
+    884791 => fieldOption(10, 'DMOS Asset - Ownership', 'ownershipfield', 'text'),
+    884792 => fieldOption(2, 'DMOS Asset - HW Billable', 'hwbillablefieldtwo', 'yesno'),
+    884793 => fieldOption(11, 'DMOS Asset - Installed Date', 'installedonfield', 'date'),
+    884794 => fieldOption(12, 'DMOS Asset - Computer Model', 'computermodelfield', 'text'),
+];
+PluginFieldsComputerdmosasset::$found = true;
+PluginFieldsComputerdmosasset::$row = [
+    'id' => 10,
+    'statusfield' => 'Active',
+    'ownershipfield' => 'Customer Leased',
+    'hwbillablefieldtwo' => 1,
+    'installedonfield' => '2026-01-06',
+    'computermodelfield' => 'Lenovo ThinkStation P7',
+];
+$billingInputKeys = HardwareBilling::localInputKeys('Computer');
+check($billingInputKeys === [$statusKey, $ownershipKey, $billableKey, $installedKey, $modelKey], 'Hardware Billing must discover input fields by metadata labels');
+$billingAsset = FieldsText::localValues('Computer', 2, $billingInputKeys);
+$billingSync = HardwareBilling::syncData('Computer', $billingAsset, new DateTimeImmutable('2026-02-10'));
+check($billingSync['values'] === [
+    'Computer.PluginFieldsComputerdmosasset.hwbillingstartdatefield' => '2026-02-01',
+    'Computer.PluginFieldsComputerdmosasset.hwbillingenddatefield' => '2030-01-31',
+    'Computer.PluginFieldsComputerdmosasset.plugin_fields_hwbillingfrequencyfielddropdowns_id' => 'Annual',
+    'Computer.PluginFieldsComputerdmosasset.hwbillingmonthfield' => 1,
+], 'Hardware Billing sync data must expose calculated output values with stable remote keys');
+check($billingSync['custom_types'] === [
+    'Computer.PluginFieldsComputerdmosasset.hwbillingstartdatefield' => 'date',
+    'Computer.PluginFieldsComputerdmosasset.hwbillingenddatefield' => 'date',
+    'Computer.PluginFieldsComputerdmosasset.plugin_fields_hwbillingfrequencyfielddropdowns_id' => 'dropdown',
+    'Computer.PluginFieldsComputerdmosasset.hwbillingmonthfield' => 'int',
+], 'Hardware Billing output metadata must keep the expected remote field types');
 
 $yesKeyA = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
 $yesKeyB = 'Computer.PluginFieldsComputerdmosasset.hwbillablefield';
