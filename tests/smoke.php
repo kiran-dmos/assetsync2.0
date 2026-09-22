@@ -147,6 +147,12 @@ final class FakeDB
 
     /** @var array<string,int> */
     private array $nextIds = [];
+    public string $timezone = '';
+
+    public function guessTimezone(): string
+    {
+        return $this->timezone !== '' ? $this->timezone : date_default_timezone_get();
+    }
 
     public function tableExists(string $table): bool
     {
@@ -606,6 +612,7 @@ class PluginFieldsStatusfieldDropdown
 final class FakeGlpiBClient
 {
     public array $unavailableCustomKeys = [];
+    public string $dateModTimezone = 'UTC';
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $records = [];
     /** @var array<string,array<int,array<string,mixed>>> */
@@ -659,6 +666,7 @@ final class FakeGlpiBClient
             'item' => $record ?? [],
             'missing' => $record === null,
             'transient' => false,
+            'date_mod_timezone' => $this->dateModTimezone,
         ];
     }
 
@@ -812,6 +820,7 @@ final class FakeGlpiBClient
             'message' => 'custom history loaded',
             'dates' => $dates,
             'transient' => false,
+            'date_mod_timezone' => $this->dateModTimezone,
         ];
     }
 
@@ -2237,6 +2246,36 @@ if (hasPendingProductionQueue($DB, 602)) {
     throw new RuntimeException('Sync-written local custom value should not feed back into a new queued job.');
 }
 
+$oldPhpTimezone = date_default_timezone_get();
+$oldDbTimezone = $DB->timezone;
+$remoteClient->dateModTimezone = 'UTC';
+date_default_timezone_set('UTC');
+$DB->timezone = 'Asia/Brunei';
+try {
+    seedLinkedCustomComputer($DB, $remoteClient, 613, 2613, $customKey, $customOptionId, $remoteCustomOptionId, 'Kiran PC 06', '2026-09-22 21:53:07', 'Both verification B newer', null);
+    $DB->update('glpi_computers', ['date_mod' => '2026-09-14 14:05:43'], ['id' => 613]);
+    $remoteClient->records['production:Computer'][2613]['date_mod'] = '2026-09-14 06:05:49';
+    $remoteClient->customHistoryLogs['production:Computer'][2613] = [
+        ['id' => 1091, 'id_search_option' => (int) $remoteCustomOptionId, 'itemtype_link' => '', 'date_mod' => '2026-09-22 13:56:20'],
+        ['id' => 1092, 'id_search_option' => (int) $remoteCustomOptionId, 'itemtype_link' => '', 'date_mod' => '2026-09-22 13:56:20'],
+        ['id' => 1093, 'id_search_option' => (int) $remoteCustomOptionId, 'itemtype_link' => '', 'date_mod' => '2026-09-22 13:56:41'],
+    ];
+    if (!$syncService->queueAssetIfNeeded('Computer', 613, 'production', true)) {
+        throw new RuntimeException('Timezone-offset custom Both edit should queue for conflict resolution.');
+    }
+    $syncService->processQueue(10);
+    if ((PluginFieldsComputerdmosasset::$rows[613]['namefield'] ?? null) !== 'Both verification B newer') {
+        throw new RuntimeException('Custom Both should compare GLPI B UTC history against GLPI A local history before choosing a winner.');
+    }
+    if (($remoteClient->customRecords['production:Computer'][2613][$customKey] ?? null) !== 'Both verification B newer') {
+        throw new RuntimeException('Custom Both timezone regression should keep the newer GLPI B value unchanged.');
+    }
+} finally {
+    date_default_timezone_set($oldPhpTimezone);
+    $DB->timezone = $oldDbTimezone;
+    $remoteClient->dateModTimezone = 'UTC';
+}
+
 seedLinkedCustomComputer($DB, $remoteClient, 603, 2603, $customKey, $customOptionId, $remoteCustomOptionId, '', '2026-09-14 08:20:00', 'filled', '2026-09-14 08:10:00');
 if (!$syncService->queueAssetIfNeeded('Computer', 603, 'production')) {
     throw new RuntimeException('Newer custom blank should queue for Both conflict resolution.');
@@ -2257,6 +2296,22 @@ if (($customBlockedLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLi
 }
 if (($remoteClient->customRecords['production:Computer'][2604][$customKey] ?? null) !== 'Remote without reliable history') {
     throw new RuntimeException('Blocked custom history conflict should not write GLPI B.');
+}
+
+$remoteClient->dateModTimezone = '';
+try {
+    seedLinkedCustomComputer($DB, $remoteClient, 614, 2614, $customKey, $customOptionId, $remoteCustomOptionId, 'Local with unknown remote timezone', '2026-09-22 21:53:07', 'Remote with unknown remote timezone', '2026-09-22 13:56:41');
+    if (!$syncService->queueAssetIfNeeded('Computer', 614, 'production', true)) {
+        throw new RuntimeException('Unknown remote timezone conflict should queue for blocking.');
+    }
+    $syncService->processQueue(10);
+    $timezoneBlockedLink = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 614, 'production');
+    if (($timezoneBlockedLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT
+        || !str_contains((string) ($timezoneBlockedLink['last_error'] ?? ''), 'Set a named timezone such as UTC on the GLPI B API user')) {
+        throw new RuntimeException('Unknown remote timezone conflict should explain the named API user timezone setup.');
+    }
+} finally {
+    $remoteClient->dateModTimezone = 'UTC';
 }
 
 configureCustomNameMapping('glpi_a', $customKey, $remoteCustomOptionId);

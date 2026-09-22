@@ -218,6 +218,10 @@ $historyDates = $historyFilter->invoke(null, [
     ['id' => 937, 'id_search_option' => 0, 'itemtype_link' => 'PluginFieldsComputerdmosasset', 'date_mod' => '2026-09-14 08:16:21'],
 ], $historyRefs);
 check($historyDates === [$key => '2026-09-14 08:16:21'], 'Generated container history must outrank older field-option history');
+$sessionTimezone = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'sessionTimezone');
+$sessionTimezone->setAccessible(true);
+check($sessionTimezone->invoke(null, ['glpitimezone' => 'Asia/Brunei']) === 'Asia/Brunei', 'GLPI B named session timezone must be preserved for date_mod parsing');
+check($sessionTimezone->invoke(null, ['glpitimezone' => '0', 'glpi_currenttime' => gmdate('Y-m-d H:i:s')]) === '', 'GLPI B default/server timezone must not be guessed from current session time');
 $metadata = FieldsText::metadataWithDefinition($metadata, PluginFieldsField::$definitions[1]);
 check($metadata['container_id'] === 1, 'Generated metadata must identify the Fields container id');
 check($metadata['writable'] === true, 'Generated metadata must identify writable fields');
@@ -245,21 +249,39 @@ $mappings[0]['source_of_truth'] = 'both';
 $asset['date_mod'] = '2026-09-14 06:05:43';
 $remote['date_mod'] = '2026-09-14 06:05:49';
 $asset[$key] = '';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-13 10:00:00'])['remote'] === [$key => ''], 'A newer custom blank must clear B even when parent date_mod is stale');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-13 10:00:00'], 'UTC')['remote'] === [$key => ''], 'A newer custom blank must clear B even when parent date_mod is stale');
 $asset[$key] = 'local text';
 $remote[$key] = '';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-13 10:00:00'], [$key => '2026-09-14 10:00:00'])['local'] === [$key => ''], 'B newer custom blank must clear A even when parent date_mod is stale');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-13 10:00:00'], [$key => '2026-09-14 10:00:00'], 'UTC')['local'] === [$key => ''], 'B newer custom blank must clear A even when parent date_mod is stale');
 $asset['date_mod'] = '2026-09-14 06:05:43';
 $remote['date_mod'] = '2026-09-14 06:05:49';
 $asset[$key] = 'local text';
 $remote[$key] = 'remote text';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-13 10:00:00'])['remote'] === [$key => 'local text'], 'A newer custom filled value must update B');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-13 10:00:00'], 'UTC')['remote'] === [$key => 'local text'], 'A newer custom filled value must update B');
 $asset['date_mod'] = '2026-09-14 06:05:43';
 $remote['date_mod'] = '2026-09-14 06:05:49';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-13 10:00:00'], [$key => '2026-09-14 10:00:00'])['local'] === [$key => 'remote text'], 'B newer custom filled value must update A');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-13 10:00:00'], [$key => '2026-09-14 10:00:00'], 'UTC')['local'] === [$key => 'remote text'], 'B newer custom filled value must update A');
 $asset['date_mod'] = '2026-09-14 10:30:00';
 $remote['date_mod'] = '2026-09-14 06:05:49';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 08:00:00'], [$key => '2026-09-14 10:00:00'])['remote'] === [$key => 'local text'], 'A parent date_mod may raise a custom timestamp only when custom history exists');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 08:00:00'], [$key => '2026-09-14 10:00:00'], 'UTC')['remote'] === [$key => 'local text'], 'A parent date_mod may raise a custom timestamp only when custom history exists');
+$missingTimezone = $compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 08:00:00'], [$key => '2026-09-14 10:00:00']);
+check($missingTimezone['conflicts'] === [$key] && $missingTimezone['remote'] === [] && $missingTimezone['local'] === [], 'Both different custom values must block when GLPI B timezone is unavailable');
+$oldTimezone = date_default_timezone_get();
+date_default_timezone_set('Asia/Brunei');
+try {
+    $nativeBoth = [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'both']];
+    $nativeAsset = ['name' => 'local native', 'date_mod' => '2026-09-14 14:05:43'];
+    $nativeRemote = ['entities_id' => 0, 'name' => 'remote native', 'date_mod' => '2026-09-14 06:05:49'];
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'UTC')['local'] === ['name' => 'remote native'], 'Both native timestamps must compare GLPI B UTC against GLPI A local time');
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth)['conflicts'] === ['name'], 'Both native timestamps must block when GLPI B timezone is unavailable');
+    $asset['date_mod'] = '2026-09-14 14:05:43';
+    $remote['date_mod'] = '2026-09-14 06:05:49';
+    $asset[$key] = 'local text';
+    $remote[$key] = 'remote text';
+    check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-22 21:53:07'], [$key => '2026-09-22 13:56:41'], 'UTC')['local'] === [$key => 'remote text'], 'Both custom history timestamps must compare GLPI B UTC against GLPI A local time');
+} finally {
+    date_default_timezone_set($oldTimezone);
+}
 $asset['date_mod'] = '';
 $remote['date_mod'] = 'not-a-date';
 $asset[$key] = 'same text';
@@ -270,13 +292,13 @@ $asset['date_mod'] = '2026-09-14 10:00:00';
 $remote['date_mod'] = '2026-09-14 10:00:00';
 $asset[$key] = 'local text';
 $remote[$key] = 'remote text';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-14 10:00:00'])['conflicts'] === [$key], 'Both different custom values with equal timestamps must conflict');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => '2026-09-14 10:00:00'], [$key => '2026-09-14 10:00:00'], 'UTC')['conflicts'] === [$key], 'Both different custom values with equal timestamps must conflict');
 unset($asset['date_mod']);
 $remote['date_mod'] = '2026-09-14 10:00:00';
-check($compare->invoke($service, $asset, $remote, $route, $mappings)['conflicts'] === [$key], 'Both different custom values with missing history must conflict even when parent dates exist');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [], [], 'UTC')['conflicts'] === [$key], 'Both different custom values with missing history must conflict even when parent dates exist');
 $asset['date_mod'] = 'not-a-date';
 $remote['date_mod'] = '2026-09-14 10:00:00';
-check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => 'not-a-date'], [$key => '2026-09-14 10:00:00'])['conflicts'] === [$key], 'Both different custom values with invalid history must conflict');
+check($compare->invoke($service, $asset, $remote, $route, $mappings, [], [$key => 'not-a-date'], [$key => '2026-09-14 10:00:00'], 'UTC')['conflicts'] === [$key], 'Both different custom values with invalid history must conflict');
 
 $notesKeyA = 'Computer.PluginFieldsComputerdmosasset.notesfield';
 $notesKeyB = 'Computer.PluginFieldsComputerdmosasset.notesfieldb';
@@ -641,7 +663,8 @@ $swsdChanges = $compare->invoke(
     $swsdMappings,
     $swsdTypes,
     [$swsdBillableKey => '2026-06-02 00:00:00'],
-    [$swsdBillableKey => '2026-06-01 00:00:00']
+    [$swsdBillableKey => '2026-06-01 00:00:00'],
+    'UTC'
 );
 check($swsdChanges['remote'] === [$swsdBillableKey => 1], 'Both-sourced SW/SD outputs must keep existing newer-GLPI-A behavior');
 check($swsdChanges['local'] === [], 'Both-sourced SW/SD outputs must not update GLPI A when GLPI A is newer');

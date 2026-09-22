@@ -10,6 +10,7 @@ final class AssetSyncService
     private const SCAN_CURSORS_KEY = 'asset_sync_scan_cursors';
     private const MAX_ROUTE_ENTITY_IDS = 1000;
     private const INBOUND_RECHECK_SECONDS = 3600;
+    private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
 
     /** @var object|string */
     private $remoteClient;
@@ -281,6 +282,7 @@ final class AssetSyncService
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
         $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : (int) ($job['remote_items_id'] ?? 0);
         $remoteItem = null;
+        $remoteDateModTimezone = '';
         $createdRemote = false;
 
         if ($remoteItemsId > 0) {
@@ -296,6 +298,7 @@ final class AssetSyncService
             }
 
             $remoteItem = is_array($remoteResult['item'] ?? null) ? $remoteResult['item'] : [];
+            $remoteDateModTimezone = $this->dateModTimezone($remoteResult[self::DATE_MOD_TIMEZONE_KEY] ?? '');
         } else {
             $searchResult = $this->callRemote('searchBySerial', [$connection, $itemtype, $serial]);
             if (!$this->remoteSucceeded($searchResult)) {
@@ -330,6 +333,7 @@ final class AssetSyncService
                 }
 
                 $remoteItem = is_array($remoteResult['item'] ?? null) ? $remoteResult['item'] : [];
+                $remoteDateModTimezone = $this->dateModTimezone($remoteResult[self::DATE_MOD_TIMEZONE_KEY] ?? '');
             } else {
                 $createResult = $this->callRemote('createItem', [$connection, $itemtype, $this->createInput($asset, $route, $mappings)]);
                 if (!$this->remoteSucceeded($createResult)) {
@@ -373,23 +377,31 @@ final class AssetSyncService
             }
             if ($customHistoryNeeds['remote'] !== []) {
                 $remoteHistoryRefs = $this->historyRefs($customResult['history_refs'] ?? [], $customHistoryNeeds['remote']);
-                $remoteCustomDateMods = $this->remoteCustomHistoryDates($connection, $itemtype, $remoteItemsId, $remoteHistoryRefs, $job, $route['id'], $attempts);
-                if ($remoteCustomDateMods === null) {
+                $remoteHistory = $this->remoteCustomHistoryDates($connection, $itemtype, $remoteItemsId, $remoteHistoryRefs, $job, $route['id'], $attempts);
+                if ($remoteHistory === null) {
                     return;
                 }
+                $remoteCustomDateMods = $remoteHistory['dates'];
+                $remoteHistoryTimezone = $this->dateModTimezone($remoteHistory[self::DATE_MOD_TIMEZONE_KEY] ?? '');
+                $remoteDateModTimezone = $remoteHistoryTimezone !== '' && ($remoteDateModTimezone === '' || $remoteDateModTimezone === $remoteHistoryTimezone)
+                    ? $remoteHistoryTimezone
+                    : '';
             }
-            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes, $localCustomDateMods, $remoteCustomDateMods);
+            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes, $localCustomDateMods, $remoteCustomDateMods, $remoteDateModTimezone);
         } catch (\Throwable $error) {
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
             return;
         }
 
         if ($changes['conflicts'] !== []) {
+            $conflictMessage = $remoteDateModTimezone === ''
+                ? 'Both sides have different values, but GLPI B did not expose a named timezone for timestamp comparison. Set a named timezone such as UTC on the GLPI B API user instead of "Use server configuration" for: '
+                : 'Both sides have different values without a newer valid asset or custom history timestamp for: ';
             $this->blockJob(
                 $job,
                 $route['id'],
                 AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT,
-                'Both sides have different values without a newer valid asset or custom history timestamp for: ' . implode(', ', $changes['conflicts']) . '.',
+                $conflictMessage . implode(', ', $changes['conflicts']) . '.',
                 $remoteItemsId
             );
             return;
@@ -881,9 +893,10 @@ final class AssetSyncService
      * @param array<string,string> $fieldTypes
      * @param array<string,string> $localCustomDateMods
      * @param array<string,string> $remoteCustomDateMods
+     * @param string $remoteDateModTimezone Timezone used by GLPI B date_mod strings.
      * @return array{remote:array<string,mixed>,local:array<string,mixed>,conflicts:list<string>}
      */
-    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings, array $fieldTypes = [], array $localCustomDateMods = [], array $remoteCustomDateMods = []): array
+    private function existingChanges(array $asset, array $remoteItem, array $route, array $mappings, array $fieldTypes = [], array $localCustomDateMods = [], array $remoteCustomDateMods = [], string $remoteDateModTimezone = ''): array
     {
         $remoteChanges = [];
         $localChanges = [];
@@ -917,7 +930,7 @@ final class AssetSyncService
                 continue;
             }
 
-            $newerDateModSource = $this->newerMappingDateModSource($asset, $remoteItem, $mapping, $localCustomDateMods, $remoteCustomDateMods);
+            $newerDateModSource = $this->newerMappingDateModSource($asset, $remoteItem, $mapping, $localCustomDateMods, $remoteCustomDateMods, $remoteDateModTimezone);
 
             if ($newerDateModSource === 'glpi_a') {
                 $remoteChanges[$mapping['glpi_b_field']] = $this->changeValue($localValue, $fieldType);
@@ -1016,12 +1029,12 @@ final class AssetSyncService
      * @param array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool} $connection
      * @param array<string,array{option_id:string,itemtype_link:string}> $historyRefs
      * @param array<string,mixed> $job
-     * @return array<string,string>|null
+     * @return array{dates:array<string,string>,date_mod_timezone:string}|null
      */
     private function remoteCustomHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs, array $job, string $routeId, int $attempts): ?array
     {
         if ($historyRefs === []) {
-            return [];
+            return ['dates' => [], self::DATE_MOD_TIMEZONE_KEY => ''];
         }
 
         $historyResult = $this->callRemote('customHistoryDates', [$connection, $itemtype, $itemsId, $historyRefs]);
@@ -1030,7 +1043,10 @@ final class AssetSyncService
             return null;
         }
 
-        return $this->stringMap($historyResult['dates'] ?? []);
+        return [
+            'dates' => $this->stringMap($historyResult['dates'] ?? []),
+            self::DATE_MOD_TIMEZONE_KEY => $this->dateModTimezone($historyResult[self::DATE_MOD_TIMEZONE_KEY] ?? ''),
+        ];
     }
 
     /**
@@ -1118,29 +1134,35 @@ final class AssetSyncService
      * @param array<string,string> $localCustomDateMods
      * @param array<string,string> $remoteCustomDateMods
      */
-    private function newerMappingDateModSource(array $asset, array $remoteItem, array $mapping, array $localCustomDateMods, array $remoteCustomDateMods): string
+    private function newerMappingDateModSource(array $asset, array $remoteItem, array $mapping, array $localCustomDateMods, array $remoteCustomDateMods, string $remoteDateModTimezone = ''): string
     {
         $localKey = $mapping['glpi_a_field'];
         $remoteKey = $mapping['glpi_b_field'];
+        $localTimezone = $this->dateModTimezone($this->localDateModTimezone());
+        $remoteTimezone = $this->dateModTimezone($remoteDateModTimezone);
+        if ($localTimezone === '' || $remoteTimezone === '') {
+            return '';
+        }
+
         $localDateMod = FieldsText::isCustom($localKey)
-            ? $this->effectiveCustomDateMod((string) ($asset['date_mod'] ?? ''), (string) ($localCustomDateMods[$localKey] ?? ''))
+            ? $this->effectiveCustomDateMod((string) ($asset['date_mod'] ?? ''), (string) ($localCustomDateMods[$localKey] ?? ''), $localTimezone)
             : trim((string) ($asset['date_mod'] ?? ''));
         $remoteDateMod = FieldsText::isCustom($remoteKey)
-            ? $this->effectiveCustomDateMod((string) ($remoteItem['date_mod'] ?? ''), (string) ($remoteCustomDateMods[$remoteKey] ?? ''))
+            ? $this->effectiveCustomDateMod((string) ($remoteItem['date_mod'] ?? ''), (string) ($remoteCustomDateMods[$remoteKey] ?? ''), $remoteTimezone)
             : trim((string) ($remoteItem['date_mod'] ?? ''));
 
-        return $this->newerDateModValueSource($localDateMod, $remoteDateMod);
+        return $this->newerDateModValueSource($localDateMod, $remoteDateMod, $localTimezone, $remoteTimezone);
     }
 
-    private function effectiveCustomDateMod(string $parentDateMod, string $customHistoryDateMod): string
+    private function effectiveCustomDateMod(string $parentDateMod, string $customHistoryDateMod, string $timezone): string
     {
-        $customHistoryTimestamp = $this->validDateModTimestamp(trim($customHistoryDateMod));
+        $customHistoryTimestamp = $this->validDateModTimestamp(trim($customHistoryDateMod), $timezone);
         if ($customHistoryTimestamp === null) {
             return '';
         }
 
         $parentDateMod = trim($parentDateMod);
-        $parentTimestamp = $this->validDateModTimestamp($parentDateMod);
+        $parentTimestamp = $this->validDateModTimestamp($parentDateMod, $timezone);
         if ($parentTimestamp !== null && $parentTimestamp > $customHistoryTimestamp) {
             return $parentDateMod;
         }
@@ -1148,14 +1170,14 @@ final class AssetSyncService
         return trim($customHistoryDateMod);
     }
 
-    private function newerDateModValueSource(string $localDateMod, string $remoteDateMod): string
+    private function newerDateModValueSource(string $localDateMod, string $remoteDateMod, string $localTimezone, string $remoteTimezone): string
     {
         if ($localDateMod === '' || $remoteDateMod === '') {
             return '';
         }
 
-        $localTimestamp = $this->validDateModTimestamp($localDateMod);
-        $remoteTimestamp = $this->validDateModTimestamp($remoteDateMod);
+        $localTimestamp = $this->validDateModTimestamp($localDateMod, $localTimezone);
+        $remoteTimestamp = $this->validDateModTimestamp($remoteDateMod, $remoteTimezone);
 
         if ($localTimestamp === null || $remoteTimestamp === null) {
             return '';
@@ -1168,13 +1190,19 @@ final class AssetSyncService
         return $localTimestamp > $remoteTimestamp ? 'glpi_a' : 'glpi_b';
     }
 
-    private function validDateModTimestamp(string $dateMod): ?int
+    private function validDateModTimestamp(string $dateMod, string $timezone = ''): ?int
     {
         if ($dateMod === '') {
             return null;
         }
 
-        $date = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $dateMod);
+        try {
+            $dateTimezone = new \DateTimeZone($timezone !== '' ? $timezone : date_default_timezone_get());
+        } catch (\Throwable) {
+            return null;
+        }
+
+        $date = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $dateMod, $dateTimezone);
         $errors = \DateTimeImmutable::getLastErrors();
         $hasErrors = is_array($errors) && ((int) $errors['warning_count'] > 0 || (int) $errors['error_count'] > 0);
 
@@ -1183,6 +1211,43 @@ final class AssetSyncService
         }
 
         return $date->getTimestamp();
+    }
+
+    private function dateModTimezone($value): string
+    {
+        if (!is_scalar($value)) {
+            return '';
+        }
+
+        $timezone = trim((string) $value);
+        if ($timezone === '') {
+            return '';
+        }
+
+        try {
+            new \DateTimeZone($timezone);
+        } catch (\Throwable) {
+            return '';
+        }
+
+        return $timezone;
+    }
+
+    private function localDateModTimezone(): string
+    {
+        $db = $this->db();
+        if (is_object($db) && method_exists($db, 'guessTimezone')) {
+            try {
+                $timezone = $db->guessTimezone();
+                if (is_scalar($timezone)) {
+                    return (string) $timezone;
+                }
+            } catch (\Throwable) {
+                // Fall back to PHP's configured timezone outside a full GLPI DB session.
+            }
+        }
+
+        return date_default_timezone_get();
     }
 
     private function cleanHistoryOptionId($value): string

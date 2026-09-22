@@ -9,6 +9,7 @@ final class GlpiBConnection
     private const CONTEXT = 'plugin:assetsync20';
     private const CONNECTIONS_KEY = 'glpib_connections';
     private const CUSTOM_HISTORY_RANGE = '0-20';
+    private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
 
     private const OLD_KEYS = [
         'glpib_name'       => '',
@@ -385,7 +386,7 @@ final class GlpiBConnection
 
     /**
      * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
-     * @return array{success:bool,message:string,item:array<string,mixed>,missing:bool,transient:bool}
+     * @return array{success:bool,message:string,item:array<string,mixed>,missing:bool,transient:bool,date_mod_timezone?:string}
      */
     public static function getItem(array $connection, string $itemtype, int $itemsId): array
     {
@@ -399,7 +400,7 @@ final class GlpiBConnection
             ];
         }
 
-        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId): array {
+        return self::withSession($connection, static function (string $sessionToken, string $dateModTimezone = '') use ($connection, $itemtype, $itemsId): array {
             $response = self::request(
                 'GET',
                 self::apiUrl($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId),
@@ -425,8 +426,9 @@ final class GlpiBConnection
                 'item'      => $response['body'],
                 'missing'   => false,
                 'transient' => false,
+                self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
             ];
-        });
+        }, true);
     }
 
     /**
@@ -800,7 +802,7 @@ final class GlpiBConnection
      *
      * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
      * @param array<string,array{option_id?:int|string,itemtype_link?:string}> $historyRefs
-     * @return array{success:bool,message:string,dates:array<string,string>,transient:bool}
+     * @return array{success:bool,message:string,dates:array<string,string>,transient:bool,date_mod_timezone?:string}
      */
     public static function customHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs): array
     {
@@ -814,7 +816,7 @@ final class GlpiBConnection
             ];
         }
 
-        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $historyRefs): array {
+        return self::withSession($connection, static function (string $sessionToken, string $dateModTimezone = '') use ($connection, $itemtype, $itemsId, $historyRefs): array {
             $response = self::request(
                 'GET',
                 self::apiUrlWithQuery($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId . '/Log', [
@@ -835,6 +837,7 @@ final class GlpiBConnection
                     'message' => $response['message'],
                     'dates' => [],
                     'transient' => $response['transient'],
+                    self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
                 ];
             }
 
@@ -845,6 +848,7 @@ final class GlpiBConnection
                     'message' => 'GLPI B did not expose item history for this asset.',
                     'dates' => [],
                     'transient' => false,
+                    self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
                 ];
             }
 
@@ -853,8 +857,9 @@ final class GlpiBConnection
                 'message' => 'GLPI B custom history loaded.',
                 'dates' => self::latestHistoryDatesByRef($logs, $historyRefs),
                 'transient' => false,
+                self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
             ];
-        });
+        }, true);
     }
 
     /** Mirror Fields' profile and container entity checks before accessing a generated child row. */
@@ -1290,7 +1295,7 @@ final class GlpiBConnection
      * @param callable(string):array<string,mixed> $callback
      * @return array<string,mixed>
      */
-    private static function withSession(array $connection, callable $callback): array
+    private static function withSession(array $connection, callable $callback, bool $needsDateModTimezone = false): array
     {
         if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
             return [
@@ -1322,7 +1327,13 @@ final class GlpiBConnection
             ];
         }
 
+        $dateModTimezone = $needsDateModTimezone ? self::remoteDateModTimezone($connection, $sessionToken) : '';
+
         try {
+            if ($needsDateModTimezone) {
+                return $callback($sessionToken, $dateModTimezone);
+            }
+
             return $callback($sessionToken);
         } finally {
             self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
@@ -1330,6 +1341,68 @@ final class GlpiBConnection
                 'Session-Token: ' . $sessionToken,
             ]);
         }
+    }
+
+    /**
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     */
+    private static function remoteDateModTimezone(array $connection, string $sessionToken): string
+    {
+        $fullSession = self::request('GET', self::apiUrl($connection['base_url'], 'getFullSession'), [
+            'App-Token: ' . $connection['app_token'],
+            'Session-Token: ' . $sessionToken,
+        ]);
+
+        if (!$fullSession['success']) {
+            return '';
+        }
+
+        return self::sessionTimezone($fullSession['body']);
+    }
+
+    /**
+     * @param array<string,mixed> $session
+     */
+    private static function sessionTimezone(array $session): string
+    {
+        $timezone = self::sessionScalar($session, 'glpitimezone');
+        if ($timezone !== '' && $timezone !== '0' && self::isValidTimezone($timezone)) {
+            return $timezone;
+        }
+
+        return '';
+    }
+
+    /**
+     * @param array<string,mixed> $values
+     */
+    private static function sessionScalar(array $values, string $key): string
+    {
+        if (isset($values[$key]) && is_scalar($values[$key])) {
+            return trim((string) $values[$key]);
+        }
+
+        foreach ($values as $value) {
+            if (is_array($value)) {
+                $found = self::sessionScalar($value, $key);
+                if ($found !== '') {
+                    return $found;
+                }
+            }
+        }
+
+        return '';
+    }
+
+    private static function isValidTimezone(string $timezone): bool
+    {
+        try {
+            new \DateTimeZone($timezone);
+        } catch (\Throwable) {
+            return false;
+        }
+
+        return true;
     }
 
     /**
