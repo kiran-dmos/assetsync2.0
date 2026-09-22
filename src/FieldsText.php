@@ -340,6 +340,10 @@ final class FieldsText
                 'plugin_fields_containers_id' => $metadata['container_id'],
                 $metadata['field'] => $storedValue];
             if ($row->getFromDBByCrit(['items_id' => $itemsId, 'itemtype' => $itemtype])) {
+                // GLPI loosely compares changes: NULL equals integer 0, but not string "0".
+                if ($storedValue === 0 && ($row->fields[$metadata['field']] ?? null) === null) {
+                    $input[$metadata['field']] = '0';
+                }
                 $ok = $row->update(['id' => $row->fields['id']] + $input);
             } else {
                 $ok = $row->add($input);

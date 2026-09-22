@@ -252,6 +252,15 @@ final class GlpiBConnection
             ]
         );
 
+        $rawFieldsResponse = self::request(
+            'GET',
+            self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]),
+            [
+                'App-Token: ' . $connection['app_token'],
+                'Session-Token: ' . $sessionToken,
+            ]
+        );
+
         self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
             'App-Token: ' . $connection['app_token'],
             'Session-Token: ' . $sessionToken,
@@ -265,7 +274,18 @@ final class GlpiBConnection
             ];
         }
 
-        $fields = self::fieldsFromSearchOptions($fieldsResponse['body'], $itemtype);
+        if (!$rawFieldsResponse['success']) {
+            return [
+                'success' => false,
+                'message' => $rawFieldsResponse['message'],
+                'fields'  => [],
+            ];
+        }
+
+        $fields = self::fieldsFromSearchOptions(
+            self::searchOptionsWithRawMetadata($fieldsResponse['body'], $rawFieldsResponse['body']),
+            $itemtype
+        );
         if ($fields === []) {
             return [
                 'success' => false,
@@ -1035,6 +1055,10 @@ final class GlpiBConnection
                 continue;
             }
 
+            if (self::hasRawFieldsPluginMetadata($option)) {
+                continue;
+            }
+
             if ($id === '' && self::isHeaderOnlySearchOption($option)) {
                 continue;
             }
@@ -1056,6 +1080,40 @@ final class GlpiBConnection
         }
 
         return $fields;
+    }
+
+    /**
+     * @param array<string,mixed> $options
+     * @param array<string,mixed> $rawOptions
+     * @return array<string,mixed>
+     */
+    private static function searchOptionsWithRawMetadata(array $options, array $rawOptions): array
+    {
+        foreach ($options as $optionId => $option) {
+            if (!is_array($option) || !isset($rawOptions[$optionId]) || !is_array($rawOptions[$optionId])) {
+                continue;
+            }
+
+            foreach (['pfields_type', 'pfields_fields_id', 'plugin_fields_containers_id', 'is_multiple', 'multiple'] as $metadataKey) {
+                if (!array_key_exists($metadataKey, $option) && array_key_exists($metadataKey, $rawOptions[$optionId])) {
+                    $option[$metadataKey] = $rawOptions[$optionId][$metadataKey];
+                }
+            }
+
+            $options[$optionId] = $option;
+        }
+
+        return $options;
+    }
+
+    /**
+     * @param array<string,mixed> $option
+     */
+    private static function hasRawFieldsPluginMetadata(array $option): bool
+    {
+        return isset($option['pfields_type'])
+            && is_scalar($option['pfields_type'])
+            && trim((string) $option['pfields_type']) !== '';
     }
 
     /**

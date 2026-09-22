@@ -8,6 +8,7 @@ use GlpiPlugin\Assetsync20\AssetSyncService;
 use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\FieldsText;
 use GlpiPlugin\Assetsync20\HardwareBilling;
+use GlpiPlugin\Assetsync20\SwsdBilling;
 
 class Config
 {
@@ -57,6 +58,9 @@ class PluginFieldsField
         6 => ['id' => 6, 'name' => 'datefield', 'type' => 'date', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
         7 => ['id' => 7, 'name' => 'datetimefield', 'type' => 'datetime', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
         8 => ['id' => 8, 'name' => 'departmentfield', 'type' => 'dropdown', 'multiple' => 0, 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
+        9 => ['id' => 9, 'name' => 'statusfield', 'type' => 'dropdown', 'multiple' => 0, 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
+        10 => ['id' => 10, 'name' => 'redeployeddatefield', 'type' => 'date', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
+        11 => ['id' => 11, 'name' => 'swsdbillingstartdatefield', 'type' => 'date', 'is_active' => 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 0],
     ];
     public array $fields = [];
     public function getFromDB($id): bool
@@ -70,6 +74,7 @@ class PluginFieldsComputerdmosasset
     public static string $value = 'DMOS sync test 20260911';
     public static array $row = [];
     public static bool $found = true;
+    public static bool $looseComparison = false;
     public array $fields = [];
     public function getFromDBByCrit(array $criteria): bool
     {
@@ -84,6 +89,9 @@ class PluginFieldsComputerdmosasset
     public function update(array $input): bool
     {
         self::$found = true;
+        if (self::$looseComparison) {
+            $input = array_filter($input, fn ($value, $key) => (self::$row[$key] ?? null) != $value, ARRAY_FILTER_USE_BOTH);
+        }
         self::$row = array_merge(self::$row, $input);
         $this->fields = self::$row;
         return true;
@@ -102,6 +110,26 @@ class PluginFieldsDepartmentfieldDropdown
         10 => ['id' => 10, 'name' => 'Hardware', 'completename' => 'Operations > Hardware'],
         11 => ['id' => 11, 'name' => 'Software', 'completename' => 'Operations > Software'],
         12 => ['id' => 12, 'name' => 'Fallback Only', 'completename' => ''],
+    ];
+    public array $fields = [];
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$rows[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+
+    public function find(array $criteria = []): array
+    {
+        return self::$rows;
+    }
+}
+class PluginFieldsStatusfieldDropdown
+{
+    public static array $rows = [
+        20 => ['id' => 20, 'name' => 'In Use', 'completename' => 'In Use'],
+        21 => ['id' => 21, 'name' => 'In Stock - Available', 'completename' => 'In Stock - Available'],
     ];
     public array $fields = [];
 
@@ -293,6 +321,12 @@ expectRuntime(static fn (): array => FieldMapping::expectedCustomTypes('Computer
 $scalarAsset = ['id' => 2, 'serial' => 'test'] + FieldsText::localValues('Computer', 2, [$notesKeyA, $countKeyA, $dateKeyA, $dateTimeKeyA]);
 check($scalarAsset[$notesKeyA] === 'Long notes', 'Textarea values must remain strings');
 check($scalarAsset[$countKeyA] === 42, 'Number values must normalize to int');
+PluginFieldsComputerdmosasset::$looseComparison = true;
+PluginFieldsComputerdmosasset::$row['countfield'] = null;
+check(FieldsText::updateLocal('Computer', 2, [$countKeyA => 0]), 'NULL number must persist zero despite GLPI loose comparison');
+check(FieldsText::localValues('Computer', 2, [$countKeyA])[$countKeyA] === 0, 'Zero must actually persist, not be accepted as blank');
+PluginFieldsComputerdmosasset::$looseComparison = false;
+PluginFieldsComputerdmosasset::$row['countfield'] = '42';
 check($scalarAsset[$dateKeyA] === '2026-09-14', 'Date values must accept YYYY-MM-DD');
 check($scalarAsset[$dateTimeKeyA] === '2026-09-14 08:09:10', 'Datetime values must accept YYYY-MM-DD HH:MM:SS');
 $scalarRemote = ['entities_id' => 0, $notesKeyB => '', $countKeyB => 0, $dateKeyB => '', $dateTimeKeyB => ''];
@@ -427,6 +461,191 @@ check($billingSync['custom_types'] === [
     'Computer.PluginFieldsComputerdmosasset.hwbillingmonthfield' => 'int',
 ], 'Hardware Billing output metadata must keep the expected remote field types');
 
+$swsdKeys = [
+    'status' => 'status',
+    'redeployed_date' => 'redeployed_date',
+];
+$swsdDayFive = SwsdBilling::calculateValues([
+    'status' => 'In Use',
+    'redeployed_date' => '2026-03-05',
+], $swsdKeys);
+check($swsdDayFive === [
+    'billable' => 1,
+    'start_date' => '2026-03-01',
+], 'SW/SD Billing should start in the redeployed month when redeployed by day 5');
+$swsdDaySix = SwsdBilling::calculateValues([
+    'status' => 'In Use',
+    'redeployed_date' => '2026-03-06',
+], $swsdKeys);
+check($swsdDaySix === [
+    'billable' => 1,
+    'start_date' => '2026-04-01',
+], 'SW/SD Billing should start next month after day 5');
+$swsdBlankDate = SwsdBilling::calculateValues([
+    'status' => 'In Use',
+    'redeployed_date' => '',
+], $swsdKeys);
+check($swsdBlankDate === [
+    'billable' => 0,
+    'start_date' => '',
+], 'SW/SD Billing should reset when Redeployed Date is blank');
+$swsdWrongStatus = SwsdBilling::calculateValues([
+    'status' => 'In Stock - Available',
+    'redeployed_date' => '2026-03-05',
+], $swsdKeys);
+check($swsdWrongStatus === [
+    'billable' => 0,
+    'start_date' => '',
+], 'SW/SD Billing should reset unless Status is exactly In Use');
+
+$swsdStatusKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_statusfielddropdowns_id';
+$swsdRedeployedKey = 'Computer.PluginFieldsComputerdmosasset.redeployeddatefield';
+$swsdBillableKey = 'Computer.PluginFieldsComputerdmosasset.swsdbillablefieldtwo';
+$swsdStartKey = 'Computer.PluginFieldsComputerdmosasset.swsdbillingstartdatefield';
+PluginFieldsContainer::$options = [
+    884799 => dropdownFieldOption(9, 'DMOS Asset - Status', 'statusfield'),
+    884800 => fieldOption(10, 'DMOS Asset - Redeployed Date', 'redeployeddatefield', 'date'),
+    884801 => fieldOption(3, 'DMOS Asset - SW/SD Billable', 'swsdbillablefieldtwo', 'yesno'),
+    884802 => fieldOption(11, 'DMOS Asset - SW/SD Billing Start Date', 'swsdbillingstartdatefield', 'date'),
+];
+PluginFieldsComputerdmosasset::$found = true;
+PluginFieldsComputerdmosasset::$row = [
+    'id' => 10,
+    'plugin_fields_statusfielddropdowns_id' => 20,
+    'redeployeddatefield' => '2026-03-06',
+    'swsdbillablefieldtwo' => 0,
+    'swsdbillingstartdatefield' => '',
+];
+$swsdInputKeys = SwsdBilling::localInputKeys('Computer');
+check($swsdInputKeys === [$swsdStatusKey, $swsdRedeployedKey], 'SW/SD Billing must use the locked input field keys');
+$swsdAsset = FieldsText::localValues('Computer', 2, array_merge($swsdInputKeys, SwsdBilling::localOutputKeys('Computer')));
+$swsdSync = SwsdBilling::syncData('Computer', $swsdAsset);
+check($swsdSync['values'] === [
+    $swsdBillableKey => 1,
+    $swsdStartKey => '2026-04-01',
+], 'SW/SD Billing sync data must expose calculated output values with stable local keys');
+check($swsdSync['custom_types'] === [
+    $swsdBillableKey => 'yesno',
+    $swsdStartKey => 'date',
+], 'SW/SD Billing output metadata must keep the expected field types');
+
+PluginFieldsField::$definitions[3]['is_readonly'] = 1;
+PluginFieldsField::$definitions[11]['is_readonly'] = 1;
+check(!FieldsText::updateLocal('Computer', 2, [$swsdBillableKey => 0]), 'Read-only SW/SD Billing output fields must block normal local writes');
+$applySwsdBilling = new ReflectionMethod(AssetSyncService::class, 'applySwsdBilling');
+$applySwsdBilling->setAccessible(true);
+$swsdReadonlyAsset = ['id' => 2] + FieldsText::localValues('Computer', 2, array_merge($swsdInputKeys, SwsdBilling::localOutputKeys('Computer')));
+$applySwsdBilling->invoke($service, 'Computer', 2, $swsdReadonlyAsset, []);
+check(PluginFieldsComputerdmosasset::$row['swsdbillablefieldtwo'] === 1, 'Calculated SW/SD Billing may write a read-only billable output');
+check(PluginFieldsComputerdmosasset::$row['swsdbillingstartdatefield'] === '2026-04-01', 'Calculated SW/SD Billing may write a read-only start date output');
+PluginFieldsField::$definitions[3]['is_readonly'] = 0;
+PluginFieldsField::$definitions[11]['is_readonly'] = 0;
+
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    $swsdBillableKey => [
+        'glpi_b_field_key' => $swsdBillableKey,
+        'glpi_b_field_uid' => $swsdBillableKey,
+        'glpi_b_field_label' => 'SW/SD Billable',
+        'source_of_truth' => 'glpi_b',
+    ],
+    $swsdStartKey => [
+        'glpi_b_field_key' => $swsdStartKey,
+        'glpi_b_field_uid' => $swsdStartKey,
+        'glpi_b_field_label' => 'SW/SD Billing Start Date',
+        'source_of_truth' => 'glpi_b',
+    ],
+]]]);
+$swsdMappings = FieldMapping::syncMappings('test', 'Computer');
+check($swsdMappings === [
+    [
+        'glpi_a_field' => $swsdBillableKey,
+        'glpi_b_field' => $swsdBillableKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+    [
+        'glpi_a_field' => $swsdStartKey,
+        'glpi_b_field' => $swsdStartKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+], 'SW/SD Billing output mappings must keep inbound GLPI B authority');
+$swsdTypes = FieldMapping::expectedCustomTypes('Computer', $swsdMappings);
+$swsdChanges = $compare->invoke(
+    $service,
+    [$swsdBillableKey => 1, $swsdStartKey => '2026-04-01'],
+    ['entities_id' => 0, $swsdBillableKey => 0, $swsdStartKey => '2026-05-01'],
+    $route,
+    $swsdMappings,
+    $swsdTypes
+);
+check($swsdChanges['local'] === [
+    $swsdBillableKey => 0,
+    $swsdStartKey => '2026-05-01',
+], 'GLPI B SW/SD outputs must write back to GLPI A when mapped as GLPI B source');
+check($swsdChanges['remote'] === [], 'GLPI B sourced SW/SD outputs must not write calculated GLPI A values to GLPI B');
+$updateLocalAsset = new ReflectionMethod(AssetSyncService::class, 'updateLocalAsset');
+$updateLocalAsset->setAccessible(true);
+check($updateLocalAsset->invoke($service, 'Computer', 2, $swsdChanges['local']), 'GLPI B sourced SW/SD outputs must update GLPI A fields');
+check(PluginFieldsComputerdmosasset::$row['swsdbillablefieldtwo'] === 0, 'GLPI B sourced SW/SD Billable must persist to GLPI A');
+check(PluginFieldsComputerdmosasset::$row['swsdbillingstartdatefield'] === '2026-05-01', 'GLPI B sourced SW/SD Billing Start Date must persist to GLPI A');
+
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    $swsdBillableKey => [
+        'glpi_b_field_key' => $swsdBillableKey,
+        'glpi_b_field_uid' => $swsdBillableKey,
+        'glpi_b_field_label' => 'SW/SD Billable',
+        'source_of_truth' => 'glpi_a',
+    ],
+    $swsdStartKey => [
+        'glpi_b_field_key' => $swsdStartKey,
+        'glpi_b_field_uid' => $swsdStartKey,
+        'glpi_b_field_label' => 'SW/SD Billing Start Date',
+        'source_of_truth' => 'glpi_a',
+    ],
+]]]);
+$swsdMappings = FieldMapping::syncMappings('test', 'Computer');
+$swsdTypes = FieldMapping::expectedCustomTypes('Computer', $swsdMappings);
+$swsdChanges = $compare->invoke(
+    $service,
+    [$swsdBillableKey => 1, $swsdStartKey => '2026-04-01'],
+    ['entities_id' => 0, $swsdBillableKey => 0, $swsdStartKey => ''],
+    $route,
+    $swsdMappings,
+    $swsdTypes
+);
+check($swsdChanges['remote'] === [
+    $swsdBillableKey => 1,
+    $swsdStartKey => '2026-04-01',
+], 'GLPI A sourced SW/SD outputs must send calculated values to GLPI B');
+check($swsdChanges['local'] === [], 'GLPI A sourced SW/SD outputs must not accept GLPI B values');
+
+Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
+    $swsdBillableKey => [
+        'glpi_b_field_key' => $swsdBillableKey,
+        'glpi_b_field_uid' => $swsdBillableKey,
+        'glpi_b_field_label' => 'SW/SD Billable',
+        'source_of_truth' => 'both',
+    ],
+]]]);
+$swsdMappings = FieldMapping::syncMappings('test', 'Computer');
+check($swsdMappings === [[
+    'glpi_a_field' => $swsdBillableKey,
+    'glpi_b_field' => $swsdBillableKey,
+    'source_of_truth' => 'both',
+]], 'SW/SD Billing output mappings must keep Both authority when configured');
+$swsdTypes = FieldMapping::expectedCustomTypes('Computer', $swsdMappings);
+$swsdChanges = $compare->invoke(
+    $service,
+    [$swsdBillableKey => 1, 'date_mod' => '2026-06-02 00:00:00'],
+    ['entities_id' => 0, $swsdBillableKey => 0, 'date_mod' => '2026-06-01 00:00:00'],
+    $route,
+    $swsdMappings,
+    $swsdTypes,
+    [$swsdBillableKey => '2026-06-02 00:00:00'],
+    [$swsdBillableKey => '2026-06-01 00:00:00']
+);
+check($swsdChanges['remote'] === [$swsdBillableKey => 1], 'Both-sourced SW/SD outputs must keep existing newer-GLPI-A behavior');
+check($swsdChanges['local'] === [], 'Both-sourced SW/SD outputs must not update GLPI A when GLPI A is newer');
+
 $yesKeyA = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
 $yesKeyB = 'Computer.PluginFieldsComputerdmosasset.hwbillablefield';
 $noKeyA = 'Computer.PluginFieldsComputerdmosasset.swsdbillablefieldtwo';
@@ -537,6 +756,8 @@ Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
 expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible local Fields-plugin dropdown field', 'Text-to-dropdown mappings must be rejected clearly');
 $fieldsFromSearchOptions = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'fieldsFromSearchOptions');
 $fieldsFromSearchOptions->setAccessible(true);
+$searchOptionsWithRawMetadata = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'searchOptionsWithRawMetadata');
+$searchOptionsWithRawMetadata->setAccessible(true);
 $remoteFields = $fieldsFromSearchOptions->invoke(null, [884783 => ['id' => 884783] + $dropdownOption], 'Computer');
 check($remoteFields === [[
     'key' => $dropdownKeyA,
@@ -559,6 +780,119 @@ check($restRemoteFields === [[
     'uid' => $restDropdownKey,
     'label' => 'DMOS Asset - Company',
 ]], 'GLPI B REST dropdown discovery must convert joined display options to stable generated FK identifiers');
+$restTextKey = 'Computer.PluginFieldsComputerdmosasset.namefield';
+$restTextareaKey = 'Computer.PluginFieldsComputerdmosasset.shareduseremailfield';
+$restScalarFields = $fieldsFromSearchOptions->invoke(null, [
+    76666 => [
+        'name' => 'DMOS Asset - Name',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'namefield',
+        'linkfield' => 'namefield',
+        'datatype' => 'string',
+        'pfields_type' => 'text',
+    ],
+    76678 => [
+        'name' => 'DMOS Asset - Shared User Email',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'shareduseremailfield',
+        'linkfield' => 'shareduseremailfield',
+        'datatype' => 'text',
+        'pfields_type' => 'textarea',
+    ],
+], 'Computer');
+check($restScalarFields === [
+    [
+        'key' => $restTextKey,
+        'id' => '76666',
+        'uid' => $restTextKey,
+        'label' => 'DMOS Asset - Name',
+    ],
+    [
+        'key' => $restTextareaKey,
+        'id' => '76678',
+        'uid' => $restTextareaKey,
+        'label' => 'DMOS Asset - Shared User Email',
+    ],
+], 'GLPI B raw REST discovery must expose Fields-plugin text and textarea fields');
+$mergedSearchOptions = $searchOptionsWithRawMetadata->invoke(null, [
+    1 => [
+        'name' => 'Name',
+        'field' => 'name',
+        'table' => 'glpi_computers',
+        'uid' => 'Computer.name',
+    ],
+    76666 => [
+        'name' => 'DMOS Asset - Name',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'namefield',
+        'datatype' => 'string',
+        'uid' => 'Computer.PluginFieldsComputerdmosasset.namefield',
+    ],
+    76674 => [
+        'name' => 'DMOS Asset - User',
+        'table' => 'glpi_users',
+        'field' => 'name',
+        'datatype' => 'dropdown',
+        'uid' => 'Computer.users_id_userfield.PluginFieldsComputerdmosasset.User.name',
+    ],
+    76691 => [
+        'name' => 'DMOS Asset - Rich Notes',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'richnotesfield',
+        'datatype' => 'text',
+        'uid' => 'Computer.PluginFieldsComputerdmosasset.richnotesfield',
+    ],
+], [
+    1 => [
+        'name' => 'Name',
+        'field' => 'name',
+        'table' => 'glpi_computers',
+    ],
+    76666 => [
+        'name' => 'DMOS Asset - Name',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'namefield',
+        'linkfield' => 'namefield',
+        'datatype' => 'string',
+        'pfields_type' => 'text',
+    ],
+    76674 => [
+        'name' => 'DMOS Asset - User',
+        'table' => 'glpi_users',
+        'field' => 'name',
+        'linkfield' => 'users_id_userfield',
+        'datatype' => 'dropdown',
+        'pfields_type' => 'dropdown-User',
+        'joinparams' => [
+            'beforejoin' => [
+                'table' => 'glpi_plugin_fields_computerdmosassets',
+            ],
+        ],
+    ],
+    76691 => [
+        'name' => 'DMOS Asset - Rich Notes',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'field' => 'richnotesfield',
+        'linkfield' => 'richnotesfield',
+        'datatype' => 'text',
+        'pfields_type' => 'richtext',
+    ],
+]);
+$mergedRemoteFields = $fieldsFromSearchOptions->invoke(null, $mergedSearchOptions, 'Computer');
+check($mergedRemoteFields === [
+    [
+        'key' => 'Computer.name',
+        'id' => '1',
+        'uid' => 'Computer.name',
+        'label' => 'Name',
+    ],
+    [
+        'key' => $restTextKey,
+        'id' => '76666',
+        'uid' => $restTextKey,
+        'label' => 'DMOS Asset - Name',
+    ],
+], 'GLPI B discovery must merge raw Fields metadata while preserving native UID keys and blocking unsupported Fields options');
 $multiDropdownOption = dropdownFieldOption(8, 'DMOS Asset - Department', 'departmentfield', 1);
 expectRuntime(static fn (): string => FieldsText::validate($multiDropdownOption), 'multi-select dropdown fields are not supported', 'Multi-select Fields dropdowns must block clearly');
 $itemDropdownOption = fieldOption(8, 'DMOS Asset - Assigned User', 'assigneduserfield', 'dropdown-User');

@@ -409,6 +409,10 @@ function getTableForItemType($class): string
         return 'glpi_plugin_fields_hwbillingfrequencyfielddropdowns';
     }
 
+    if ($class === 'PluginFieldsStatusfieldDropdown') {
+        return 'glpi_plugin_fields_statusfielddropdowns';
+    }
+
     return 'glpi_plugin_fields_computerdmosassets';
 }
 
@@ -573,8 +577,35 @@ class PluginFieldsHwbillingfrequencyfieldDropdown
     }
 }
 
+class PluginFieldsStatusfieldDropdown
+{
+    public static array $rows = [
+        20 => ['id' => 20, 'name' => 'In Use', 'completename' => 'In Use'],
+        21 => ['id' => 21, 'name' => 'In Stock - Available', 'completename' => 'In Stock - Available'],
+    ];
+    public array $fields = [];
+
+    public static function getTable(): string
+    {
+        return 'glpi_plugin_fields_statusfielddropdowns';
+    }
+
+    public function getFromDB($id): bool
+    {
+        $this->fields = self::$rows[(int) $id] ?? [];
+
+        return $this->fields !== [];
+    }
+
+    public function find(array $criteria = []): array
+    {
+        return self::$rows;
+    }
+}
+
 final class FakeGlpiBClient
 {
+    public array $unavailableCustomKeys = [];
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $records = [];
     /** @var array<string,array<int,array<string,mixed>>> */
@@ -686,6 +717,9 @@ final class FakeGlpiBClient
      */
     public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
     {
+        if (array_intersect($keys, $this->unavailableCustomKeys) !== []) {
+            return ['success' => false, 'message' => 'Mapped remote field unavailable.', 'transient' => false];
+        }
         $recordKey = $this->key($connection, $itemtype);
         $values = [];
         $historyOptionIds = array_intersect_key($this->customHistoryOptionIds, array_flip($keys));
@@ -2655,6 +2689,371 @@ if (
 ) {
     throw new RuntimeException('Hardware Billing should clear/reset GLPI B values when an asset becomes ineligible.');
 }
+
+$swsdStatusKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_statusfielddropdowns_id';
+$swsdRedeployedKey = 'Computer.PluginFieldsComputerdmosasset.redeployeddatefield';
+$swsdBillableKey = 'Computer.PluginFieldsComputerdmosasset.swsdbillablefieldtwo';
+$swsdStartKey = 'Computer.PluginFieldsComputerdmosasset.swsdbillingstartdatefield';
+PluginFieldsField::$definitions += [
+    29 => [
+        'id' => 29,
+        'name' => 'statusfield',
+        'type' => 'dropdown',
+        'multiple' => 0,
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    30 => [
+        'id' => 30,
+        'name' => 'redeployeddatefield',
+        'type' => 'date',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 0,
+    ],
+    31 => [
+        'id' => 31,
+        'name' => 'swsdbillablefieldtwo',
+        'type' => 'yesno',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 1,
+    ],
+    32 => [
+        'id' => 32,
+        'name' => 'swsdbillingstartdatefield',
+        'type' => 'date',
+        'is_active' => 1,
+        'plugin_fields_containers_id' => 1,
+        'is_readonly' => 1,
+    ],
+];
+PluginFieldsContainer::$options = [
+    884810 => [
+        'name' => 'DMOS Asset - Status',
+        'field' => 'completename',
+        'table' => 'glpi_plugin_fields_statusfielddropdowns',
+        'linkfield' => 'plugin_fields_statusfielddropdowns_id',
+        'datatype' => 'dropdown',
+        'pfields_type' => 'dropdown',
+        'pfields_fields_id' => 29,
+        'is_multiple' => 0,
+        'joinparams' => [
+            'beforejoin' => [
+                'table' => 'glpi_plugin_fields_computerdmosassets',
+            ],
+        ],
+    ],
+    884811 => [
+        'name' => 'DMOS Asset - Redeployed Date',
+        'field' => 'redeployeddatefield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'date',
+        'pfields_fields_id' => 30,
+    ],
+    884812 => [
+        'name' => 'DMOS Asset - SW/SD Billable',
+        'field' => 'swsdbillablefieldtwo',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'yesno',
+        'pfields_fields_id' => 31,
+    ],
+    884813 => [
+        'name' => 'DMOS Asset - SW/SD Billing Start Date',
+        'field' => 'swsdbillingstartdatefield',
+        'table' => 'glpi_plugin_fields_computerdmosassets',
+        'pfields_type' => 'date',
+        'pfields_fields_id' => 32,
+    ],
+];
+\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    $swsdBillableKey => [
+        'glpi_b_field_key' => $swsdBillableKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+    $swsdStartKey => [
+        'glpi_b_field_key' => $swsdStartKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+], [
+    [
+        'key' => $swsdBillableKey,
+        'id' => '884812',
+        'uid' => $swsdBillableKey,
+        'label' => 'SW/SD Billable',
+    ],
+    [
+        'key' => $swsdStartKey,
+        'id' => '884813',
+        'uid' => $swsdStartKey,
+        'label' => 'SW/SD Billing Start Date',
+    ],
+]);
+$swsdRemoteAuthoritySources = [];
+foreach (\GlpiPlugin\Assetsync20\FieldMapping::syncMappings('production', 'Computer') as $swsdMapping) {
+    $swsdRemoteAuthoritySources[$swsdMapping['glpi_a_field']] = $swsdMapping['source_of_truth'];
+}
+if (
+    ($swsdRemoteAuthoritySources[$swsdBillableKey] ?? null) !== 'glpi_b'
+    || ($swsdRemoteAuthoritySources[$swsdStartKey] ?? null) !== 'glpi_b'
+) {
+    throw new RuntimeException('SW/SD Billing output mappings should keep GLPI B authority when configured.');
+}
+
+\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    'name' => [
+        'glpi_b_field_key' => 'Computer.name',
+        'source_of_truth' => 'glpi_a',
+    ],
+    'serial' => [
+        'glpi_b_field_key' => 'Computer.serial',
+        'source_of_truth' => 'glpi_a',
+    ],
+    $swsdStatusKey => [
+        'glpi_b_field_key' => $swsdStatusKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+    $swsdRedeployedKey => [
+        'glpi_b_field_key' => $swsdRedeployedKey,
+        'source_of_truth' => 'glpi_b',
+    ],
+    $swsdBillableKey => [
+        'glpi_b_field_key' => $swsdBillableKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+    $swsdStartKey => [
+        'glpi_b_field_key' => $swsdStartKey,
+        'source_of_truth' => 'glpi_a',
+    ],
+], [
+    [
+        'key' => 'Computer.name',
+        'id' => '1',
+        'uid' => 'Computer.name',
+        'label' => 'Name',
+    ],
+    [
+        'key' => 'Computer.serial',
+        'id' => '5',
+        'uid' => 'Computer.serial',
+        'label' => 'Serial number',
+    ],
+    [
+        'key' => $swsdStatusKey,
+        'id' => '884810',
+        'uid' => $swsdStatusKey,
+        'label' => 'Status',
+    ],
+    [
+        'key' => $swsdRedeployedKey,
+        'id' => '884811',
+        'uid' => $swsdRedeployedKey,
+        'label' => 'Redeployed Date',
+    ],
+    [
+        'key' => $swsdBillableKey,
+        'id' => '884812',
+        'uid' => $swsdBillableKey,
+        'label' => 'SW/SD Billable',
+    ],
+    [
+        'key' => $swsdStartKey,
+        'id' => '884813',
+        'uid' => $swsdStartKey,
+        'label' => 'SW/SD Billing Start Date',
+    ],
+]);
+$swsdOutboundSources = [];
+foreach (\GlpiPlugin\Assetsync20\FieldMapping::syncMappings('production', 'Computer') as $swsdMapping) {
+    $swsdOutboundSources[$swsdMapping['glpi_a_field']] = $swsdMapping['source_of_truth'];
+}
+if (
+    ($swsdOutboundSources[$swsdBillableKey] ?? null) !== 'glpi_a'
+    || ($swsdOutboundSources[$swsdStartKey] ?? null) !== 'glpi_a'
+) {
+    throw new RuntimeException('SW/SD Billing output mappings should keep GLPI A authority when configured.');
+}
+$DB->insert('glpi_computers', [
+    'id' => 612,
+    'entities_id' => 20,
+    'is_deleted' => 0,
+    'name' => 'SWSD Local',
+    'serial' => 'SER-612',
+    'otherserial' => '',
+    'comment' => '',
+    'date_mod' => '2026-03-01 00:00:00',
+]);
+PluginFieldsComputerdmosasset::$rows[612] = [
+    'id' => 1612,
+    'items_id' => 612,
+    'itemtype' => 'Computer',
+    'plugin_fields_containers_id' => 1,
+    'plugin_fields_statusfielddropdowns_id' => 21,
+    'redeployeddatefield' => '',
+    'swsdbillablefieldtwo' => 0,
+    'swsdbillingstartdatefield' => '',
+];
+$remoteClient->records['production:Computer'][2612] = [
+    'id' => 2612,
+    'entities_id' => 200,
+    'is_deleted' => 0,
+    'name' => 'SWSD Remote',
+    'serial' => 'SER-612',
+    'date_mod' => '2026-03-06 00:00:00',
+];
+$remoteClient->customDropdownOptions[$swsdStatusKey] = [
+    410 => ['id' => 410, 'name' => 'In Use', 'completename' => 'In Use'],
+    411 => ['id' => 411, 'name' => 'In Stock - Available', 'completename' => 'In Stock - Available'],
+];
+$remoteClient->customRecords['production:Computer'][2612] = [
+    $swsdStatusKey => 410,
+    $swsdRedeployedKey => '2026-03-06',
+    $swsdBillableKey => 0,
+];
+\GlpiPlugin\Assetsync20\AssetSyncLink::save([
+    'itemtype' => 'Computer',
+    'items_id' => 612,
+    'glpi_b_connection_id' => 'production',
+    'route_id' => 'prod-child',
+    'remote_items_id' => 2612,
+    'status' => \GlpiPlugin\Assetsync20\AssetSyncLink::STATUS_SYNCED,
+    'last_payload_hash' => '',
+    'last_payload_date' => '2026-03-01 00:00:00',
+]);
+$swsdService = new \GlpiPlugin\Assetsync20\AssetSyncService($remoteClient);
+if (!$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
+    throw new RuntimeException('SW/SD Billing inbound source changes should queue for processing.');
+}
+$swsdService->processQueue(10);
+$swsdLocal = PluginFieldsComputerdmosasset::$rows[612] ?? [];
+if (
+    ($swsdLocal['plugin_fields_statusfielddropdowns_id'] ?? null) !== 20
+    || ($swsdLocal['redeployeddatefield'] ?? null) !== '2026-03-06'
+    || ($swsdLocal['swsdbillablefieldtwo'] ?? null) !== 1
+    || ($swsdLocal['swsdbillingstartdatefield'] ?? null) !== '2026-04-01'
+) {
+    throw new RuntimeException('SW/SD Billing should recalculate from inbound Status and Redeployed Date in the same run.');
+}
+if (($remoteClient->customRecords['production:Computer'][2612][$swsdBillableKey] ?? null) !== 1
+    || ($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey] ?? null) !== '2026-04-01') {
+    throw new RuntimeException('A-authority SWSD outputs must reach B in the same run as new inbound inputs.');
+}
+
+$swsdSavedConfig = Config::$values['plugin:assetsync20']['field_mappings'];
+$swsdConfig = json_decode($swsdSavedConfig, true);
+foreach (['glpi_b', 'both'] as $authority) {
+    foreach ([$swsdBillableKey, $swsdStartKey] as $key) {
+        $swsdConfig['production']['Computer'][$key]['source_of_truth'] = $authority;
+    }
+    Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
+    // Writable fixtures exercise ordinary inbound authority; readonly is checked separately below.
+    PluginFieldsField::$definitions[31]['is_readonly'] = 0;
+    PluginFieldsField::$definitions[32]['is_readonly'] = 0;
+    PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] = 1;
+    PluginFieldsComputerdmosasset::$rows[612]['swsdbillingstartdatefield'] = '2026-04-01';
+    $remoteClient->customRecords['production:Computer'][2612][$swsdBillableKey] = 0;
+    $remoteClient->customRecords['production:Computer'][2612][$swsdStartKey] = '2027-01-01';
+    foreach ([$swsdBillableKey => '884812', $swsdStartKey => '884813'] as $key => $option) {
+        $remoteClient->customHistoryOptionIds[$key] = $option;
+        $remoteClient->customHistoryDates['production:Computer'][2612][$option] = '2027-02-01 00:00:00';
+        $DB->insert('glpi_logs', ['itemtype' => 'Computer', 'items_id' => 612,
+            'itemtype_link' => '', 'id_search_option' => (int) $option, 'date_mod' => '2026-01-01 00:00:00']);
+    }
+    for ($run = 0; $run < 2; $run++) {
+        $swsdService->queueAssetIfNeeded('Computer', 612, 'production', true);
+        $swsdService->processQueue(10);
+        $link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
+        if ($link['status'] !== 'synced'
+            || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 0
+            || PluginFieldsComputerdmosasset::$rows[612]['swsdbillingstartdatefield'] !== '2027-01-01') {
+            throw new RuntimeException('SWSD ' . $authority . ' authority must persist across full sync runs.');
+        }
+    }
+}
+// Both must also preserve a newer local output instead of recalculating it.
+foreach (['884812', '884813'] as $option) {
+    $DB->insert('glpi_logs', ['itemtype' => 'Computer', 'items_id' => 612,
+        'itemtype_link' => '', 'id_search_option' => (int) $option, 'date_mod' => '2028-01-01 00:00:00']);
+}
+PluginFieldsComputerdmosasset::$rows[612]['swsdbillingstartdatefield'] = '2028-03-01';
+$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true);
+$swsdService->processQueue(10);
+if ($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey] !== '2028-03-01') {
+    throw new RuntimeException('Both must send newer local SWSD output through normal mapping.');
+}
+foreach ([$swsdBillableKey, $swsdStartKey] as $key) {
+    $swsdConfig['production']['Computer'][$key]['source_of_truth'] = 'glpi_b';
+}
+Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
+PluginFieldsField::$definitions[31]['is_readonly'] = 1;
+PluginFieldsField::$definitions[32]['is_readonly'] = 1;
+$remoteClient->customRecords['production:Computer'][2612][$swsdBillableKey] = 1;
+$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true);
+$swsdService->processQueue(10);
+$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
+if ($link['status'] !== 'blocked_local_update' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 0) {
+    throw new RuntimeException('B authority must not bypass readonly SWSD output protection.');
+}
+if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production')) {
+    throw new RuntimeException('Scheduled runs must not retry unchanged blocked local updates.');
+}
+if (!$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
+    throw new RuntimeException('Explicit force must retry a linked blocked local update with an unchanged payload.');
+}
+$swsdService->processQueue(10);
+$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
+if ($link['status'] !== 'blocked_local_update' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 0) {
+    throw new RuntimeException('Forced retries must still enforce readonly field protection.');
+}
+$blockedHash = $link['last_payload_hash'];
+foreach (['blocked_duplicate', 'blocked_configuration', 'blocked_remote_error'] as $otherBlock) {
+    \GlpiPlugin\Assetsync20\AssetSyncLink::save(array_merge($link, ['status' => $otherBlock]));
+    if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
+        throw new RuntimeException('Force must preserve other unchanged block types: ' . $otherBlock);
+    }
+}
+\GlpiPlugin\Assetsync20\AssetSyncLink::save(array_merge($link, ['remote_items_id' => null]));
+if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
+    throw new RuntimeException('Force must not retry a blocked local update without a known remote identity.');
+}
+\GlpiPlugin\Assetsync20\AssetSyncLink::save($link);
+PluginFieldsField::$definitions[31]['is_readonly'] = 0;
+PluginFieldsField::$definitions[32]['is_readonly'] = 0;
+if (!$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
+    throw new RuntimeException('Force must retry after correcting permissions without changing the payload.');
+}
+$retryJob = null;
+foreach ($DB->tables[\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE] as $queueRow) {
+    if ((int) $queueRow['items_id'] === 612 && $queueRow['glpi_b_connection_id'] === 'production') {
+        $retryJob = $queueRow;
+        break;
+    }
+}
+if ($retryJob['payload_hash'] !== $blockedHash || (int) $retryJob['remote_items_id'] !== 2612) {
+    throw new RuntimeException('Retry must retain the unchanged payload and existing remote identity.');
+}
+$swsdService->processQueue(10);
+$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
+if ($link['status'] !== 'synced' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 1) {
+    throw new RuntimeException('Corrected permissions must allow a forced blocked local update to finish.');
+}
+// Unmapped outputs stay local, including a start date that does not exist on B.
+unset($swsdConfig['production']['Computer'][$swsdBillableKey], $swsdConfig['production']['Computer'][$swsdStartKey]);
+Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
+unset($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey]);
+$remoteClient->unavailableCustomKeys = [$swsdStartKey];
+$remoteClient->customRecords['production:Computer'][2612][$swsdRedeployedKey] = '2026-03-05';
+$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true);
+$swsdService->processQueue(10);
+$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
+if ($link['status'] !== 'synced'
+    || PluginFieldsComputerdmosasset::$rows[612]['swsdbillingstartdatefield'] !== '2026-03-01'
+    || isset($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey])) {
+    throw new RuntimeException('Unmapped SWSD start date must calculate locally without creating a remote value.');
+}
+Config::$values['plugin:assetsync20']['field_mappings'] = $swsdSavedConfig;
+$remoteClient->unavailableCustomKeys = [];
 
 Config::$values = [
     'plugin:assetsync20' => [

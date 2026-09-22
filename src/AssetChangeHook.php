@@ -36,22 +36,24 @@ final class AssetChangeHook
     {
         $hookItemtypes = [];
 
-        try {
-            foreach (FieldsText::localOptions($itemtype) as $option) {
-                if (!is_array($option)) {
-                    continue;
-                }
+        if (self::canUseFieldsSearchOptions()) {
+            try {
+                foreach (FieldsText::localOptions($itemtype) as $option) {
+                    if (!is_array($option)) {
+                        continue;
+                    }
 
-                $key = FieldsText::key($itemtype, $option);
-                if ($key === '') {
-                    continue;
-                }
+                    $key = FieldsText::key($itemtype, $option);
+                    if ($key === '') {
+                        continue;
+                    }
 
-                $descriptor = FieldsText::descriptor($itemtype, $key);
-                $hookItemtypes[$descriptor['class']] = true;
+                    $descriptor = FieldsText::descriptor($itemtype, $key);
+                    $hookItemtypes[$descriptor['class']] = true;
+                }
+            } catch (\Throwable) {
+                // Fall back to the container table below.
             }
-        } catch (\Throwable) {
-            // Fall back to the container table below.
         }
 
         foreach (self::customHookItemtypesFromContainers($itemtype) as $customItemtype) {
@@ -59,6 +61,19 @@ final class AssetChangeHook
         }
 
         return array_keys($hookItemtypes);
+    }
+
+    private static function canUseFieldsSearchOptions(): bool
+    {
+        if (!class_exists('\Session') || !method_exists('\Session', 'isCron')) {
+            return true;
+        }
+
+        if (\Session::isCron()) {
+            return true;
+        }
+
+        return isset($_SESSION['glpiactiveprofile']) && is_array($_SESSION['glpiactiveprofile']);
     }
 
     /**
