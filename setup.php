@@ -57,7 +57,7 @@ function plugin_version_assetsync20(): array
         'id'           => Plugin::KEY,
         'name'         => Plugin::NAME,
         'version'      => PLUGIN_ASSETSYNC20_VERSION,
-        'author'       => 'DMOS',
+        'author'       => 'DMOS Technologies',
         'license'      => 'GPLv3+',
         'homepage'     => '',
         'requirements' => [
