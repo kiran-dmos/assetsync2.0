@@ -431,7 +431,7 @@ final class AssetSyncService
         }
 
         if ($customChanges !== []) {
-            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, $customChanges, $customTypes]);
+            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, $customChanges, $customTypes, true]);
             if (!$this->remoteSucceeded($updateResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;
@@ -797,7 +797,7 @@ final class AssetSyncService
     {
         $customFields = array_filter($fields, static fn (string $key): bool => FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
         try {
-            if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields)) {
+            if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields, true)) {
                 return false;
             }
         } catch (\RuntimeException $error) {

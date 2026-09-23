@@ -518,14 +518,14 @@ final class GlpiBConnection
     }
 
     /** Read and optionally write mapped Fields-plugin values through child-row REST endpoints. */
-    public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
+    public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false): array
     {
         $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
         if ($keys === []) {
             return ['success' => true, 'item' => [], 'history_option_ids' => [], 'history_refs' => []];
         }
 
-        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes): array {
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes, $allowReadonly): array {
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
             $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
             if (!$options['success']) {
@@ -569,7 +569,7 @@ final class GlpiBConnection
                     $foundType = $metadata['type'] !== '' ? $metadata['type'] : 'unsupported';
                     throw new \RuntimeException('The remote Fields-plugin definition is not an active ' . $expectedType . ' field: ' . $key . ' (found ' . $foundType . ').');
                 }
-                if (array_key_exists($key, $changes) && !$metadata['writable']) {
+                if (array_key_exists($key, $changes) && !$allowReadonly && !$metadata['writable']) {
                     throw new \RuntimeException('The remote Fields-plugin field is read-only: ' . $key);
                 }
                 if ($metadata['search_option_id'] > 0) {

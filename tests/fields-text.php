@@ -606,9 +606,13 @@ check($swsdChanges['local'] === [
 check($swsdChanges['remote'] === [], 'GLPI B sourced SW/SD outputs must not write calculated GLPI A values to GLPI B');
 $updateLocalAsset = new ReflectionMethod(AssetSyncService::class, 'updateLocalAsset');
 $updateLocalAsset->setAccessible(true);
+PluginFieldsField::$definitions[3]['is_readonly'] = 1;
+PluginFieldsField::$definitions[11]['is_readonly'] = 1;
 check($updateLocalAsset->invoke($service, 'Computer', 2, $swsdChanges['local']), 'GLPI B sourced SW/SD outputs must update GLPI A fields');
 check(PluginFieldsComputerdmosasset::$row['swsdbillablefieldtwo'] === 0, 'GLPI B sourced SW/SD Billable must persist to GLPI A');
 check(PluginFieldsComputerdmosasset::$row['swsdbillingstartdatefield'] === '2026-05-01', 'GLPI B sourced SW/SD Billing Start Date must persist to GLPI A');
+PluginFieldsField::$definitions[3]['is_readonly'] = 0;
+PluginFieldsField::$definitions[11]['is_readonly'] = 0;
 
 Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
     $swsdBillableKey => [
@@ -668,6 +672,22 @@ $swsdChanges = $compare->invoke(
 );
 check($swsdChanges['remote'] === [$swsdBillableKey => 1], 'Both-sourced SW/SD outputs must keep existing newer-GLPI-A behavior');
 check($swsdChanges['local'] === [], 'Both-sourced SW/SD outputs must not update GLPI A when GLPI A is newer');
+$swsdChanges = $compare->invoke(
+    $service,
+    [$swsdBillableKey => 1, 'date_mod' => '2026-06-01 00:00:00'],
+    ['entities_id' => 0, $swsdBillableKey => 0, 'date_mod' => '2026-06-02 00:00:00'],
+    $route,
+    $swsdMappings,
+    $swsdTypes,
+    [$swsdBillableKey => '2026-06-01 00:00:00'],
+    [$swsdBillableKey => '2026-06-02 00:00:00'],
+    'UTC'
+);
+check($swsdChanges['local'] === [$swsdBillableKey => 0], 'Both-sourced SW/SD outputs must keep existing newer-GLPI-B behavior');
+PluginFieldsField::$definitions[3]['is_readonly'] = 1;
+check($updateLocalAsset->invoke($service, 'Computer', 2, $swsdChanges['local']), 'Both-sourced SW/SD outputs must update read-only GLPI A when GLPI B is newer');
+check(PluginFieldsComputerdmosasset::$row['swsdbillablefieldtwo'] === 0, 'Both-sourced newer GLPI B value must persist to read-only GLPI A');
+PluginFieldsField::$definitions[3]['is_readonly'] = 0;
 
 $yesKeyA = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
 $yesKeyB = 'Computer.PluginFieldsComputerdmosasset.hwbillablefield';

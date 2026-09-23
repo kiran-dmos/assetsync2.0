@@ -617,6 +617,8 @@ final class FakeGlpiBClient
     public array $records = [];
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $customRecords = [];
+    /** @var array<string,bool> */
+    public array $readonlyCustomKeys = [];
     /** @var array<string,array<int,array<string,mixed>>> */
     public array $customDropdownOptions = [];
     /** @var array<string,string> */
@@ -723,7 +725,7 @@ final class FakeGlpiBClient
      * @param array<string,string> $expectedTypes
      * @return array{success:bool,message:string,item:array<string,mixed>,history_option_ids:array<string,string>,history_refs:array<string,array{option_id:string,itemtype_link:string}>,transient:bool}
      */
-    public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = []): array
+    public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false): array
     {
         if (array_intersect($keys, $this->unavailableCustomKeys) !== []) {
             return ['success' => false, 'message' => 'Mapped remote field unavailable.', 'transient' => false];
@@ -737,6 +739,9 @@ final class FakeGlpiBClient
             $this->customRecords[$recordKey][$itemsId] ??= [];
             foreach ($changes as $key => $value) {
                 $key = (string) $key;
+                if (!$allowReadonly && !empty($this->readonlyCustomKeys[$key])) {
+                    return ['success' => false, 'message' => 'Remote custom field is read-only.', 'transient' => false];
+                }
                 $type = (string) ($expectedTypes[$key] ?? 'text');
                 $this->customRecords[$recordKey][$itemsId][$key] = $type === 'dropdown'
                     ? $this->dropdownIdForLabel($key, (string) $value)
@@ -2966,6 +2971,19 @@ $remoteClient->customRecords['production:Computer'][2612] = [
     $swsdRedeployedKey => '2026-03-06',
     $swsdBillableKey => 0,
 ];
+$remoteClient->readonlyCustomKeys[$swsdBillableKey] = true;
+$remoteClient->readonlyCustomKeys[$swsdStartKey] = true;
+$readonlyRemoteWrite = $remoteClient->customTextValues(
+    ['id' => 'production'],
+    'Computer',
+    2612,
+    [$swsdBillableKey],
+    [$swsdBillableKey => 1],
+    [$swsdBillableKey => 'yesno']
+);
+if ($readonlyRemoteWrite['success']) {
+    throw new RuntimeException('Default GLPI B custom writes should still respect readonly protection.');
+}
 \GlpiPlugin\Assetsync20\AssetSyncLink::save([
     'itemtype' => 'Computer',
     'items_id' => 612,
@@ -2992,7 +3010,7 @@ if (
 }
 if (($remoteClient->customRecords['production:Computer'][2612][$swsdBillableKey] ?? null) !== 1
     || ($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey] ?? null) !== '2026-04-01') {
-    throw new RuntimeException('A-authority SWSD outputs must reach B in the same run as new inbound inputs.');
+    throw new RuntimeException('A-authority SWSD outputs must reach read-only GLPI B in the same run as new inbound inputs.');
 }
 
 $swsdSavedConfig = Config::$values['plugin:assetsync20']['field_mappings'];
@@ -3047,52 +3065,11 @@ $remoteClient->customRecords['production:Computer'][2612][$swsdBillableKey] = 1;
 $swsdService->queueAssetIfNeeded('Computer', 612, 'production', true);
 $swsdService->processQueue(10);
 $link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
-if ($link['status'] !== 'blocked_local_update' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 0) {
-    throw new RuntimeException('B authority must not bypass readonly SWSD output protection.');
+if ($link['status'] !== 'synced' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 1) {
+    throw new RuntimeException('B authority must update read-only GLPI A destination fields.');
 }
-if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production')) {
-    throw new RuntimeException('Scheduled runs must not retry unchanged blocked local updates.');
-}
-if (!$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
-    throw new RuntimeException('Explicit force must retry a linked blocked local update with an unchanged payload.');
-}
-$swsdService->processQueue(10);
-$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
-if ($link['status'] !== 'blocked_local_update' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 0) {
-    throw new RuntimeException('Forced retries must still enforce readonly field protection.');
-}
-$blockedHash = $link['last_payload_hash'];
-foreach (['blocked_duplicate', 'blocked_configuration', 'blocked_remote_error'] as $otherBlock) {
-    \GlpiPlugin\Assetsync20\AssetSyncLink::save(array_merge($link, ['status' => $otherBlock]));
-    if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
-        throw new RuntimeException('Force must preserve other unchanged block types: ' . $otherBlock);
-    }
-}
-\GlpiPlugin\Assetsync20\AssetSyncLink::save(array_merge($link, ['remote_items_id' => null]));
-if ($swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
-    throw new RuntimeException('Force must not retry a blocked local update without a known remote identity.');
-}
-\GlpiPlugin\Assetsync20\AssetSyncLink::save($link);
 PluginFieldsField::$definitions[31]['is_readonly'] = 0;
 PluginFieldsField::$definitions[32]['is_readonly'] = 0;
-if (!$swsdService->queueAssetIfNeeded('Computer', 612, 'production', true)) {
-    throw new RuntimeException('Force must retry after correcting permissions without changing the payload.');
-}
-$retryJob = null;
-foreach ($DB->tables[\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE] as $queueRow) {
-    if ((int) $queueRow['items_id'] === 612 && $queueRow['glpi_b_connection_id'] === 'production') {
-        $retryJob = $queueRow;
-        break;
-    }
-}
-if ($retryJob['payload_hash'] !== $blockedHash || (int) $retryJob['remote_items_id'] !== 2612) {
-    throw new RuntimeException('Retry must retain the unchanged payload and existing remote identity.');
-}
-$swsdService->processQueue(10);
-$link = \GlpiPlugin\Assetsync20\AssetSyncLink::find('Computer', 612, 'production');
-if ($link['status'] !== 'synced' || PluginFieldsComputerdmosasset::$rows[612]['swsdbillablefieldtwo'] !== 1) {
-    throw new RuntimeException('Corrected permissions must allow a forced blocked local update to finish.');
-}
 // Unmapped outputs stay local, including a start date that does not exist on B.
 unset($swsdConfig['production']['Computer'][$swsdBillableKey], $swsdConfig['production']['Computer'][$swsdStartKey]);
 Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
