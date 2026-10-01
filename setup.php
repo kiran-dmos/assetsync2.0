@@ -24,6 +24,7 @@ function plugin_init_assetsync20(): void
 
     $PLUGIN_HOOKS['csrf_compliant'][Plugin::KEY] = true;
     $PLUGIN_HOOKS['config_page'][Plugin::KEY] = 'front/config.php';
+    $PLUGIN_HOOKS['add_css'][Plugin::KEY] = 'css/assetsync20.css';
     $PLUGIN_HOOKS['menu_toadd'][Plugin::KEY] = [
         'config' => Menu::class,
     ];

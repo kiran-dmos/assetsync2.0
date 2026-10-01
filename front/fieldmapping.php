@@ -129,11 +129,11 @@ $fieldOptionLabel = static function (array $field): string {
     return $label;
 };
 
-echo '<div class="center">';
+echo '<div class="assetsync-page assetsync-mapping">';
 echo '<h2>Field Mapping</h2>';
 
 if ($selectedConnection !== null) {
-    echo '<p><a class="submit" href="' . $html($urlWithQuery(Menu::configUrl(), [
+    echo '<p class="assetsync-actions"><a class="submit" href="' . $html($urlWithQuery(Menu::configUrl(), [
         'id' => $selectedConnectionId,
     ])) . '">Back to GLPI B connection setup</a></p>';
 }
@@ -204,7 +204,8 @@ if ($selectedConnectionId === '' || $selectedConnection === null) {
 echo '<form method="post" action="' . $html(Menu::fieldMappingUrl()) . '">';
 echo '<input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">';
 echo '<input type="hidden" name="itemtype" value="' . $html($selectedItemtype) . '">';
-echo '<table class="tab_cadre_fixe">';
+echo '<div class="assetsync-table-scroll">';
+echo '<table class="tab_cadre_fixe assetsync-mapping-table">';
 echo '<tr><th colspan="4">' . $html($assetTypes[$selectedItemtype]) . ' fields</th></tr>';
 echo '<tr>';
 echo '<th>GLPI A field</th>';
@@ -262,6 +263,7 @@ echo '<button type="submit" name="save" value="1" class="submit"'
 echo '</td>';
 echo '</tr>';
 echo '</table>';
+echo '</div>';
 echo '</form>';
 echo '</div>';
 

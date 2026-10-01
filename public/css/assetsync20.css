@@ -1,0 +1,77 @@
+.assetsync-page {
+    box-sizing: border-box;
+    width: 100%;
+    max-width: 1100px;
+    margin: 1rem auto 2rem;
+    padding: 0 1rem;
+    text-align: left;
+}
+
+.assetsync-page h2,
+.assetsync-page .assetsync-actions {
+    text-align: center;
+}
+
+.assetsync-page table.tab_cadre_fixe {
+    width: 100%;
+    max-width: 980px;
+    margin: 0 auto 1rem;
+}
+
+.assetsync-page input[type="text"],
+.assetsync-page input[type="url"],
+.assetsync-page input[type="password"],
+.assetsync-page select {
+    box-sizing: border-box;
+    max-width: 100%;
+}
+
+.assetsync-table-scroll {
+    max-width: 980px;
+    margin: 0 auto;
+    overflow-x: auto;
+}
+
+.assetsync-page .assetsync-wide-table {
+    min-width: 760px;
+}
+
+.assetsync-mapping .assetsync-table-scroll,
+.assetsync-mapping table.assetsync-mapping-table {
+    max-width: 1100px;
+}
+
+.assetsync-mapping .assetsync-mapping-table {
+    min-width: 680px;
+    table-layout: fixed;
+}
+
+.assetsync-mapping-table td {
+    overflow-wrap: anywhere;
+}
+
+.assetsync-mapping-table code {
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.assetsync-mapping-table select {
+    width: 100%;
+    min-width: 0;
+}
+
+.assetsync-billing table.assetsync-workflow {
+    max-width: 840px;
+}
+
+.assetsync-billing .assetsync-workflow select {
+    width: 100%;
+}
+
+.assetsync-asset-type {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    margin: 0 0.75rem 0.3rem 0;
+    white-space: nowrap;
+}

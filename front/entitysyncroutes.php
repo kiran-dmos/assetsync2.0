@@ -220,7 +220,7 @@ $entityDropdown = static function (array $selectedRoute) use ($html): void {
         . $html((string) ($selectedRoute['glpi_a_source_entity_id'] ?? '')) . '" size="20">';
 };
 
-echo '<div class="center">';
+echo '<div class="assetsync-page assetsync-routes">';
 $pageTitle = 'Entity Sync Routes';
 if ($selectedConnection !== null) {
     $selectedConnectionLabel = $selectedConnection['name'] !== ''
@@ -232,7 +232,7 @@ if ($selectedConnection !== null) {
 echo '<h2>' . $html($pageTitle) . '</h2>';
 
 if ($selectedConnectionId !== '') {
-    echo '<p>';
+    echo '<p class="assetsync-actions">';
     echo '<a class="submit" href="' . $html($connectionSetupUrl($selectedConnectionId)) . '">Back to GLPI B connection setup</a> ';
     echo '<a class="submit" href="' . $html($urlWithQuery(Menu::fieldMappingUrl(), [
         'connection_id' => $selectedConnectionId,
@@ -272,7 +272,8 @@ if ($conflicts !== []) {
     echo '</table>';
 }
 
-echo '<table class="tab_cadre_fixe">';
+echo '<div class="assetsync-table-scroll">';
+echo '<table class="tab_cadre_fixe assetsync-wide-table">';
 echo '<tr><th colspan="8">' . ($selectedConnectionId !== '' ? 'Saved routes for this connection' : 'Saved routes') . '</th></tr>';
 echo '<tr>';
 echo '<th>Name</th>';
@@ -322,6 +323,7 @@ foreach ($routes as $savedRoute) {
 }
 
 echo '</table>';
+echo '</div>';
 
 if ($connections === []) {
     echo '<table class="tab_cadre_fixe">';
@@ -401,7 +403,7 @@ echo '<td>Asset types</td>';
 echo '<td>';
 foreach ($assetTypes as $assetType => $label) {
     $checked = in_array($assetType, $route['asset_types'], true) ? ' checked' : '';
-    echo '<label style="display:inline-block;margin-right:1em">';
+    echo '<label class="assetsync-asset-type">';
     echo '<input type="checkbox" name="asset_types[]" value="' . $html($assetType) . '"' . $checked . '> ';
     echo $html($label);
     echo '</label>';

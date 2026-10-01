@@ -62,9 +62,9 @@ if (class_exists('Html') && method_exists('Html', 'header')) {
 
 $html = static fn (string $value): string => htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 
-echo '<div class="center">';
+echo '<div class="assetsync-page assetsync-billing">';
 echo '<h2>Billing Field Configuration</h2>';
-echo '<p><a href="' . $html(Menu::configUrl()) . '">Back to AssetSync2.0 dashboard</a></p>';
+echo '<p class="assetsync-actions"><a href="' . $html(Menu::configUrl()) . '">Back to AssetSync2.0 dashboard</a></p>';
 if ($message !== null) {
     echo '<div class="' . $html($messageClass) . '">' . $html($message) . '</div>';
 }
@@ -84,7 +84,7 @@ echo '<form method="post" action="' . $html(Menu::billingFieldsUrl()) . '">';
 foreach (BillingFieldConfig::roles() as $workflow => $roles) {
     $title = $workflow === 'hardware' ? 'Hardware Billing' : 'SW/SD Billing';
     $saved = is_array($config[$workflow] ?? null) ? $config[$workflow] : [];
-    echo '<table class="tab_cadre_fixe">';
+    echo '<table class="tab_cadre_fixe assetsync-workflow">';
     echo '<tr><th colspan="2">' . $html($title) . '</th></tr>';
     echo '<tr><td>Enabled</td><td><label><input type="checkbox" name="billing_fields[' . $html($workflow) . '][enabled]" value="1"'
         . (!empty($saved['enabled']) ? ' checked' : '') . '> Calculate billing fields</label></td></tr>';
@@ -115,7 +115,7 @@ if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
 if ($legacyMode || $invalidConfig) {
     echo '<p><label><input type="checkbox" name="confirm_disable_legacy" value="1"> I understand that saving with both workflows disabled stops billing.</label></p>';
 }
-echo '<p><button type="submit" name="save" value="1" class="submit">Save billing fields</button></p>';
+echo '<p class="assetsync-actions"><button type="submit" name="save" value="1" class="submit">Save billing fields</button></p>';
 echo '</form></div>';
 
 if (class_exists('Html') && method_exists('Html', 'footer')) {

@@ -109,7 +109,7 @@ $html = static function (string $value): string {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 };
 
-echo '<div class="center">';
+echo '<div class="assetsync-page assetsync-config">';
 echo '<h2>' . htmlspecialchars(Plugin::NAME, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</h2>';
 
 if ($message !== null) {
@@ -159,7 +159,8 @@ echo '<tr><td>4. Map fields.</td><td>Use Field mappings for the GLPI B connectio
 echo '<tr><td>5. Run sync.</td><td>Use GLPI automatic action <code>' . $html(AssetSyncCron::TASK_NAME) . '</code>.</td></tr>';
 echo '</table>';
 
-echo '<table class="tab_cadre_fixe" id="glpib-connections">';
+echo '<div class="assetsync-table-scroll">';
+echo '<table class="tab_cadre_fixe assetsync-wide-table" id="glpib-connections">';
 echo '<tr><th colspan="9">GLPI B connections</th></tr>';
 echo '<tr>';
 echo '<th>Name</th>';
@@ -219,6 +220,7 @@ foreach ($connections as $savedConnection) {
 }
 
 echo '</table>';
+echo '</div>';
 
 echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
 echo '<input type="hidden" name="id" value="' . $html($connection['id']) . '">';
