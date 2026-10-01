@@ -2815,6 +2815,32 @@ if (
     throw new RuntimeException('Hardware Billing should clear/reset GLPI B values when an asset becomes ineligible.');
 }
 
+$hwBillableKey = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
+$hwSavedConfig = Config::$values['plugin:assetsync20']['field_mappings'];
+$hwMappings = json_decode($hwSavedConfig, true);
+$hwMappings['production']['Computer'][$hwBillableKey] = [
+    'glpi_a_field_key' => $hwBillableKey,
+    'glpi_b_field_key' => $hwBillableKey,
+    'glpi_b_field_id' => '884792',
+    'glpi_b_field_uid' => $hwBillableKey,
+    'glpi_b_field_label' => 'HW Billable',
+    'source_of_truth' => 'glpi_b',
+];
+Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($hwMappings);
+$remoteClient->customRecords['production:Computer'][2611][$hwBillableKey] = 1;
+if (!$billingMayService->queueAssetIfNeeded('Computer', 611, 'production', true)) {
+    throw new RuntimeException('Inbound HW Billable change should queue for processing.');
+}
+$billingMayService->processQueue(10);
+if (PluginFieldsComputerdmosasset::$rows[611]['hwbillablefieldtwo'] !== 1
+    || PluginFieldsComputerdmosasset::$rows[611]['hwbillingstartdatefield'] !== '2026-02-01') {
+    throw new RuntimeException('Inbound HW Billable must recalculate local HW outputs in the same run.');
+}
+if (($remoteClient->customRecords['production:Computer'][2611][$billingStartKey] ?? null) !== '2026-02-01') {
+    throw new RuntimeException('Mapped HW outputs must reach GLPI B in the same run as an inbound HW input.');
+}
+Config::$values['plugin:assetsync20']['field_mappings'] = $hwSavedConfig;
+
 $swsdStatusKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_statusfielddropdowns_id';
 $swsdRedeployedKey = 'Computer.PluginFieldsComputerdmosasset.redeployeddatefield';
 $swsdBillableKey = 'Computer.PluginFieldsComputerdmosasset.swsdbillablefieldtwo';

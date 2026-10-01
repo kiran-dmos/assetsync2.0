@@ -140,6 +140,11 @@ echo '<td class="center"><a class="submit" href="' . $html(Menu::fieldMappingUrl
 echo '</tr>';
 echo '<tr>';
 echo '<td>4</td>';
+echo '<td><strong>Billing Fields</strong><br><small>Choose GLPI A Computer fields used by Hardware and SW/SD Billing.</small></td>';
+echo '<td class="center"><a class="submit" href="' . $html(Menu::billingFieldsUrl()) . '">Open billing fields</a></td>';
+echo '</tr>';
+echo '<tr>';
+echo '<td>5</td>';
 echo '<td><strong>Sync / CRON</strong><br><small>Automatic action: <code>' . $html(AssetSyncCron::TASK_NAME) . '</code></small></td>';
 echo '<td class="center"><a class="submit" href="' . $html($glpiFrontUrl('crontask.php')) . '">Open automatic actions</a></td>';
 echo '</tr>';

@@ -109,7 +109,7 @@ final class HardwareBilling
             ];
         }
 
-        $valuesByName = self::calculateValues($asset, $fields['inputs'], $today ?? new \DateTimeImmutable('today'));
+        $valuesByName = self::calculateValues(BillingFieldConfig::billingAsset($asset, $fields['inputs']), $fields['inputs'], $today ?? new \DateTimeImmutable('today'));
         $values = [];
         $mappings = [];
         $customTypes = [];
@@ -121,7 +121,11 @@ final class HardwareBilling
                 'glpi_b_field' => $key,
                 'source_of_truth' => 'glpi_a',
             ];
-            $customTypes[$key] = self::OUTPUTS[$name]['type'];
+            if (FieldsText::isCustom($key)) {
+                $customTypes[$key] = BillingFieldConfig::load() === null
+                    ? self::OUTPUTS[$name]['type']
+                    : BillingFieldConfig::fieldType($key);
+            }
         }
 
         return [
@@ -179,6 +183,29 @@ final class HardwareBilling
     {
         if ($itemtype !== self::ITEMTYPE) {
             return null;
+        }
+
+        $configured = BillingFieldConfig::workflow('hardware');
+        if ($configured !== null) {
+            if (!$configured['enabled']) {
+                return null;
+            }
+
+            return [
+                'inputs' => [
+                    'status' => $configured['status'],
+                    'ownership' => $configured['ownership'],
+                    'billable' => $configured['hw_billable'],
+                    'installed_date' => $configured['installed_date'],
+                    'model' => $configured['model'],
+                ],
+                'outputs' => [
+                    'start_date' => $configured['hw_billing_start_date'],
+                    'end_date' => $configured['hw_billing_end_date'],
+                    'frequency' => $configured['hw_billing_frequency'],
+                    'month' => $configured['hw_billing_month'],
+                ],
+            ];
         }
 
         $inputs = [];

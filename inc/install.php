@@ -9,6 +9,7 @@ use GlpiPlugin\Assetsync20\AssetSyncCron;
 use GlpiPlugin\Assetsync20\AssetSyncLink;
 use GlpiPlugin\Assetsync20\AssetSyncQueue;
 use GlpiPlugin\Assetsync20\AssetSyncService;
+use GlpiPlugin\Assetsync20\BillingFieldConfig;
 
 function plugin_assetsync20_install(): bool
 {
@@ -30,6 +31,7 @@ function plugin_assetsync20_uninstall(): bool
     AssetSyncCron::unregister();
     GlpiBConnection::uninstall();
     FieldMapping::uninstall();
+    BillingFieldConfig::uninstall();
     EntitySyncRoute::uninstall();
     AssetSyncService::uninstall();
 

@@ -35,7 +35,8 @@ final class SwsdBilling
      */
     public static function localInputKeys(string $itemtype): array
     {
-        return self::fields($itemtype) === null ? [] : array_values(self::INPUTS);
+        $fields = self::fields($itemtype);
+        return $fields === null ? [] : array_values($fields['inputs']);
     }
 
     /**
@@ -43,7 +44,8 @@ final class SwsdBilling
      */
     public static function localOutputKeys(string $itemtype): array
     {
-        return self::fields($itemtype) === null ? [] : array_column(self::OUTPUTS, 'key');
+        $fields = self::fields($itemtype);
+        return $fields === null ? [] : array_values($fields['outputs']);
     }
 
     /**
@@ -56,7 +58,8 @@ final class SwsdBilling
      */
     public static function syncData(string $itemtype, array $asset): array
     {
-        if (self::fields($itemtype) === null) {
+        $fields = self::fields($itemtype);
+        if ($fields === null) {
             return [
                 'values' => [],
                 'mappings' => [],
@@ -64,20 +67,23 @@ final class SwsdBilling
             ];
         }
 
-        $valuesByName = self::calculateValues($asset, self::INPUTS);
+        $valuesByName = self::calculateValues(BillingFieldConfig::billingAsset($asset, $fields['inputs']), $fields['inputs']);
         $values = [];
         $mappings = [];
         $customTypes = [];
 
-        foreach (self::OUTPUTS as $name => $output) {
-            $key = $output['key'];
+        foreach ($fields['outputs'] as $name => $key) {
             $values[$key] = $valuesByName[$name];
             $mappings[] = [
                 'glpi_a_field' => $key,
                 'glpi_b_field' => $key,
                 'source_of_truth' => 'glpi_a',
             ];
-            $customTypes[$key] = $output['type'];
+            if (FieldsText::isCustom($key)) {
+                $customTypes[$key] = BillingFieldConfig::load() === null
+                    ? self::OUTPUTS[$name]['type']
+                    : BillingFieldConfig::fieldType($key);
+            }
         }
 
         return [
@@ -111,12 +117,30 @@ final class SwsdBilling
     }
 
     /**
-     * @return bool|null
+     * @return array{inputs:array<string,string>,outputs:array<string,string>}|null
      */
-    private static function fields(string $itemtype): ?bool
+    private static function fields(string $itemtype): ?array
     {
         if ($itemtype !== self::ITEMTYPE) {
             return null;
+        }
+
+        $configured = BillingFieldConfig::workflow('swsd');
+        if ($configured !== null) {
+            if (!$configured['enabled']) {
+                return null;
+            }
+
+            return [
+                'inputs' => [
+                    'status' => $configured['status'],
+                    'redeployed_date' => $configured['redeployed_date'],
+                ],
+                'outputs' => [
+                    'billable' => $configured['swsd_billable'],
+                    'start_date' => $configured['swsd_billing_start_date'],
+                ],
+            ];
         }
 
         $expectedTypes = [
@@ -142,7 +166,13 @@ final class SwsdBilling
             }
         }
 
-        return true;
+        return [
+            'inputs' => self::INPUTS,
+            'outputs' => [
+                'billable' => self::OUTPUTS['billable']['key'],
+                'start_date' => self::OUTPUTS['start_date']['key'],
+            ],
+        ];
     }
 
     private static function startDate(\DateTimeImmutable $redeployedDate): \DateTimeImmutable

@@ -5,6 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/../src/autoload.php';
 
 use GlpiPlugin\Assetsync20\AssetSyncService;
+use GlpiPlugin\Assetsync20\BillingFieldConfig;
 use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\FieldsText;
 use GlpiPlugin\Assetsync20\HardwareBilling;
@@ -479,6 +480,10 @@ PluginFieldsComputerdmosasset::$row = [
 ];
 $billingInputKeys = HardwareBilling::localInputKeys('Computer');
 check($billingInputKeys === [$statusKey, $ownershipKey, $billableKey, $installedKey, $modelKey], 'Hardware Billing must discover input fields by metadata labels');
+$hardwareLegacyDraft = BillingFieldConfig::legacyDraft();
+check($hardwareLegacyDraft['config']['hardware']['enabled'], 'Legacy Hardware Billing opens enabled in the unsaved draft');
+check($hardwareLegacyDraft['config']['hardware']['status'] === $statusKey, 'Legacy Hardware status is preselected by stable key');
+check($hardwareLegacyDraft['warnings'] !== [], 'Unavailable legacy HW fallback outputs trigger a review warning');
 $billingAsset = FieldsText::localValues('Computer', 2, $billingInputKeys);
 $billingSync = HardwareBilling::syncData('Computer', $billingAsset, new DateTimeImmutable('2026-02-10'));
 check($billingSync['values'] === [
@@ -551,6 +556,9 @@ PluginFieldsComputerdmosasset::$row = [
 ];
 $swsdInputKeys = SwsdBilling::localInputKeys('Computer');
 check($swsdInputKeys === [$swsdStatusKey, $swsdRedeployedKey], 'SW/SD Billing must use the locked input field keys');
+$swsdLegacyDraft = BillingFieldConfig::legacyDraft();
+check($swsdLegacyDraft['config']['swsd']['enabled'], 'Legacy SW/SD Billing opens enabled in the unsaved draft');
+check($swsdLegacyDraft['config']['swsd']['status'] === $swsdStatusKey, 'Legacy SW/SD status is preselected by stable key');
 $swsdAsset = FieldsText::localValues('Computer', 2, array_merge($swsdInputKeys, SwsdBilling::localOutputKeys('Computer')));
 $swsdSync = SwsdBilling::syncData('Computer', $swsdAsset);
 check($swsdSync['values'] === [

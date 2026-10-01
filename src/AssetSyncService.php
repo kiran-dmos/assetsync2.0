@@ -408,14 +408,23 @@ final class AssetSyncService
         }
 
         // A-owned derived outputs must use this run's inbound inputs before sending to B.
-        $swsdValues = SwsdBilling::syncData($itemtype, array_merge($asset, $changes['local']))['values'];
+        try {
+            $billingAsset = array_merge($asset, $changes['local']);
+            $billingValues = array_merge(
+                HardwareBilling::syncData($itemtype, $billingAsset, $this->billingDate ?? new \DateTimeImmutable('today'))['values'],
+                SwsdBilling::syncData($itemtype, $billingAsset)['values']
+            );
+        } catch (\RuntimeException $error) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
+            return;
+        }
         foreach ($comparisonMappings as $mapping) {
             $localKey = $mapping['glpi_a_field'];
-            if ($mapping['source_of_truth'] === 'glpi_a' && array_key_exists($localKey, $swsdValues)) {
+            if ($mapping['source_of_truth'] === 'glpi_a' && array_key_exists($localKey, $billingValues)) {
                 $remoteKey = $mapping['glpi_b_field'];
                 unset($changes['remote'][$remoteKey]);
-                if (($remoteItem[$remoteKey] ?? null) !== $swsdValues[$localKey]) {
-                    $changes['remote'][$remoteKey] = $swsdValues[$localKey];
+                if (($remoteItem[$remoteKey] ?? null) !== $billingValues[$localKey]) {
+                    $changes['remote'][$remoteKey] = $billingValues[$localKey];
                 }
             }
         }
@@ -756,7 +765,7 @@ final class AssetSyncService
 
             if ($billingChanges !== []) {
                 $updatedBilling = AssetChangeHook::withoutQueue(
-                    fn (): bool => FieldsText::updateLocal($itemtype, $itemsId, $billingChanges, true)
+                    fn (): bool => $this->updateLocalAsset($itemtype, $itemsId, $billingChanges)
                 );
                 if (!$updatedBilling) {
                     throw new \RuntimeException('GLPI A rejected the HW Billing field update.');
@@ -791,7 +800,7 @@ final class AssetSyncService
 
             if ($billingChanges !== []) {
                 $updatedBilling = AssetChangeHook::withoutQueue(
-                    fn (): bool => FieldsText::updateLocal($itemtype, $itemsId, $billingChanges, true)
+                    fn (): bool => $this->updateLocalAsset($itemtype, $itemsId, $billingChanges)
                 );
                 if (!$updatedBilling) {
                     throw new \RuntimeException('GLPI A rejected the SW/SD Billing field update.');
