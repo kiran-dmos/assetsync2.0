@@ -1396,13 +1396,7 @@ final class GlpiBConnection
 
     private static function isValidTimezone(string $timezone): bool
     {
-        try {
-            new \DateTimeZone($timezone);
-        } catch (\Throwable) {
-            return false;
-        }
-
-        return true;
+        return in_array($timezone, \DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC), true);
     }
 
     /**

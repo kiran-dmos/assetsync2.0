@@ -222,6 +222,7 @@ $sessionTimezone = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection:
 $sessionTimezone->setAccessible(true);
 check($sessionTimezone->invoke(null, ['glpitimezone' => 'Asia/Brunei']) === 'Asia/Brunei', 'GLPI B named session timezone must be preserved for date_mod parsing');
 check($sessionTimezone->invoke(null, ['glpitimezone' => '0', 'glpi_currenttime' => gmdate('Y-m-d H:i:s')]) === '', 'GLPI B default/server timezone must not be guessed from current session time');
+check($sessionTimezone->invoke(null, ['glpitimezone' => '+08:00']) === '', 'GLPI B numeric timezone offset is not reliable across DST');
 $metadata = FieldsText::metadataWithDefinition($metadata, PluginFieldsField::$definitions[1]);
 check($metadata['container_id'] === 1, 'Generated metadata must identify the Fields container id');
 check($metadata['writable'] === true, 'Generated metadata must identify writable fields');
@@ -274,6 +275,16 @@ try {
     $nativeRemote = ['entities_id' => 0, 'name' => 'remote native', 'date_mod' => '2026-09-14 06:05:49'];
     check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'UTC')['local'] === ['name' => 'remote native'], 'Both native timestamps must compare GLPI B UTC against GLPI A local time');
     check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth)['conflicts'] === ['name'], 'Both native timestamps must block when GLPI B timezone is unavailable');
+    $nativeAsset['_date_mod_epoch'] = strtotime('2026-09-14 06:05:43 UTC');
+    date_default_timezone_set('UTC');
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'UTC')['local'] === ['name' => 'remote native'], 'GLPI A DB epoch must win over PHP timezone for Both');
+    $nativeRemote['date_mod'] = '2026-11-01 01:30:00';
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'America/New_York')['conflicts'] === ['name'], 'Ambiguous GLPI B DST fold must block Both');
+    $nativeRemote['date_mod'] = '2026-03-08 02:30:00';
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'America/New_York')['conflicts'] === ['name'], 'Nonexistent GLPI B DST gap must block Both');
+    $nativeRemote['date_mod'] = '2026-11-01 02:30:00';
+    check($compare->invoke($service, $nativeAsset, $nativeRemote, $route, $nativeBoth, [], [], [], 'America/New_York')['local'] === ['name' => 'remote native'], 'Unambiguous GLPI B time after DST fold must compare normally');
+    date_default_timezone_set('Asia/Brunei');
     $asset['date_mod'] = '2026-09-14 14:05:43';
     $remote['date_mod'] = '2026-09-14 06:05:49';
     $asset[$key] = 'local text';

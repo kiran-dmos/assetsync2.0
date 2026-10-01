@@ -75,14 +75,13 @@ final class AssetSyncQueue
 
         if (
             $existing !== null
-            && (string) ($existing['status'] ?? '') === self::STATUS_PENDING
+            && in_array((string) ($existing['status'] ?? ''), [self::STATUS_PENDING, self::STATUS_RETRY], true)
             && (string) ($existing['route_id'] ?? '') === $routeId
             && (string) ($existing['payload_hash'] ?? '') === $payloadHash
         ) {
             return false;
         }
 
-        $now = self::now();
         $fields = [
             'route_id'             => $routeId,
             'remote_items_id'      => self::nullablePositiveInt($remoteItemsId),
@@ -94,7 +93,7 @@ final class AssetSyncQueue
             'started_at'           => null,
             'finished_at'          => null,
             'last_error'           => null,
-            'date_mod'             => $now,
+            'date_mod'             => self::now(),
         ];
 
         if ($existing === null) {
@@ -105,16 +104,16 @@ final class AssetSyncQueue
             $fields['itemtype'] = $itemtype;
             $fields['items_id'] = $itemsId;
             $fields['glpi_b_connection_id'] = $connectionId;
-            $fields['date_creation'] = $now;
+            $fields['date_creation'] = self::now();
 
-            return $db->insert(self::TABLE, $fields);
+            return AssetSyncDbTime::write($db, static fn (): bool => $db->insert(self::TABLE, $fields));
         }
 
         if (!method_exists($db, 'update')) {
             return false;
         }
 
-        return $db->update(self::TABLE, $fields, ['id' => (int) $existing['id']]);
+        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, ['id' => (int) $existing['id']]));
     }
 
     /**
@@ -128,9 +127,16 @@ final class AssetSyncQueue
         }
 
         $limit = max(1, $limit);
-        $now = self::now();
-        $staleStartedAt = gmdate('Y-m-d H:i:s', time() - 1800);
+        $now = time();
         $rows = $db->request([
+            'SELECT' => [
+                '*',
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`available_at`)', 'available_epoch'),
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`date_mod`)', 'modified_epoch'),
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`finished_at`)', 'finished_epoch'),
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`payload_date`)', 'payload_epoch'),
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch'),
+            ],
             'FROM'  => self::TABLE,
             'WHERE' => [
                 'status' => [self::STATUS_PENDING, self::STATUS_RETRY, self::STATUS_RUNNING],
@@ -142,22 +148,34 @@ final class AssetSyncQueue
         $claimed = [];
 
         foreach ($rows as $row) {
-            if (!is_array($row) || count($claimed) >= $limit || !self::rowIsDue($row, $now, $staleStartedAt)) {
+            if (!is_array($row) || count($claimed) >= $limit || !self::rowIsDue($row, $now)) {
                 continue;
             }
 
             $attempts = (int) ($row['attempts'] ?? 0) + 1;
-            $db->update(self::TABLE, [
+            $updated = AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, [
                 'status'      => self::STATUS_RUNNING,
                 'attempts'    => $attempts,
-                'started_at'  => $now,
+                'started_at'  => self::now(),
                 'finished_at' => null,
-                'date_mod'    => $now,
-            ], ['id' => (int) $row['id']]);
+                'date_mod'    => self::now(),
+            ], ['id' => (int) $row['id']]));
+            if (!$updated) {
+                continue;
+            }
 
             $row['status'] = self::STATUS_RUNNING;
             $row['attempts'] = $attempts;
-            $row['started_at'] = $now;
+            $startedRows = $db->request([
+                'SELECT' => ['started_at'],
+                'FROM' => self::TABLE,
+                'WHERE' => ['id' => (int) $row['id']],
+                'LIMIT' => 1,
+            ]);
+            foreach ($startedRows as $startedRow) {
+                $row['started_at'] = $startedRow['started_at'] ?? null;
+                break;
+            }
             $claimed[] = $row;
         }
 
@@ -176,8 +194,8 @@ final class AssetSyncQueue
 
     public static function retry(int $id, int $attempts, string $message): bool
     {
-        $backoffSeconds = min(3600, 60 * (2 ** min(5, max(0, $attempts - 1))));
-        $availableAt = gmdate('Y-m-d H:i:s', time() + $backoffSeconds);
+        $backoffSeconds = self::backoffSeconds($attempts);
+        $availableAt = new \Glpi\DBAL\QueryExpression('DATE_ADD(NOW(), INTERVAL ' . $backoffSeconds . ' SECOND)');
 
         return self::updateStatus($id, self::STATUS_RETRY, $availableAt, $message, null);
     }
@@ -209,7 +227,7 @@ final class AssetSyncQueue
         return null;
     }
 
-    private static function updateStatus(int $id, string $status, ?string $availableAt, string $message, ?int $remoteItemsId): bool
+    private static function updateStatus(int $id, string $status, ?\Glpi\DBAL\QueryExpression $availableAt, string $message, ?int $remoteItemsId): bool
     {
         $db = self::db();
         if ($db === null) {
@@ -232,7 +250,7 @@ final class AssetSyncQueue
             $fields['remote_items_id'] = $remoteItemsId;
         }
 
-        return $db->update(self::TABLE, $fields, ['id' => $id]);
+        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, ['id' => $id]));
     }
 
     /**
@@ -243,7 +261,7 @@ final class AssetSyncQueue
         return isset($GLOBALS['DB']) && is_object($GLOBALS['DB']) ? $GLOBALS['DB'] : null;
     }
 
-    private static function rowIsDue(array $row, string $now, string $staleStartedAt): bool
+    private static function rowIsDue(array $row, int $now): bool
     {
         $status = (string) ($row['status'] ?? '');
         if ($status === self::STATUS_PENDING) {
@@ -251,18 +269,34 @@ final class AssetSyncQueue
         }
 
         if ($status === self::STATUS_RETRY) {
-            $availableAt = (string) ($row['available_at'] ?? '');
+            $finishedAt = (int) ($row['finished_epoch'] ?? 0);
+            if ($finishedAt > 0) {
+                return $finishedAt > $now + 60
+                    || $finishedAt + self::backoffSeconds((int) ($row['attempts'] ?? 1)) <= $now;
+            }
 
-            return $availableAt === '' || $availableAt <= $now;
+            $availableAt = (int) ($row['available_epoch'] ?? 0);
+
+            return $availableAt <= $now || $availableAt > $now + self::backoffSeconds((int) ($row['attempts'] ?? 1)) + 60;
         }
 
         if ($status === self::STATUS_RUNNING) {
-            $startedAt = (string) ($row['started_at'] ?? '');
+            $startedAt = (int) ($row['started_epoch'] ?? 0);
+            if ($startedAt <= 0) {
+                $modifiedAt = (int) ($row['modified_epoch'] ?? 0);
 
-            return $startedAt !== '' && $startedAt <= $staleStartedAt;
+                return $modifiedAt > 0 && $modifiedAt <= $now - 1800;
+            }
+
+            return $startedAt <= $now - 1800 || $startedAt > $now + 60;
         }
 
         return false;
+    }
+
+    private static function backoffSeconds(int $attempts): int
+    {
+        return min(3600, 60 * (2 ** min(5, max(0, $attempts - 1))));
     }
 
     private static function createTableSql(): string
@@ -318,8 +352,8 @@ SQL;
         return $value !== '' ? $value : null;
     }
 
-    private static function now(): string
+    private static function now(): \Glpi\DBAL\QueryExpression
     {
-        return gmdate('Y-m-d H:i:s');
+        return new \Glpi\DBAL\QueryExpression('NOW()');
     }
 }

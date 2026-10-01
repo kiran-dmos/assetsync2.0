@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/query-expression.php';
+
 define('GLPI_VERSION', '11.0.7');
 
 class Config
@@ -159,8 +161,30 @@ final class FakeDB
         return array_key_exists($table, $this->tables);
     }
 
-    public function doQuery(string $sql): bool
+    public function doQuery(string $sql)
     {
+        if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
+            return [['session_timezone' => $this->guessTimezone()]];
+        }
+
+        if (preg_match("/^SET SESSION time_zone = '([^']+)'$/", $sql, $match)) {
+            $previous = new DateTimeZone($this->guessTimezone());
+            $next = new DateTimeZone($match[1]);
+            foreach ($this->tables as &$rows) {
+                foreach ($rows as &$row) {
+                    foreach (['date_creation', 'date_mod', 'last_sync_at', 'last_payload_date', 'blocked_at', 'payload_date', 'available_at', 'started_at', 'finished_at'] as $field) {
+                        if (is_string($row[$field] ?? null) && preg_match('/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/', $row[$field])) {
+                            $row[$field] = (new DateTimeImmutable($row[$field], $previous))->setTimezone($next)->format('Y-m-d H:i:s');
+                        }
+                    }
+                }
+                unset($row);
+            }
+            unset($rows);
+            $this->timezone = $match[1];
+            return true;
+        }
+
         if (preg_match('/CREATE TABLE IF NOT EXISTS `([^`]+)`/i', $sql, $match)) {
             $this->tables[$match[1]] ??= [];
             return true;
@@ -174,11 +198,22 @@ final class FakeDB
         return true;
     }
 
+    public function fetchAssoc(array $rows): ?array
+    {
+        return $rows[0] ?? null;
+    }
+
+    public function quote(string $value): string
+    {
+        return "'" . str_replace("'", "''", $value) . "'";
+    }
+
     /**
      * @param array<string,mixed> $params
      */
     public function insert(string $table, array $params): bool
     {
+        $params = $this->resolveExpressions($params);
         $this->tables[$table] ??= [];
 
         if (!isset($params['id'])) {
@@ -198,6 +233,7 @@ final class FakeDB
      */
     public function update(string $table, array $params, array $where): bool
     {
+        $params = $this->resolveExpressions($params);
         foreach ($this->tables[$table] ?? [] as $index => $row) {
             if ($this->rowMatches($row, $where)) {
                 $this->tables[$table][$index] = array_merge($row, $params);
@@ -232,11 +268,40 @@ final class FakeDB
         }
 
         if (isset($query['SELECT']) && is_array($query['SELECT'])) {
-            $selected = array_flip(array_map('strval', $query['SELECT']));
-            $filtered = array_map(static fn (array $row): array => array_intersect_key($row, $selected), $filtered);
+            $selected = array_filter($query['SELECT'], 'is_string');
+            $keepAll = in_array('*', $selected, true);
+            $selected = array_flip($selected);
+            $filtered = array_map(function (array $row) use ($query, $keepAll, $selected): array {
+                $result = $keepAll ? $row : array_intersect_key($row, $selected);
+                foreach ($query['SELECT'] as $column) {
+                    if (!$column instanceof \Glpi\DBAL\QueryExpression || !preg_match('/^UNIX_TIMESTAMP\(`(\w+)`\)$/', $column->expression, $matches)) {
+                        continue;
+                    }
+                    $value = $row[$matches[1]] ?? null;
+                    $result[$column->alias] = $value === null ? null : (new DateTimeImmutable((string) $value, new DateTimeZone($this->guessTimezone())))->getTimestamp();
+                }
+                return $result;
+            }, $filtered);
         }
 
         return new FakeDBResult($filtered);
+    }
+
+    private function resolveExpressions(array $params): array
+    {
+        foreach ($params as $key => $value) {
+            if (!$value instanceof \Glpi\DBAL\QueryExpression) {
+                continue;
+            }
+            $time = new DateTimeImmutable('now', new DateTimeZone($this->guessTimezone()));
+            if (preg_match('/^DATE_ADD\(NOW\(\), INTERVAL (\d+) SECOND\)$/', $value->expression, $matches)) {
+                $time = $time->modify('+' . $matches[1] . ' seconds');
+            } elseif ($value->expression !== 'NOW()') {
+                throw new RuntimeException('Unexpected SQL expression: ' . $value->expression);
+            }
+            $params[$key] = $time->format('Y-m-d H:i:s');
+        }
+        return $params;
     }
 
     /**

@@ -396,7 +396,7 @@ final class AssetSyncService
         if ($changes['conflicts'] !== []) {
             $conflictMessage = $remoteDateModTimezone === ''
                 ? 'Both sides have different values, but GLPI B did not expose a named timezone for timestamp comparison. Set a named timezone such as UTC on the GLPI B API user instead of "Use server configuration" for: '
-                : 'Both sides have different values without a newer valid asset or custom history timestamp for: ';
+                : 'Both sides have different values without a newer unambiguous asset or custom history timestamp for: ';
             $this->blockJob(
                 $job,
                 $route['id'],
@@ -506,9 +506,11 @@ final class AssetSyncService
      */
     private function payloadDate(array $asset): string
     {
-        $dateMod = trim((string) ($asset['date_mod'] ?? ''));
+        if (is_int($asset['_date_mod_epoch'] ?? null)) {
+            return gmdate('Y-m-d H:i:s', $asset['_date_mod_epoch']);
+        }
 
-        return $dateMod !== '' ? $dateMod : gmdate('Y-m-d H:i:s');
+        return '';
     }
 
     /**
@@ -521,13 +523,8 @@ final class AssetSyncService
             return false;
         }
 
-        $lastSyncAt = trim((string) ($link['last_sync_at'] ?? ''));
-        if ($lastSyncAt === '') {
-            return true;
-        }
-
-        $lastSyncTime = strtotime($lastSyncAt);
-        if ($lastSyncTime === false) {
+        $lastSyncTime = (int) ($link['last_sync_epoch'] ?? 0);
+        if (!$lastSyncTime || $lastSyncTime > time() + 60) {
             return true;
         }
 
@@ -690,6 +687,23 @@ final class AssetSyncService
         }
 
         $fields['id'] = (int) ($fields['id'] ?? $itemsId);
+
+        $db = $this->db();
+        $table = $this->assetTable($itemtype);
+        if ($db !== null && method_exists($db, 'request') && $table !== '') {
+            $rows = $db->request([
+                'SELECT' => [new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`date_mod`)', 'date_mod_epoch')],
+                'FROM' => $table,
+                'WHERE' => ['id' => $itemsId],
+                'LIMIT' => 1,
+            ]);
+            foreach ($rows as $row) {
+                if (is_array($row) && is_numeric($row['date_mod_epoch'] ?? null)) {
+                    $fields['_date_mod_epoch'] = (int) $row['date_mod_epoch'];
+                }
+                break;
+            }
+        }
 
         return $fields;
     }
@@ -1012,7 +1026,10 @@ final class AssetSyncService
         }
 
         $rows = $db->request([
-            'SELECT' => ['id', 'date_mod', 'id_search_option', 'itemtype_link'],
+            'SELECT' => [
+                'id', 'date_mod', 'id_search_option', 'itemtype_link',
+                new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`date_mod`)', 'date_mod_epoch'),
+            ],
             'FROM' => 'glpi_logs',
             'WHERE' => [
                 'itemtype' => $itemtype,
@@ -1022,7 +1039,15 @@ final class AssetSyncService
             'LIMIT' => max(20, count($historyRefs) * 20),
         ]);
 
-        return $this->latestHistoryDatesByRef($rows, $historyRefs);
+        $datedRows = [];
+        foreach ($rows as $row) {
+            if (is_array($row) && is_numeric($row['date_mod_epoch'] ?? null)) {
+                $row['date_mod'] = gmdate('Y-m-d H:i:s', (int) $row['date_mod_epoch']);
+            }
+            $datedRows[] = $row;
+        }
+
+        return $this->latestHistoryDatesByRef($datedRows, $historyRefs);
     }
 
     /**
@@ -1138,15 +1163,19 @@ final class AssetSyncService
     {
         $localKey = $mapping['glpi_a_field'];
         $remoteKey = $mapping['glpi_b_field'];
-        $localTimezone = $this->dateModTimezone($this->localDateModTimezone());
+        $localEpoch = $asset['_date_mod_epoch'] ?? null;
+        $localTimezone = is_int($localEpoch) ? 'UTC' : $this->dateModTimezone($this->localDateModTimezone());
         $remoteTimezone = $this->dateModTimezone($remoteDateModTimezone);
         if ($localTimezone === '' || $remoteTimezone === '') {
             return '';
         }
 
-        $localDateMod = FieldsText::isCustom($localKey)
-            ? $this->effectiveCustomDateMod((string) ($asset['date_mod'] ?? ''), (string) ($localCustomDateMods[$localKey] ?? ''), $localTimezone)
+        $localParentDateMod = is_int($localEpoch)
+            ? gmdate('Y-m-d H:i:s', $localEpoch)
             : trim((string) ($asset['date_mod'] ?? ''));
+        $localDateMod = FieldsText::isCustom($localKey)
+            ? $this->effectiveCustomDateMod($localParentDateMod, (string) ($localCustomDateMods[$localKey] ?? ''), $localTimezone)
+            : $localParentDateMod;
         $remoteDateMod = FieldsText::isCustom($remoteKey)
             ? $this->effectiveCustomDateMod((string) ($remoteItem['date_mod'] ?? ''), (string) ($remoteCustomDateMods[$remoteKey] ?? ''), $remoteTimezone)
             : trim((string) ($remoteItem['date_mod'] ?? ''));
@@ -1210,7 +1239,26 @@ final class AssetSyncService
             return null;
         }
 
-        return $date->getTimestamp();
+        $wallTime = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $dateMod, new \DateTimeZone('UTC'));
+        if ($wallTime === false) {
+            return null;
+        }
+
+        $offsets = [$date->getOffset()];
+        foreach ($dateTimezone->getTransitions($date->getTimestamp() - 172800, $date->getTimestamp() + 172800) ?: [] as $transition) {
+            $offsets[] = (int) $transition['offset'];
+        }
+
+        $matches = [];
+        foreach (array_unique($offsets) as $offset) {
+            $timestamp = $wallTime->getTimestamp() - $offset;
+            $inTimezone = (new \DateTimeImmutable('@' . $timestamp))->setTimezone($dateTimezone);
+            if ($inTimezone->format('Y-m-d H:i:s') === $dateMod) {
+                $matches[$timestamp] = true;
+            }
+        }
+
+        return count($matches) === 1 ? (int) array_key_first($matches) : null;
     }
 
     private function dateModTimezone($value): string
@@ -1224,13 +1272,7 @@ final class AssetSyncService
             return '';
         }
 
-        try {
-            new \DateTimeZone($timezone);
-        } catch (\Throwable) {
-            return '';
-        }
-
-        return $timezone;
+        return in_array($timezone, \DateTimeZone::listIdentifiers(\DateTimeZone::ALL_WITH_BC), true) ? $timezone : '';
     }
 
     private function localDateModTimezone(): string
@@ -1336,7 +1378,7 @@ final class AssetSyncService
             $message,
             $remoteItemsId,
             (string) ($job['payload_hash'] ?? ''),
-            (string) ($job['payload_date'] ?? '')
+            (int) ($job['payload_epoch'] ?? 0) > 0 ? gmdate('Y-m-d H:i:s', (int) $job['payload_epoch']) : null
         );
         AssetSyncQueue::block((int) ($job['id'] ?? 0), $message, $remoteItemsId);
     }

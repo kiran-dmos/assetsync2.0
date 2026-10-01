@@ -66,6 +66,7 @@ final class AssetSyncLink
         }
 
         $rows = $db->request([
+            'SELECT' => ['*', new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`last_sync_at`)', 'last_sync_epoch')],
             'FROM'  => self::TABLE,
             'WHERE' => [
                 'itemtype'             => $itemtype,
@@ -108,11 +109,14 @@ final class AssetSyncLink
             'status'               => $status,
             'last_payload_hash'    => (string) ($data['last_payload_hash'] ?? ''),
             'last_payload_date'    => self::nullableDate($data['last_payload_date'] ?? null),
-            'last_sync_at'         => self::nullableDate($data['last_sync_at'] ?? $now),
+            'last_sync_at'         => array_key_exists('last_sync_at', $data) ? self::nullableDate($data['last_sync_at']) : $now,
             'blocked_at'           => str_starts_with($status, 'blocked_') ? $now : null,
             'last_error'           => self::nullableText($data['last_error'] ?? null),
             'date_mod'             => $now,
         ];
+        if (!array_key_exists('last_payload_date', $data)) {
+            unset($fields['last_payload_date']);
+        }
 
         $existing = self::find($itemtype, $itemsId, $connectionId);
         if ($existing === null) {
@@ -121,14 +125,14 @@ final class AssetSyncLink
             $fields['glpi_b_connection_id'] = $connectionId;
             $fields['date_creation'] = $now;
 
-            return method_exists($db, 'insert') && $db->insert(self::TABLE, $fields);
+            return method_exists($db, 'insert') && AssetSyncDbTime::write($db, static fn (): bool => $db->insert(self::TABLE, $fields));
         }
 
         if (!method_exists($db, 'update')) {
             return false;
         }
 
-        return $db->update(self::TABLE, $fields, ['id' => (int) $existing['id']]);
+        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, ['id' => (int) $existing['id']]));
     }
 
     public static function saveStatus(
@@ -148,7 +152,7 @@ final class AssetSyncLink
             $remoteItemsId = $existing !== null ? self::nullablePositiveInt($existing['remote_items_id'] ?? null) : null;
         }
 
-        return self::save([
+        $data = [
             'itemtype'             => $itemtype,
             'items_id'             => $itemsId,
             'glpi_b_connection_id' => $connectionId,
@@ -158,8 +162,12 @@ final class AssetSyncLink
             'last_error'           => $message,
             'last_sync_at'         => null,
             'last_payload_hash'    => $payloadHash ?? (string) ($existing['last_payload_hash'] ?? ''),
-            'last_payload_date'    => $payloadDate ?? (string) ($existing['last_payload_date'] ?? ''),
-        ]);
+        ];
+        if ($payloadDate !== null) {
+            $data['last_payload_date'] = $payloadDate;
+        }
+
+        return self::save($data);
     }
 
     /**
@@ -227,8 +235,8 @@ SQL;
         return $value !== '' ? $value : null;
     }
 
-    private static function now(): string
+    private static function now(): \Glpi\DBAL\QueryExpression
     {
-        return gmdate('Y-m-d H:i:s');
+        return new \Glpi\DBAL\QueryExpression('NOW()');
     }
 }
