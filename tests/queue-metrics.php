@@ -39,7 +39,7 @@ namespace {
             $this->pdo->sqliteCreateFunction('LEAST', static fn (...$values): int => (int) min($values));
             $this->pdo->sqliteCreateFunction('GREATEST', static fn (...$values): int => (int) max($values));
             $this->pdo->sqliteCreateFunction('POW', static fn ($base, $power): float => pow((float) $base, (float) $power), 2);
-            $this->pdo->exec('CREATE TABLE ' . AssetSyncQueue::TABLE . ' (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, date_creation INTEGER)');
+            $this->pdo->exec('CREATE TABLE ' . AssetSyncQueue::TABLE . ' (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, date_creation INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0)');
         }
 
         public function doQuery(string $sql)
@@ -70,7 +70,7 @@ namespace {
     QueueMetricsClock::$now = $now;
     $db = new QueueMetricsDB();
     $GLOBALS['DB'] = $db;
-    $insert = $db->pdo->prepare('INSERT INTO ' . AssetSyncQueue::TABLE . ' VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    $insert = $db->pdo->prepare('INSERT INTO ' . AssetSyncQueue::TABLE . ' (id,status,attempts,finished_at,available_at,started_at,date_mod,date_creation) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     for ($id = 1; $id <= 45; $id++) {
         $insert->execute([$id, 'retry', 1, $now, $now + 60, null, $now, $now - 900000]);
     }
@@ -102,10 +102,14 @@ namespace {
         $insert->execute($row);
     }
 
+    $insert->execute([74, 'done', 9, $now, null, null, $now - 10, null]);
+    $insert->execute([75, 'blocked', 8, $now, null, null, $now - 5, null]);
+    $db->pdo->exec('UPDATE ' . AssetSyncQueue::TABLE . ' SET needs_recheck = 1 WHERE id IN (69, 71, 74, 75)');
+
     try {
         $due = (new ReflectionMethod(AssetSyncQueue::class, 'dueSql'))->invoke(null, $now);
         $ids = $db->pdo->query('SELECT id FROM ' . AssetSyncQueue::TABLE . ' WHERE ' . $due . ' ORDER BY id')->fetchAll(PDO::FETCH_COLUMN);
-        queueMetricsCheck(array_map('intval', $ids) === [51, 52, 53, 54, 55, 56, 57, 58, 59, 65, 66, 67, 68, 72, 73], 'Independent expected SQL ids must preserve backoff, missing dates, stale and future boundaries.');
+        queueMetricsCheck(array_map('intval', $ids) === [51, 52, 53, 54, 55, 56, 57, 58, 59, 65, 66, 67, 68, 72, 73, 74, 75], 'Independent expected SQL ids must preserve backoff, missing dates, stale and future boundaries plus dirty terminals.');
 
         foreach (['UTC', 'Asia/Brunei', 'America/New_York'] as $timezone) {
             date_default_timezone_set($timezone);
@@ -113,7 +117,7 @@ namespace {
             $summary = AssetSyncQueue::metricsSnapshot();
             queueMetricsCheck(count($db->queries) === 1 && $summary['available'], 'Each snapshot must use one aggregate query.');
             queueMetricsCheck(str_contains($db->queries[0], "WHERE `status` IN ('pending', 'retry', 'running', 'blocked')"), 'The query must exclude historical done rows with a status filter.');
-            queueMetricsCheck($summary['pending'] === ['count' => 4, 'oldest_wait_s' => 30, 'unknown_age' => 2], 'Pending age must use the current enqueue and disclose missing/future dates.');
+            queueMetricsCheck($summary['pending'] === ['count' => 6, 'oldest_wait_s' => 30, 'unknown_age' => 2], 'Pending age must include dirty terminals and use current notification time, disclosing missing/future dates.');
             queueMetricsCheck($summary['retry_due'] === ['count' => 8, 'oldest_overdue_s' => 180, 'unknown_age' => 4], 'Retry overdue must start at finished plus backoff, ignoring available when finished exists.');
             queueMetricsCheck($summary['retry_waiting'] === ['count' => 47], 'Delayed retry classification must use the exact existing due predicate.');
             queueMetricsCheck($summary['running_reclaimable'] === ['count' => 3, 'oldest_job_age_s' => 1801, 'unknown_age' => 1], 'Reclaimable running jobs must preserve stale and future-legacy rules.');

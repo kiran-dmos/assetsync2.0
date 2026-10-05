@@ -169,6 +169,7 @@ final class FakeDB
     public string $timezone = '';
     public array $requests = [];
     public ?Closure $afterRequest = null;
+    public ?Closure $afterFirstRow = null;
     public ?Closure $afterInsert = null;
     public ?Closure $afterTableExists = null;
     public ?Closure $queryResult = null;
@@ -176,6 +177,12 @@ final class FakeDB
     public array $sqlQueries = [];
     public ?int $runLockResult = 1;
     public bool $runLockHeld = false;
+    public array $columns = [];
+
+    public function fieldExists(string $table, string $field): bool
+    {
+        return in_array($field, $this->columns[$table] ?? [], true);
+    }
 
     public function guessTimezone(): string
     {
@@ -237,7 +244,26 @@ final class FakeDB
 
         if (preg_match('/CREATE TABLE IF NOT EXISTS `([^`]+)`/i', $sql, $match)) {
             $this->tables[$match[1]] ??= [];
+            preg_match_all('/^  `(\w+)`/m', $sql, $fields);
+            $this->columns[$match[1]] = $fields[1];
             return true;
+        }
+
+        if (preg_match('/^ALTER TABLE `([^`]+)` ADD `needs_recheck` TINYINT NOT NULL DEFAULT 0$/', $sql, $match)) {
+            $this->columns[$match[1]][] = 'needs_recheck';
+            foreach ($this->tables[$match[1]] as &$row) {
+                $row['needs_recheck'] = 0;
+            }
+            unset($row);
+            return true;
+        }
+
+        $quoted = "'((?:''|[^'])*)'";
+        if (preg_match('/^INSERT INTO `glpi_plugin_assetsync20_syncqueue` .* VALUES \(' . $quoted . ', (\d+), ' . $quoted . ', 1, NOW\(\), NOW\(\)\) ON DUPLICATE KEY UPDATE /', $sql, $match)) {
+            return $this->notifyQueue(str_replace("''", "'", $match[1]), (int) $match[2], str_replace("''", "'", $match[3]), true);
+        }
+        if (preg_match('/^UPDATE `glpi_plugin_assetsync20_syncqueue` SET `needs_recheck` = 1, .* WHERE `itemtype` = ' . $quoted . ' AND `items_id` = (\d+) AND `glpi_b_connection_id` = ' . $quoted . '$/', $sql, $match)) {
+            return $this->notifyQueue(str_replace("''", "'", $match[1]), (int) $match[2], str_replace("''", "'", $match[3]), false);
         }
 
         if (preg_match('/DROP TABLE IF EXISTS `([^`]+)`/i', $sql, $match)) {
@@ -246,6 +272,25 @@ final class FakeDB
         }
 
         return true;
+    }
+
+    private function notifyQueue(string $itemtype, int $itemsId, string $connectionId, bool $allowInsert): bool
+    {
+        $table = \GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE;
+        foreach ($this->tables[$table] ?? [] as $index => $row) {
+            if ($row['itemtype'] === $itemtype && (int) $row['items_id'] === $itemsId && $row['glpi_b_connection_id'] === $connectionId) {
+                $this->tables[$table][$index]['needs_recheck'] = 1;
+                if (!in_array($row['status'], ['running', 'retry'], true)) {
+                    $this->tables[$table][$index]['date_mod'] = (new DateTimeImmutable('now', new DateTimeZone($this->guessTimezone())))->format('Y-m-d H:i:s');
+                }
+                return true;
+            }
+        }
+        return !$allowInsert || $this->insert($table, ['itemtype' => $itemtype, 'items_id' => $itemsId,
+            'glpi_b_connection_id' => $connectionId, 'route_id' => '', 'payload_hash' => '', 'payload_date' => null,
+            'remote_items_id' => null, 'status' => 'pending', 'attempts' => 0, 'needs_recheck' => 1,
+            'available_at' => null, 'started_at' => null, 'finished_at' => null, 'last_error' => null,
+            'date_creation' => new \Glpi\DBAL\QueryExpression('NOW()'), 'date_mod' => new \Glpi\DBAL\QueryExpression('NOW()')]);
     }
 
     public function fetchAssoc($rows): ?array
@@ -267,6 +312,9 @@ final class FakeDB
     public function insert(string $table, array $params): bool
     {
         $params = $this->resolveExpressions($params);
+        if ($table === \GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE) {
+            $params['needs_recheck'] ??= 0;
+        }
         $this->tables[$table] ??= [];
 
         if (!isset($params['id'])) {
@@ -296,8 +344,11 @@ final class FakeDB
         $this->affectedRows = 0;
         foreach ($this->tables[$table] ?? [] as $index => $row) {
             if ($this->rowMatches($row, $where)) {
-                $this->tables[$table][$index] = array_merge($row, $params);
-                $this->affectedRows++;
+                $updated = array_merge($row, $params);
+                $this->tables[$table][$index] = $updated;
+                if ($updated !== $row) {
+                    $this->affectedRows++;
+                }
             }
         }
 
@@ -381,6 +432,8 @@ final class FakeDB
             $time = new DateTimeImmutable('now', new DateTimeZone($this->guessTimezone()));
             if (preg_match('/^DATE_ADD\(NOW\(\), INTERVAL (\d+) SECOND\)$/', $value->expression, $matches)) {
                 $time = $time->modify('+' . $matches[1] . ' seconds');
+            } elseif (preg_match('/^FROM_UNIXTIME\((\d+)\)$/', $value->expression, $matches)) {
+                $time = (new DateTimeImmutable('@' . $matches[1]))->setTimezone(new DateTimeZone($this->guessTimezone()));
             } elseif ($value->expression !== 'NOW()') {
                 throw new RuntimeException('Unexpected SQL expression: ' . $value->expression);
             }
@@ -396,6 +449,9 @@ final class FakeDB
     {
         foreach ($this->tables[$table] ?? [] as $row) {
             if ($this->rowMatches($row, $where)) {
+                if ($this->afterFirstRow !== null) {
+                    ($this->afterFirstRow)($table, $where);
+                }
                 return $row;
             }
         }
@@ -425,6 +481,19 @@ final class FakeDB
                 continue;
             }
             if ($expected instanceof \Glpi\DBAL\QueryExpression) {
+                if (preg_match('/^UNIX_TIMESTAMP\(`(started_at|payload_date)`\) = (\d+)$/', $expected->expression, $matches)) {
+                    $value = $row[$matches[1]] ?? null;
+                    if ($value === null || (new DateTimeImmutable((string) $value, new DateTimeZone($this->guessTimezone())))->getTimestamp() !== (int) $matches[2]) {
+                        return false;
+                    }
+                    continue;
+                }
+                if ($expected->expression === '`payload_date` IS NULL') {
+                    if (($row['payload_date'] ?? null) !== null) {
+                        return false;
+                    }
+                    continue;
+                }
                 if (!str_contains($expected->expression, 'UNIX_TIMESTAMP(`started_at`)')) {
                     throw new RuntimeException('Unexpected queue condition: ' . $expected->expression);
                 }
@@ -1263,7 +1332,7 @@ function hasPendingProductionQueue(FakeDB $DB, int $assetId): bool
         if (
             (int) ($queueRow['items_id'] ?? 0) === $assetId
             && (string) ($queueRow['glpi_b_connection_id'] ?? '') === 'production'
-            && (string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING
+            && ((string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING || !empty($queueRow['needs_recheck']))
         ) {
             return true;
         }
@@ -1312,7 +1381,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.6',
+    'version' => '0.1.7',
 ];
 
 foreach ($expectations as $key => $expected) {
@@ -2001,7 +2070,7 @@ foreach ($DB->tables[\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE] ?? [] as $qu
         (string) ($queueRow['itemtype'] ?? '') === 'Computer'
         && (int) ($queueRow['items_id'] ?? 0) === 501
         && (string) ($queueRow['glpi_b_connection_id'] ?? '') === 'production'
-        && (string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING
+        && ((string) ($queueRow['status'] ?? '') === \GlpiPlugin\Assetsync20\AssetSyncQueue::STATUS_PENDING || !empty($queueRow['needs_recheck']))
     ) {
         $hookQueued = true;
         break;

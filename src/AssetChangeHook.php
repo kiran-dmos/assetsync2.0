@@ -157,15 +157,58 @@ final class AssetChangeHook
             }
 
             [$itemtype, $itemsId] = $assetRef;
-            $service = new AssetSyncService();
+            $asset = self::parentFields($item, $itemtype, $itemsId);
+            $active = [];
             foreach (GlpiBConnection::loadAll() as $connection) {
                 if (!empty($connection['active'])) {
-                    $service->queueAssetIfNeeded($itemtype, $itemsId, (string) $connection['id']);
+                    $active[(string) $connection['id']] = true;
+                }
+            }
+            $eligible = [];
+            if ($asset !== null && empty($asset['is_deleted'])) {
+                $scope = EntitySyncRoute::matchAsset($itemtype, (string) $asset['entities_id']);
+                foreach (array_merge($scope['matches'], $scope['conflicts']) as $match) {
+                    $connectionId = (string) $match['glpi_b_connection_id'];
+                    if (isset($active[$connectionId])) {
+                        $eligible[$connectionId] = true;
+                    }
+                }
+            }
+            $connectionIds = array_unique(array_merge(array_keys($eligible), AssetSyncQueue::connectionIdsForAsset($itemtype, $itemsId)));
+            foreach ($connectionIds as $connectionId) {
+                try {
+                    if (!AssetSyncQueue::notify($itemtype, $itemsId, $connectionId, isset($eligible[$connectionId]))) {
+                        self::logFailure(new \RuntimeException('Could not notify an asset queue entry.'));
+                    }
+                } catch (\Throwable $error) {
+                    self::logFailure($error);
                 }
             }
         } catch (\Throwable $error) {
             self::logFailure($error);
         }
+    }
+
+    /** @return array<string,mixed>|null */
+    private static function parentFields(object $item, string $itemtype, int $itemsId): ?array
+    {
+        $fields = is_array($item->fields ?? null) ? $item->fields : [];
+        if (self::itemtype($item) === $itemtype && array_key_exists('entities_id', $fields) && array_key_exists('is_deleted', $fields)) {
+            return ['id' => $itemsId, 'entities_id' => $fields['entities_id'], 'is_deleted' => $fields['is_deleted']];
+        }
+        global $DB;
+        if (!isset($DB) || !is_object($DB) || !method_exists($DB, 'request') || !is_callable([$itemtype, 'getTable'])) {
+            return null;
+        }
+        foreach ($DB->request([
+            'SELECT' => ['id', 'entities_id', 'is_deleted'],
+            'FROM' => $itemtype::getTable(),
+            'WHERE' => ['id' => $itemsId],
+            'LIMIT' => 1,
+        ]) as $row) {
+            return is_array($row) ? $row : null;
+        }
+        return null;
     }
 
     /**

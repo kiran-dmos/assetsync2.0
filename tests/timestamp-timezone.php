@@ -63,7 +63,7 @@ final class TimestampTestDB
         $rows = $this->rows[$query['FROM']] ?? [];
         foreach ($query['WHERE'] ?? [] as $field => $value) {
             if ($value instanceof \Glpi\DBAL\QueryExpression) {
-                $rows = array_values(array_filter($rows, fn (array $row): bool => $this->queueRowIsDue($row)));
+                $rows = array_values(array_filter($rows, fn (array $row): bool => $this->expressionMatches($row, $value->expression)));
                 continue;
             }
             $rows = array_values(array_filter($rows, static fn (array $row): bool => in_array($row[$field] ?? null, (array) $value, true)));
@@ -92,6 +92,9 @@ final class TimestampTestDB
     public function insert(string $table, array $fields): bool
     {
         $fields = $this->resolveExpressions($fields);
+        if ($table === AssetSyncQueue::TABLE) {
+            $fields['needs_recheck'] ??= 0;
+        }
         $fields['id'] = count($this->rows[$table] ?? []) + 1;
         $this->rows[$table][] = $fields;
 
@@ -111,7 +114,7 @@ final class TimestampTestDB
             $matches = true;
             foreach ($where as $key => $expected) {
                 if ($expected instanceof \Glpi\DBAL\QueryExpression) {
-                    $matches = $matches && $this->queueRowIsDue($row);
+                    $matches = $matches && $this->expressionMatches($row, $expected->expression);
                 } elseif (($row[$key] ?? null) !== $expected) {
                     $matches = false;
                 }
@@ -128,6 +131,18 @@ final class TimestampTestDB
     public function affectedRows(): int
     {
         return $this->affectedRows;
+    }
+
+    private function expressionMatches(array $row, string $expression): bool
+    {
+        if (preg_match('/^UNIX_TIMESTAMP\(`(started_at|payload_date)`\) = (\d+)$/', $expression, $matches)) {
+            $value = $row[$matches[1]] ?? null;
+            return $value !== null && (new DateTimeImmutable((string) $value, new DateTimeZone($this->timezone)))->getTimestamp() === (int) $matches[2];
+        }
+        if ($expression === '`payload_date` IS NULL') {
+            return ($row['payload_date'] ?? null) === null;
+        }
+        return $this->queueRowIsDue($row);
     }
 
     private function queueRowIsDue(array $row): bool
@@ -149,6 +164,8 @@ final class TimestampTestDB
             $time = new DateTimeImmutable('now', new DateTimeZone($this->timezone));
             if (preg_match('/^DATE_ADD\(NOW\(\), INTERVAL (\d+) SECOND\)$/', $value->expression, $matches)) {
                 $time = $time->modify('+' . $matches[1] . ' seconds');
+            } elseif (preg_match('/^FROM_UNIXTIME\((\d+)\)$/', $value->expression, $matches)) {
+                $time = (new DateTimeImmutable('@' . $matches[1]))->setTimezone(new DateTimeZone($this->timezone));
             } elseif ($value->expression !== 'NOW()') {
                 throw new RuntimeException('Unexpected SQL expression: ' . $value->expression);
             }
@@ -206,7 +223,8 @@ try {
     AssetSyncQueue::enqueue('Computer', 1, 'test', 'test-route', 'hash', null);
     $queue = $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][0];
     checkRecent((string) $queue['date_creation'] . ' +08:00', $started, 'Queue creation time must use the DB session timezone');
-    AssetSyncQueue::retry((int) $queue['id'], 1, 'retry');
+    $firstClaim = AssetSyncQueue::claimDue(1)[0];
+    AssetSyncQueue::retry($firstClaim, 'retry');
     $queue = $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][0];
     checkRecent((string) $queue['available_at'] . ' +08:00', $started + 60, 'Retry must use the DB session timezone');
     if (AssetSyncQueue::enqueue('Computer', 1, 'test', 'test-route', 'hash', null)) {
@@ -227,7 +245,7 @@ try {
     if (count($claimed) !== 1 || (int) $claimed[0]['id'] !== (int) $queue['id']) {
         throw new RuntimeException('A running job must become stale after 30 minutes');
     }
-    checkRecent((string) $claimed[0]['started_at'] . ' +08:00', $started, 'Claim time must use the DB session timezone');
+    checkRecent((string) $claimed[0]['started_at'] . ' +00:00', $started, 'Claim reread must use UTC for its epoch fence');
 
     $payloadDate = new ReflectionMethod(AssetSyncService::class, 'payloadDate');
     if ($payloadDate->invoke($service, []) !== '') {
@@ -236,7 +254,8 @@ try {
 
     AssetSyncQueue::enqueue('Computer', 2, 'test', 'test-route', 'old-hash', null);
     $secondQueue = $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][1];
-    AssetSyncQueue::retry((int) $secondQueue['id'], 1, 'retry');
+    $secondClaim = AssetSyncQueue::claimDue(1)[0];
+    AssetSyncQueue::retry($secondClaim, 'retry');
     if (!AssetSyncQueue::enqueue('Computer', 2, 'test', 'test-route', 'new-hash', null)) {
         throw new RuntimeException('A changed payload must replace a retry');
     }
@@ -290,8 +309,8 @@ try {
         throw new RuntimeException('Future legacy queue timestamps must not strand work');
     }
 
-    AssetSyncQueue::finish((int) $queue['id']);
-    AssetSyncQueue::finish((int) $secondQueue['id']);
+    AssetSyncQueue::finish($claimed[0]);
+    AssetSyncQueue::finish(AssetSyncQueue::claimDue(1)[0]);
     date_default_timezone_set('Asia/Brunei');
     $GLOBALS['DB']->timezone = 'UTC';
     AssetSyncLink::save([
@@ -307,7 +326,7 @@ try {
     }
     AssetSyncQueue::enqueue('Computer', 3, 'test', 'test-route', 'web-hash', null);
     $webQueue = $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][2];
-    AssetSyncQueue::retry((int) $webQueue['id'], 1, 'retry');
+    AssetSyncQueue::retry(AssetSyncQueue::claimDue(1)[0], 'retry');
     if (AssetSyncQueue::claimDue(1) !== []) {
         throw new RuntimeException('Web PHP timezone must not skip retry backoff');
     }
@@ -326,6 +345,7 @@ try {
         'attempts' => 0,
         'route_id' => 'test-route',
         'payload_hash' => 'ready',
+        'needs_recheck' => 0,
     ];
     $ready = AssetSyncQueue::claimDue(1);
     if (count($ready) !== 1 || (int) $ready[0]['id'] !== 150) {
@@ -339,6 +359,7 @@ try {
             'attempts' => 0,
             'route_id' => 'test-route',
             'payload_hash' => 'race',
+            'needs_recheck' => 0,
         ];
     }
     $GLOBALS['DB']->beforeClaimUpdate = static function (TimestampTestDB $db): void {

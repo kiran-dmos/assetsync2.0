@@ -300,6 +300,25 @@ final class AssetSyncService
         $payloadDate = $this->payloadDate($asset);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
 
+        if (!$this->payloadNeedsWork($link, $route, $payloadHash, $mappings, $forceInboundRecheck)) {
+            return false;
+        }
+
+        $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : null;
+
+        return AssetSyncQueue::enqueue(
+            $itemtype,
+            $itemsId,
+            $connectionId,
+            $route['id'],
+            $payloadHash,
+            $payloadDate,
+            $remoteItemsId
+        );
+    }
+
+    private function payloadNeedsWork(?array $link, array $route, string $payloadHash, array $mappings, bool $forceInboundRecheck = false): bool
+    {
         if ($link !== null && (string) ($link['route_id'] ?? '') === $route['id'] && (string) ($link['last_payload_hash'] ?? '') === $payloadHash) {
             $linkStatus = (string) ($link['status'] ?? '');
             if ($linkStatus === AssetSyncLink::STATUS_SYNCED) {
@@ -322,17 +341,7 @@ final class AssetSyncService
             }
         }
 
-        $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : null;
-
-        return AssetSyncQueue::enqueue(
-            $itemtype,
-            $itemsId,
-            $connectionId,
-            $route['id'],
-            $payloadHash,
-            $payloadDate,
-            $remoteItemsId
-        );
+        return true;
     }
 
     public function processQueue(int $limit = 10, ?int $deadline = null): int
@@ -404,6 +413,10 @@ final class AssetSyncService
             $this->recordJobOutcome('skipped', true);
             return;
         }
+        if (!AssetSyncQueue::owns($job)) {
+            $this->recordJobOutcome('skipped', false);
+            return;
+        }
 
         $connection = $this->activeConnection($connectionId);
         if ($connection === null) {
@@ -413,6 +426,10 @@ final class AssetSyncService
 
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
+            if (!AssetSyncQueue::owns($job)) {
+                $this->recordJobOutcome('skipped', false);
+                return;
+            }
             $saved = AssetSyncLink::saveStatus(
                 $itemtype,
                 $itemsId,
@@ -421,7 +438,7 @@ final class AssetSyncService
                 AssetSyncLink::STATUS_OUT_OF_SCOPE,
                 'The local asset no longer exists or is deleted.'
             );
-            $finished = AssetSyncQueue::finish($queueId, 'Local asset is no longer syncable.');
+            $finished = AssetSyncQueue::finish($job, 'Local asset is no longer syncable.');
             $this->recordJobOutcome('skipped', $saved && $finished);
             return;
         }
@@ -433,6 +450,10 @@ final class AssetSyncService
         }
 
         if ($scope['status'] !== 'matched' || $scope['route'] === null) {
+            if (!AssetSyncQueue::owns($job)) {
+                $this->recordJobOutcome('skipped', false);
+                return;
+            }
             $saved = AssetSyncLink::saveStatus(
                 $itemtype,
                 $itemsId,
@@ -441,7 +462,7 @@ final class AssetSyncService
                 AssetSyncLink::STATUS_OUT_OF_SCOPE,
                 'The asset is no longer in scope for this GLPI B connection.'
             );
-            $finished = AssetSyncQueue::finish($queueId, 'Asset is out of scope.');
+            $finished = AssetSyncQueue::finish($job, 'Asset is out of scope.');
             $this->recordJobOutcome('skipped', $saved && $finished);
             return;
         }
@@ -469,9 +490,26 @@ final class AssetSyncService
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
             return;
         }
+        // Retry/reclaimed work was already accepted, even if a legacy hash is blank.
+        $checkUnchanged = (($job['previous_status'] ?? '') === AssetSyncQueue::STATUS_PENDING && (string) ($job['payload_hash'] ?? '') === '')
+            || in_array($job['previous_status'] ?? '', [AssetSyncQueue::STATUS_DONE, AssetSyncQueue::STATUS_BLOCKED], true);
+        $payloadHash = $this->payloadHash($asset, $route, $mappings);
+        $payloadEpoch = isset($asset['_date_mod_epoch']) ? (int) $asset['_date_mod_epoch'] : null;
+        if (!AssetSyncQueue::savePrepared($job, $route['id'], $payloadHash, $payloadEpoch)) {
+            $this->recordJobOutcome('skipped', false);
+            return;
+        }
+        $job['route_id'] = $route['id'];
+        $job['payload_hash'] = $payloadHash;
+        $job['payload_epoch'] = $payloadEpoch;
+        $job['payload_date'] = $payloadEpoch !== null && $payloadEpoch > 0 ? gmdate('Y-m-d H:i:s', $payloadEpoch) : null;
         $customKeys = array_keys($customTypes);
         $needsDateModTimezone = in_array('both', array_column($mappings, 'source_of_truth'), true);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
+        if ($checkUnchanged && !$this->payloadNeedsWork($link, $route, $payloadHash, $mappings)) {
+            $this->recordJobOutcome('skipped', AssetSyncQueue::finish($job, 'Asset payload is unchanged.'));
+            return;
+        }
         $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : (int) ($job['remote_items_id'] ?? 0);
         $remoteItem = null;
         $remoteDateModTimezone = '';
@@ -669,6 +707,10 @@ final class AssetSyncService
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, $error->getMessage(), $remoteItemsId);
             return;
         }
+        if (!AssetSyncQueue::owns($job)) {
+            $this->recordJobOutcome('succeeded', false);
+            return;
+        }
         $saved = AssetSyncLink::save([
             'itemtype'             => $itemtype,
             'items_id'             => $itemsId,
@@ -680,7 +722,7 @@ final class AssetSyncService
             'last_payload_date'    => $this->payloadDate($finalAsset),
             'last_error'           => '',
         ]);
-        $finished = AssetSyncQueue::finish($queueId, 'Asset synchronized.', $remoteItemsId);
+        $finished = AssetSyncQueue::finish($job, 'Asset synchronized.', $remoteItemsId);
         $this->recordJobOutcome('succeeded', $saved && $finished);
     }
 
@@ -1642,6 +1684,10 @@ final class AssetSyncService
      */
     private function blockJob(array $job, string $routeId, string $linkStatus, string $message, ?int $remoteItemsId = null): void
     {
+        if (!AssetSyncQueue::owns($job)) {
+            $this->recordJobOutcome('blocked', false);
+            return;
+        }
         $itemtype = (string) ($job['itemtype'] ?? '');
         $itemsId = (int) ($job['items_id'] ?? 0);
         $connectionId = (string) ($job['glpi_b_connection_id'] ?? '');
@@ -1657,7 +1703,7 @@ final class AssetSyncService
             (string) ($job['payload_hash'] ?? ''),
             (int) ($job['payload_epoch'] ?? 0) > 0 ? gmdate('Y-m-d H:i:s', (int) $job['payload_epoch']) : null
         );
-        $blocked = AssetSyncQueue::block((int) ($job['id'] ?? 0), $message, $remoteItemsId);
+        $blocked = AssetSyncQueue::block($job, $message, $remoteItemsId);
         $this->recordJobOutcome('blocked', $saved && $blocked);
     }
 
@@ -1670,7 +1716,7 @@ final class AssetSyncService
         $message = (string) ($remoteResult['message'] ?? 'GLPI B request failed.');
 
         if (!empty($remoteResult['transient'])) {
-            $retried = AssetSyncQueue::retry((int) ($job['id'] ?? 0), $attempts, $message);
+            $retried = AssetSyncQueue::retry($job, $message);
             $this->recordJobOutcome('retried', $retried);
             return;
         }

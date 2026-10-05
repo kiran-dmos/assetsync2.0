@@ -26,7 +26,15 @@ final class AssetSyncQueue
         }
 
         if ($db->tableExists(self::TABLE)) {
-            return true;
+            if (!method_exists($db, 'fieldExists')) {
+                return false;
+            }
+            try {
+                return $db->fieldExists(self::TABLE, 'needs_recheck')
+                    || (bool) $db->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `needs_recheck` TINYINT NOT NULL DEFAULT 0');
+            } catch (\Throwable) {
+                return false;
+            }
         }
 
         return (bool) $db->doQuery(self::createTableSql());
@@ -132,6 +140,44 @@ final class AssetSyncQueue
     }
 
     /** @return list<string> */
+    public static function connectionIdsForAsset(string $itemtype, int $itemsId): array
+    {
+        $db = self::db();
+        if ($db === null || !method_exists($db, 'request')) {
+            return [];
+        }
+        $ids = [];
+        foreach ($db->request([
+            'SELECT' => ['glpi_b_connection_id'],
+            'FROM' => self::TABLE,
+            'WHERE' => ['itemtype' => $itemtype, 'items_id' => $itemsId],
+        ]) as $row) {
+            $ids[] = (string) $row['glpi_b_connection_id'];
+        }
+        return $ids;
+    }
+
+    public static function notify(string $itemtype, int $itemsId, string $connectionId, bool $allowInsert = true): bool
+    {
+        $db = self::db();
+        if ($db === null || !method_exists($db, 'doQuery') || !method_exists($db, 'quote')
+            || $itemtype === '' || $itemsId <= 0 || $connectionId === '') {
+            return false;
+        }
+        $itemtypeSql = $db->quote($itemtype);
+        $connectionSql = $db->quote($connectionId);
+        // A save during a claim or retry must not move its lease/backoff clock.
+        $notification = "`needs_recheck` = 1, `date_mod` = CASE WHEN `status` IN ('running', 'retry') THEN `date_mod` ELSE NOW() END";
+        $sql = $allowInsert
+            ? 'INSERT INTO `' . self::TABLE . '` (`itemtype`, `items_id`, `glpi_b_connection_id`, `needs_recheck`, `date_creation`, `date_mod`)'
+                . " VALUES ({$itemtypeSql}, {$itemsId}, {$connectionSql}, 1, NOW(), NOW()) ON DUPLICATE KEY UPDATE {$notification}"
+            : 'UPDATE `' . self::TABLE . "` SET {$notification} WHERE `itemtype` = {$itemtypeSql} AND `items_id` = {$itemsId} AND `glpi_b_connection_id` = {$connectionSql}";
+
+        // Zero affected rows is a successful repeated notification, not new work.
+        return AssetSyncDbTime::write($db, static fn (): bool => (bool) $db->doQuery($sql));
+    }
+
+    /** @return list<string> */
     public static function dueConnectionIds(): array
     {
         $db = self::db();
@@ -192,11 +238,14 @@ final class AssetSyncQueue
                 continue;
             }
 
-            $attempts = (int) ($row['attempts'] ?? 0) + 1;
+            $attempts = in_array($row['status'], [self::STATUS_DONE, self::STATUS_BLOCKED], true)
+                ? 1 : (int) ($row['attempts'] ?? 0) + 1;
             $affectedRows = 0;
-            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, &$affectedRows): bool {
+            $startedRow = null;
+            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, &$affectedRows, &$startedRow): bool {
                 $written = $db->update(self::TABLE, [
                     'status'      => self::STATUS_RUNNING,
+                    'needs_recheck' => 0,
                     'attempts'    => $attempts,
                     'started_at'  => self::now(),
                     'finished_at' => null,
@@ -207,30 +256,36 @@ final class AssetSyncQueue
                     'attempts'     => (int) ($row['attempts'] ?? 0),
                     'route_id'     => (string) ($row['route_id'] ?? ''),
                     'payload_hash' => (string) ($row['payload_hash'] ?? ''),
+                    'needs_recheck' => (int) ($row['needs_recheck'] ?? 0),
                     new \Glpi\DBAL\QueryExpression(self::dueSql(time())),
                 ]);
                 if ($written) {
                     $affectedRows = $db->affectedRows();
                 }
-
+                if ($written && $affectedRows === 1) {
+                    foreach ($db->request([
+                        'SELECT' => ['started_at', new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch')],
+                        'FROM' => self::TABLE,
+                        'WHERE' => ['id' => (int) $row['id'], 'status' => self::STATUS_RUNNING, 'attempts' => $attempts],
+                        'LIMIT' => 1,
+                    ]) as $selected) {
+                        $startedRow = $selected;
+                        break;
+                    }
+                }
                 return $written;
             });
-            if (!$updated || $affectedRows !== 1) {
+            if (!$updated || $affectedRows !== 1 || (int) ($startedRow['started_epoch'] ?? 0) <= 0) {
                 continue;
             }
 
+            $row['previous_status'] = $row['status'];
+            $row['previous_needs_recheck'] = (int) ($row['needs_recheck'] ?? 0);
             $row['status'] = self::STATUS_RUNNING;
+            $row['needs_recheck'] = 0;
             $row['attempts'] = $attempts;
-            $startedRows = $db->request([
-                'SELECT' => ['started_at'],
-                'FROM' => self::TABLE,
-                'WHERE' => ['id' => (int) $row['id']],
-                'LIMIT' => 1,
-            ]);
-            foreach ($startedRows as $startedRow) {
-                $row['started_at'] = $startedRow['started_at'] ?? null;
-                break;
-            }
+            $row['started_at'] = $startedRow['started_at'];
+            $row['started_epoch'] = (int) $startedRow['started_epoch'];
             $claimed[] = $row;
         }
 
@@ -264,20 +319,20 @@ SELECT category, COUNT(*) AS count,
                     AND (age_epoch IS NULL OR age_epoch <= 0 OR age_epoch > {$now}) THEN 1 ELSE 0 END) AS unknown_age
 FROM (
     SELECT CASE
-               WHEN `status` = 'pending' THEN 'pending'
+               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1) THEN 'pending'
                WHEN `status` = 'retry' AND {$due} THEN 'retry_due'
                WHEN `status` = 'retry' THEN 'retry_waiting'
                WHEN `status` = 'running' AND {$due} THEN 'running_reclaimable'
                WHEN `status` = 'running' THEN 'running_active'
                ELSE 'blocked'
            END AS category,
-           CASE `status`
-               WHEN 'pending' THEN {$pending}
-               WHEN 'retry' THEN {$retry}
-               WHEN 'running' THEN {$running}
+           CASE
+               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1) THEN {$pending}
+               WHEN `status` = 'retry' THEN {$retry}
+               WHEN `status` = 'running' THEN {$running}
            END AS age_epoch
     FROM `glpi_plugin_assetsync20_syncqueue`
-    WHERE `status` IN ('pending', 'retry', 'running', 'blocked')
+    WHERE `status` IN ('pending', 'retry', 'running', 'blocked') OR (`status` = 'done' AND `needs_recheck` = 1)
 ) AS queue_metrics
 GROUP BY category
 SQL;
@@ -321,22 +376,76 @@ SQL;
         }
     }
 
-    public static function finish(int $id, string $message = '', ?int $remoteItemsId = null): bool
+    public static function finish(array $job, string $message = '', ?int $remoteItemsId = null): bool
     {
-        return self::updateStatus($id, self::STATUS_DONE, null, $message, $remoteItemsId);
+        return self::updateStatus($job, self::STATUS_DONE, null, $message, $remoteItemsId);
     }
 
-    public static function block(int $id, string $message, ?int $remoteItemsId = null): bool
+    public static function block(array $job, string $message, ?int $remoteItemsId = null): bool
     {
-        return self::updateStatus($id, self::STATUS_BLOCKED, null, $message, $remoteItemsId);
+        return self::updateStatus($job, self::STATUS_BLOCKED, null, $message, $remoteItemsId);
     }
 
-    public static function retry(int $id, int $attempts, string $message): bool
+    public static function retry(array $job, string $message): bool
     {
-        $backoffSeconds = self::backoffSeconds($attempts);
+        $backoffSeconds = self::backoffSeconds((int) ($job['attempts'] ?? 1));
         $availableAt = new \Glpi\DBAL\QueryExpression('DATE_ADD(NOW(), INTERVAL ' . $backoffSeconds . ' SECOND)');
 
-        return self::updateStatus($id, self::STATUS_RETRY, $availableAt, $message, null);
+        return self::updateStatus($job, self::STATUS_RETRY, $availableAt, $message, null);
+    }
+
+    public static function owns(array $job): bool
+    {
+        $db = self::db();
+        if ($db === null || !method_exists($db, 'request') || self::ownerWhere($job) === null) {
+            return false;
+        }
+        return AssetSyncDbTime::write($db, static function () use ($db, $job): bool {
+            foreach ($db->request(['SELECT' => ['id'], 'FROM' => self::TABLE, 'WHERE' => self::ownerWhere($job), 'LIMIT' => 1]) as $row) {
+                return true;
+            }
+            return false;
+        });
+    }
+
+    public static function savePrepared(array $job, string $routeId, string $payloadHash, ?int $payloadEpoch): bool
+    {
+        $db = self::db();
+        $where = self::ownerWhere($job);
+        if ($db === null || $where === null || !method_exists($db, 'update') || !method_exists($db, 'affectedRows') || !method_exists($db, 'request')) {
+            return false;
+        }
+        $date = $payloadEpoch !== null && $payloadEpoch > 0
+            ? new \Glpi\DBAL\QueryExpression('FROM_UNIXTIME(' . $payloadEpoch . ')') : null;
+        return AssetSyncDbTime::write($db, static function () use ($db, $where, $routeId, $payloadHash, $payloadEpoch, $date): bool {
+            if (!$db->update(self::TABLE, ['route_id' => $routeId, 'payload_hash' => $payloadHash, 'payload_date' => $date], $where)) {
+                return false;
+            }
+            if ($db->affectedRows() === 1) {
+                return true;
+            }
+            // MySQL reports zero for a matching no-op; confirm both owner and preparation.
+            $where['route_id'] = $routeId;
+            $where['payload_hash'] = $payloadHash;
+            $where[] = new \Glpi\DBAL\QueryExpression($payloadEpoch !== null && $payloadEpoch > 0
+                ? 'UNIX_TIMESTAMP(`payload_date`) = ' . $payloadEpoch : '`payload_date` IS NULL');
+            foreach ($db->request(['SELECT' => ['id'], 'FROM' => self::TABLE, 'WHERE' => $where, 'LIMIT' => 1]) as $row) {
+                return true;
+            }
+            return false;
+        });
+    }
+
+    private static function ownerWhere(array $job): ?array
+    {
+        $id = (int) ($job['id'] ?? 0);
+        $attempts = (int) ($job['attempts'] ?? 0);
+        $started = (int) ($job['started_epoch'] ?? 0);
+        if ($id <= 0 || $attempts <= 0 || $started <= 0) {
+            return null;
+        }
+        return ['id' => $id, 'status' => self::STATUS_RUNNING, 'attempts' => $attempts,
+            new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`) = ' . $started)];
     }
 
     /**
@@ -366,14 +475,15 @@ SQL;
         return null;
     }
 
-    private static function updateStatus(int $id, string $status, ?\Glpi\DBAL\QueryExpression $availableAt, string $message, ?int $remoteItemsId): bool
+    private static function updateStatus(array $job, string $status, ?\Glpi\DBAL\QueryExpression $availableAt, string $message, ?int $remoteItemsId): bool
     {
         $db = self::db();
         if ($db === null) {
-            return true;
+            return false;
         }
 
-        if (!method_exists($db, 'update')) {
+        $where = self::ownerWhere($job);
+        if ($where === null || !method_exists($db, 'update') || !method_exists($db, 'affectedRows')) {
             return false;
         }
 
@@ -389,7 +499,7 @@ SQL;
             $fields['remote_items_id'] = $remoteItemsId;
         }
 
-        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, ['id' => $id]));
+        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, $where) && $db->affectedRows() === 1);
     }
 
     /**
@@ -405,6 +515,9 @@ SQL;
         $status = (string) ($row['status'] ?? '');
         if ($status === self::STATUS_PENDING) {
             return true;
+        }
+        if (in_array($status, [self::STATUS_DONE, self::STATUS_BLOCKED], true)) {
+            return (int) ($row['needs_recheck'] ?? 0) === 1;
         }
 
         if ($status === self::STATUS_RETRY) {
@@ -446,6 +559,7 @@ SQL;
         return <<<SQL
 (
   `status` = 'pending'
+  OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1)
   OR (
     `status` = 'retry'
     AND (
@@ -492,6 +606,7 @@ CREATE TABLE IF NOT EXISTS `glpi_plugin_assetsync20_syncqueue` (
   `payload_hash` CHAR(64) NOT NULL DEFAULT '',
   `payload_date` TIMESTAMP NULL DEFAULT NULL,
   `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
+  `needs_recheck` TINYINT NOT NULL DEFAULT 0,
   `attempts` INT {$primaryKeySign} NOT NULL DEFAULT '0',
   `available_at` TIMESTAMP NULL DEFAULT NULL,
   `started_at` TIMESTAMP NULL DEFAULT NULL,

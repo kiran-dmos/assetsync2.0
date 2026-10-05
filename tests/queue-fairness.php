@@ -226,8 +226,8 @@ namespace {
     fairCheck(count(fairDueQueries()) === 2, 'Due IDs must refresh between the two queue phases.');
 
     $service = fairSetup(['a' => 1]);
-    $row = $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0];
-    AssetSyncQueue::retry($row['id'], 1, 'cooldown');
+    $row = AssetSyncQueue::claimDue(1)[0];
+    AssetSyncQueue::retry($row, 'cooldown');
     $before = $GLOBALS['DB']->tables[AssetSyncQueue::TABLE];
     fairCheck($service->run(1) === 0 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE] === $before, 'Full-queue scanning must leave an unchanged retry and its backoff intact.');
 
@@ -292,8 +292,8 @@ namespace {
         $sql->sqliteCreateFunction('LEAST', static fn (...$values) => min($values));
         $sql->sqliteCreateFunction('GREATEST', static fn (...$values) => max($values));
         $sql->sqliteCreateFunction('POW', static fn ($base, $power) => pow($base, $power), 2);
-        $sql->exec('CREATE TABLE jobs (id INTEGER, glpi_b_connection_id TEXT, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER)');
-        $insert = $sql->prepare('INSERT INTO jobs VALUES (?, ?, ?, 1, ?, ?, ?, NULL)');
+        $sql->exec('CREATE TABLE jobs (id INTEGER, glpi_b_connection_id TEXT, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0)');
+        $insert = $sql->prepare('INSERT INTO jobs (id,glpi_b_connection_id,status,attempts,finished_at,available_at,started_at,date_mod) VALUES (?, ?, ?, 1, ?, ?, ?, NULL)');
         foreach ($fixtures as $fixture) {
             $insert->execute($fixture);
         }
