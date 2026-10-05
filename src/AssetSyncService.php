@@ -36,8 +36,13 @@ final class AssetSyncService
     {
         $batchSize = max(1, $batchSize);
         $deadline = time() + max(1, $timeLimitSeconds);
-        $enqueued = $this->enqueueBackfill($batchSize, $deadline, $forceInboundRecheck);
         $processed = $this->processQueue($batchSize, $deadline);
+        $enqueued = 0;
+        if ($processed < $batchSize && time() < $deadline) {
+            $remaining = $batchSize - $processed;
+            $enqueued = $this->enqueueBackfill($remaining, $deadline, $forceInboundRecheck);
+            $processed += $this->processQueue($remaining, $deadline);
+        }
 
         return $enqueued + $processed;
     }

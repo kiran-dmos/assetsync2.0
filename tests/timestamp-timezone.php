@@ -16,9 +16,12 @@ final class TimestampTestDB
     public string $timezone = 'UTC';
     public bool $failUtcSwitch = false;
     public bool $failRestore = false;
+    public ?Closure $beforeClaimUpdate = null;
+    private int $affectedRows = 0;
 
     public function doQuery(string $sql)
     {
+        $this->affectedRows = 0;
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return [['session_timezone' => $this->timezone]];
         }
@@ -59,7 +62,17 @@ final class TimestampTestDB
     {
         $rows = $this->rows[$query['FROM']] ?? [];
         foreach ($query['WHERE'] ?? [] as $field => $value) {
+            if ($value instanceof \Glpi\DBAL\QueryExpression) {
+                $rows = array_values(array_filter($rows, fn (array $row): bool => $this->queueRowIsDue($row)));
+                continue;
+            }
             $rows = array_values(array_filter($rows, static fn (array $row): bool => in_array($row[$field] ?? null, (array) $value, true)));
+        }
+        if (isset($query['ORDER'])) {
+            usort($rows, static fn (array $left, array $right): int => (int) $left['id'] <=> (int) $right['id']);
+        }
+        if (isset($query['LIMIT'])) {
+            $rows = array_slice($rows, 0, (int) $query['LIMIT']);
         }
 
         return array_map(function (array $row) use ($query): array {
@@ -87,14 +100,44 @@ final class TimestampTestDB
 
     public function update(string $table, array $fields, array $where): bool
     {
+        if ($table === AssetSyncQueue::TABLE && $this->beforeClaimUpdate !== null && isset($where['attempts'])) {
+            $callback = $this->beforeClaimUpdate;
+            $this->beforeClaimUpdate = null;
+            $callback($this);
+        }
         $fields = $this->resolveExpressions($fields);
+        $this->affectedRows = 0;
         foreach ($this->rows[$table] as &$row) {
-            if ($row['id'] === $where['id']) {
+            $matches = true;
+            foreach ($where as $key => $expected) {
+                if ($expected instanceof \Glpi\DBAL\QueryExpression) {
+                    $matches = $matches && $this->queueRowIsDue($row);
+                } elseif (($row[$key] ?? null) !== $expected) {
+                    $matches = false;
+                }
+            }
+            if ($matches) {
                 $row = array_merge($row, $fields);
+                $this->affectedRows++;
             }
         }
 
         return true;
+    }
+
+    public function affectedRows(): int
+    {
+        return $this->affectedRows;
+    }
+
+    private function queueRowIsDue(array $row): bool
+    {
+        foreach (['finished_at', 'available_at', 'started_at', 'date_mod'] as $field) {
+            $value = $row[$field] ?? null;
+            $epochField = $field === 'date_mod' ? 'modified_epoch' : str_replace('_at', '_epoch', $field);
+            $row[$epochField] = $value === null ? null : (new DateTimeImmutable((string) $value, new DateTimeZone($this->timezone)))->getTimestamp();
+        }
+        return (new ReflectionMethod(AssetSyncQueue::class, 'rowIsDue'))->invoke(null, $row, time());
     }
 
     private function resolveExpressions(array $fields): array
@@ -267,6 +310,56 @@ try {
     AssetSyncQueue::retry((int) $webQueue['id'], 1, 'retry');
     if (AssetSyncQueue::claimDue(1) !== []) {
         throw new RuntimeException('Web PHP timezone must not skip retry backoff');
+    }
+    $delayedAt = gmdate('Y-m-d H:i:s', time());
+    for ($id = 100; $id < 150; $id++) {
+        $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][] = [
+            'id' => $id,
+            'status' => AssetSyncQueue::STATUS_RETRY,
+            'attempts' => 1,
+            'finished_at' => $delayedAt,
+        ];
+    }
+    $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][] = [
+        'id' => 150,
+        'status' => AssetSyncQueue::STATUS_PENDING,
+        'attempts' => 0,
+        'route_id' => 'test-route',
+        'payload_hash' => 'ready',
+    ];
+    $ready = AssetSyncQueue::claimDue(1);
+    if (count($ready) !== 1 || (int) $ready[0]['id'] !== 150) {
+        throw new RuntimeException('A ready job behind 50 delayed rows must be claimed');
+    }
+
+    foreach ([151, 152] as $id) {
+        $GLOBALS['DB']->rows[AssetSyncQueue::TABLE][] = [
+            'id' => $id,
+            'status' => AssetSyncQueue::STATUS_PENDING,
+            'attempts' => 0,
+            'route_id' => 'test-route',
+            'payload_hash' => 'race',
+        ];
+    }
+    $GLOBALS['DB']->beforeClaimUpdate = static function (TimestampTestDB $db): void {
+        foreach ($db->rows[AssetSyncQueue::TABLE] as &$row) {
+            if ((int) $row['id'] === 151) {
+                $row['status'] = AssetSyncQueue::STATUS_RUNNING;
+                $row['attempts'] = 1;
+                $row['started_at'] = gmdate('Y-m-d H:i:s');
+                break;
+            }
+        }
+        unset($row);
+    };
+    $afterRace = AssetSyncQueue::claimDue(1);
+    if (count($afterRace) !== 1 || (int) $afterRace[0]['id'] !== 152) {
+        throw new RuntimeException('A losing claimant must skip the row and claim another due job');
+    }
+    foreach ($GLOBALS['DB']->rows[AssetSyncQueue::TABLE] as $row) {
+        if ((int) $row['id'] === 151 && ((int) $row['attempts'] !== 1 || $row['status'] !== AssetSyncQueue::STATUS_RUNNING)) {
+            throw new RuntimeException('A losing claimant must not overwrite the winning claim');
+        }
     }
     try {
         AssetSyncDbTime::write($GLOBALS['DB'], static function (): bool {

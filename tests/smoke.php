@@ -149,6 +149,7 @@ final class FakeDB
 
     /** @var array<string,int> */
     private array $nextIds = [];
+    private int $affectedRows = 0;
     public string $timezone = '';
 
     public function guessTimezone(): string
@@ -234,13 +235,20 @@ final class FakeDB
     public function update(string $table, array $params, array $where): bool
     {
         $params = $this->resolveExpressions($params);
+        $this->affectedRows = 0;
         foreach ($this->tables[$table] ?? [] as $index => $row) {
             if ($this->rowMatches($row, $where)) {
                 $this->tables[$table][$index] = array_merge($row, $params);
+                $this->affectedRows++;
             }
         }
 
         return true;
+    }
+
+    public function affectedRows(): int
+    {
+        return $this->affectedRows;
     }
 
     /**
@@ -333,6 +341,21 @@ final class FakeDB
     private function rowMatches(array $row, array $where): bool
     {
         foreach ($where as $field => $expected) {
+            if ($expected instanceof \Glpi\DBAL\QueryExpression) {
+                if (!str_contains($expected->expression, 'UNIX_TIMESTAMP(`started_at`)')) {
+                    throw new RuntimeException('Unexpected queue condition: ' . $expected->expression);
+                }
+                foreach (['finished_at', 'available_at', 'started_at', 'date_mod'] as $timeField) {
+                    $value = $row[$timeField] ?? null;
+                    $epochField = $timeField === 'date_mod' ? 'modified_epoch' : str_replace('_at', '_epoch', $timeField);
+                    $row[$epochField] = $value === null ? null : (new DateTimeImmutable((string) $value, new DateTimeZone($this->guessTimezone())))->getTimestamp();
+                }
+                $isDue = new ReflectionMethod(\GlpiPlugin\Assetsync20\AssetSyncQueue::class, 'rowIsDue');
+                if (!$isDue->invoke(null, $row, time())) {
+                    return false;
+                }
+                continue;
+            }
             $actual = $this->rowValue($row, (string) $field);
 
             if (
@@ -3177,6 +3200,65 @@ if ($link['status'] !== 'synced'
 }
 Config::$values['plugin:assetsync20']['field_mappings'] = $swsdSavedConfig;
 $remoteClient->unavailableCustomKeys = [];
+
+$mainDb = $GLOBALS['DB'];
+$mainConfig = Config::$values;
+$GLOBALS['DB'] = new FakeDB();
+Config::$values = [];
+\GlpiPlugin\Assetsync20\AssetSyncQueue::install();
+\GlpiPlugin\Assetsync20\AssetSyncLink::install();
+\GlpiPlugin\Assetsync20\GlpiBConnection::save([
+    'id' => 'queue-test',
+    'name' => 'Queue test',
+    'base_url' => 'https://queue-test.example.com',
+    'app_token' => 'app',
+    'user_token' => 'user',
+    'active' => '1',
+]);
+\GlpiPlugin\Assetsync20\EntitySyncRoute::save([
+    'id' => 'queue-route',
+    'name' => 'Queue route',
+    'glpi_b_connection_id' => 'queue-test',
+    'glpi_a_source_entity_id' => '1',
+    'glpi_b_target_entity_id' => '100',
+    'asset_types' => ['Computer'],
+    'active' => '1',
+]);
+$GLOBALS['DB']->insert('glpi_entities', ['id' => 1, 'entities_id' => 0]);
+foreach ([701, 702, 703] as $id) {
+    $GLOBALS['DB']->insert('glpi_computers', [
+        'id' => $id,
+        'entities_id' => 1,
+        'is_deleted' => 0,
+        'name' => 'Queue ' . $id,
+        'serial' => 'QUEUE-' . $id,
+        'date_mod' => '2026-01-01 00:00:00',
+    ]);
+}
+foreach ([701, 702] as $id) {
+    \GlpiPlugin\Assetsync20\AssetSyncQueue::enqueue('Computer', $id, 'queue-test', 'queue-route', 'hash-' . $id, null);
+}
+$queueService = new \GlpiPlugin\Assetsync20\AssetSyncService(new FakeGlpiBClient());
+if ($queueService->run(1) !== 1
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 701])['status'] !== 'done'
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 702])['status'] !== 'pending'
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null) {
+    throw new RuntimeException('A full batch must process existing queue work before backfill');
+}
+if ($queueService->run(1) !== 1
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 702])['status'] !== 'done'
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null) {
+    throw new RuntimeException('The queue-first batch cap must leave unscanned work for a later run');
+}
+Config::setConfigurationValues('plugin:assetsync20', [
+    'asset_sync_scan_cursors' => json_encode(['queue-route:Computer' => '702']),
+]);
+if ($queueService->run(1) !== 2
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703])['status'] !== 'done') {
+    throw new RuntimeException('Backfill must enqueue and process a new job in the same run');
+}
+$GLOBALS['DB'] = $mainDb;
+Config::$values = $mainConfig;
 
 Config::$values = [
     'plugin:assetsync20' => [

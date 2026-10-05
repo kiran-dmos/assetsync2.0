@@ -122,7 +122,7 @@ final class AssetSyncQueue
     public static function claimDue(int $limit): array
     {
         $db = self::db();
-        if ($db === null || !method_exists($db, 'request') || !method_exists($db, 'update')) {
+        if ($db === null || !method_exists($db, 'request') || !method_exists($db, 'update') || !method_exists($db, 'affectedRows')) {
             return [];
         }
 
@@ -138,9 +138,7 @@ final class AssetSyncQueue
                 new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch'),
             ],
             'FROM'  => self::TABLE,
-            'WHERE' => [
-                'status' => [self::STATUS_PENDING, self::STATUS_RETRY, self::STATUS_RUNNING],
-            ],
+            'WHERE' => [new \Glpi\DBAL\QueryExpression(self::dueSql($now))],
             'ORDER' => 'id ASC',
             'LIMIT' => max(50, $limit * 5),
         ]);
@@ -153,14 +151,29 @@ final class AssetSyncQueue
             }
 
             $attempts = (int) ($row['attempts'] ?? 0) + 1;
-            $updated = AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, [
-                'status'      => self::STATUS_RUNNING,
-                'attempts'    => $attempts,
-                'started_at'  => self::now(),
-                'finished_at' => null,
-                'date_mod'    => self::now(),
-            ], ['id' => (int) $row['id']]));
-            if (!$updated) {
+            $affectedRows = 0;
+            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, &$affectedRows): bool {
+                $written = $db->update(self::TABLE, [
+                    'status'      => self::STATUS_RUNNING,
+                    'attempts'    => $attempts,
+                    'started_at'  => self::now(),
+                    'finished_at' => null,
+                    'date_mod'    => self::now(),
+                ], [
+                    'id'           => (int) $row['id'],
+                    'status'       => (string) $row['status'],
+                    'attempts'     => (int) ($row['attempts'] ?? 0),
+                    'route_id'     => (string) ($row['route_id'] ?? ''),
+                    'payload_hash' => (string) ($row['payload_hash'] ?? ''),
+                    new \Glpi\DBAL\QueryExpression(self::dueSql(time())),
+                ]);
+                if ($written) {
+                    $affectedRows = $db->affectedRows();
+                }
+
+                return $written;
+            });
+            if (!$updated || $affectedRows !== 1) {
                 continue;
             }
 
@@ -292,6 +305,37 @@ final class AssetSyncQueue
         }
 
         return false;
+    }
+
+    private static function dueSql(int $now): string
+    {
+        $backoff = 'LEAST(3600, 60 * POW(2, LEAST(5, GREATEST(0, `attempts` - 1))))';
+        $finished = 'COALESCE(UNIX_TIMESTAMP(`finished_at`), 0)';
+        $available = 'COALESCE(UNIX_TIMESTAMP(`available_at`), 0)';
+        $started = 'COALESCE(UNIX_TIMESTAMP(`started_at`), 0)';
+        $modified = 'COALESCE(UNIX_TIMESTAMP(`date_mod`), 0)';
+        $legacyFuture = $now + 60;
+        $staleBefore = $now - 1800;
+
+        return <<<SQL
+(
+  `status` = 'pending'
+  OR (
+    `status` = 'retry'
+    AND (
+      ({$finished} > 0 AND ({$finished} > {$legacyFuture} OR {$finished} + {$backoff} <= {$now}))
+      OR ({$finished} <= 0 AND ({$available} <= {$now} OR {$available} > {$now} + {$backoff} + 60))
+    )
+  )
+  OR (
+    `status` = 'running'
+    AND (
+      ({$started} <= 0 AND {$modified} > 0 AND {$modified} <= {$staleBefore})
+      OR ({$started} > 0 AND ({$started} <= {$staleBefore} OR {$started} > {$legacyFuture}))
+    )
+  )
+)
+SQL;
     }
 
     private static function backoffSeconds(int $attempts): int
