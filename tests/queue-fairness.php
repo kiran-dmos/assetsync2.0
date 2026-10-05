@@ -3,6 +3,10 @@
 declare(strict_types=1);
 
 namespace GlpiPlugin\Assetsync20 {
+    function hrtime(bool $asNumber = false): int
+    {
+        return \FairQueueClock::$nanoseconds;
+    }
     function time(): int
     {
         return \FairQueueClock::$wall;
@@ -22,6 +26,7 @@ namespace {
     final class FairQueueClock
     {
         public static int $wall;
+        public static int $nanoseconds = 0;
     }
 
     final class Toolbox
@@ -55,6 +60,7 @@ namespace {
     function fairSetup(array $counts = ['a' => 1, 'b' => 1, 'c' => 1], ?callable $scanClock = null): AssetSyncService
     {
         FairQueueClock::$wall = time();
+        FairQueueClock::$nanoseconds = 0;
         Toolbox::$entries = [];
         Toolbox::$fail = false;
         Config::$values = [];
@@ -359,16 +365,17 @@ namespace {
     fairEnded();
 
     $service = fairSetup(['a' => 1]);
-    fairCheck($service->run(1, 1) === 1 && fairSummary()['jobs_attempted'] === 1, 'A one-second limit must not reserve all available time away from the first queue job.');
+    fairCheck($service->run(1, 1) === 0 && fairSummary()['jobs_attempted'] === 0, 'A one-second limit must not claim untouched jobs when only cleanup reserve remains.');
     fairCheck(!$GLOBALS['DB']->runLockHeld, 'Short runs must release their advisory lock.');
 
     $service = fairSetup(['a' => 1]);
     $GLOBALS['DB']->afterRequest = static function (array $query): void {
         if (($query['FROM'] ?? '') === 'glpi_computers') {
-            FairQueueClock::$wall += 30;
+            FairQueueClock::$nanoseconds += 30_000_000_000;
         }
     };
-    fairCheck($service->run(2, 25) === 1 && fairCursor('a') === null, 'An in-flight first job may finish after the soft deadline, but must not start scanning or another job.');
+    fairCheck($service->run(2, 25) === 1 && fairCursor('a') === null, 'An in-flight first job must resolve after the soft deadline, but must not start scanning or another job.');
+    fairCheck($GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'retry', 'An owned job whose budget expired before HTTP must retry instead of leaving a running lease.');
     fairCheck(fairSummary()['stop_reason'] === 'deadline' && !$GLOBALS['DB']->runLockHeld, 'Deadline exits must still release the run lock.');
     fairEnded();
 

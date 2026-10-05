@@ -31,6 +31,7 @@ namespace GlpiPlugin\Assetsync20 {
     }
     function curl_getinfo(object $curl, int $option): int { return $curl->status; }
     function curl_error(object $curl): string { return 'private-transport-token'; }
+    function curl_errno(object $curl): int { return 0; }
     function curl_close(object $curl): void { \CatalogCurl::$closed++; }
 }
 
@@ -338,7 +339,7 @@ namespace {
             $steps[] = $kill;
             catalogStart($steps);
             $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key], [$key => 'new']]);
-            catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status, 'Every noncollection permission reader must preserve transport/429/503/403 classification: ' . $endpoint);
+            catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status && $result['cause'] === ($status === 0 ? 'transport' : 'http') && $result['executed'], 'Every noncollection permission reader must preserve executed transport/429/503/403 classification: ' . $endpoint);
             catalogCheck(!in_array('PUT', CatalogCurl::$methods, true) && !in_array('POST', CatalogCurl::$methods, true), 'Failed permission reads must prevent all mutations.');
             catalogFinish(count($steps), 1);
         }
@@ -346,7 +347,7 @@ namespace {
     foreach ([429, 503, 403, 0] as $status) {
         catalogStart([...$prefix, $dropdownFirst, catalogStep('PluginFieldsDepartmentfieldDropdown', $status === 0 ? false : [], $status), $kill]);
         $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1'], [$dropdownKey => 'dropdown']]);
-        catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status && !in_array('PUT', CatalogCurl::$methods, true), 'Later dropdown failures must retain status/classification and prevent writes even after a first-page match.');
+        catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status && $result['cause'] === ($status === 0 ? 'transport' : 'http') && $result['executed'] && !in_array('PUT', CatalogCurl::$methods, true), 'Later dropdown failures must retain status/cause/execution and prevent writes even after a first-page match.');
         catalogFinish(12, 1);
     }
 

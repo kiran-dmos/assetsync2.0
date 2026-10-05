@@ -203,8 +203,11 @@ final class AssetSyncQueue
     /**
      * @return list<array<string,mixed>>
      */
-    public static function claimDue(int $limit, ?string $connectionId = null): array
+    public static function claimDue(int $limit, ?string $connectionId = null, ?int $workCutoffNs = null): array
     {
+        if ($workCutoffNs !== null && hrtime(true) + 1_000_000 > $workCutoffNs) {
+            return [];
+        }
         $db = self::db();
         if ($db === null || !method_exists($db, 'request') || !method_exists($db, 'update') || !method_exists($db, 'affectedRows')) {
             return [];
@@ -234,6 +237,9 @@ final class AssetSyncQueue
         $claimed = [];
 
         foreach ($rows as $row) {
+            if ($workCutoffNs !== null && hrtime(true) + 1_000_000 > $workCutoffNs) {
+                break;
+            }
             if (!is_array($row) || count($claimed) >= $limit || !self::rowIsDue($row, $now)) {
                 continue;
             }
@@ -242,7 +248,10 @@ final class AssetSyncQueue
                 ? 1 : (int) ($row['attempts'] ?? 0) + 1;
             $affectedRows = 0;
             $startedRow = null;
-            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, &$affectedRows, &$startedRow): bool {
+            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, $workCutoffNs, &$affectedRows, &$startedRow): bool {
+                if ($workCutoffNs !== null && hrtime(true) + 1_000_000 > $workCutoffNs) {
+                    return false;
+                }
                 $written = $db->update(self::TABLE, [
                     'status'      => self::STATUS_RUNNING,
                     'needs_recheck' => 0,

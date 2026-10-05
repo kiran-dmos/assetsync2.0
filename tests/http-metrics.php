@@ -19,12 +19,18 @@ namespace GlpiPlugin\Assetsync20 {
     function curl_setopt_array(object $curl, array $options): bool
     {
         $curl->options = $options;
+        \HttpMetricsCurl::$nanoseconds += \HttpMetricsCurl::$setupNs;
+        \HttpMetricsCurl::$setupNs = 0;
         return true;
     }
 
     function curl_setopt(object $curl, int $option, $value): bool
     {
         $curl->options[$option] = $value;
+        if ($option === CURLOPT_CONNECTTIMEOUT_MS) {
+            \HttpMetricsCurl::$nanoseconds += \HttpMetricsCurl::$finalSetupNs;
+            \HttpMetricsCurl::$finalSetupNs = 0;
+        }
         return true;
     }
 
@@ -32,11 +38,13 @@ namespace GlpiPlugin\Assetsync20 {
     {
         $step = array_shift(\HttpMetricsCurl::$steps);
         \HttpMetricsCurl::$executions++;
+        \HttpMetricsCurl::$trace[] = ['path' => basename((string) parse_url($curl->url, PHP_URL_PATH)), 'options' => $curl->options];
         if ($step === null || !str_ends_with((string) parse_url($curl->url, PHP_URL_PATH), '/' . $step['path'])) {
             throw new \LogicException('Unexpected HTTP execution in scripted transport.');
         }
         \HttpMetricsCurl::$nanoseconds += $step['ms'] * 1_000_000;
         $curl->status = $step['status'];
+        $curl->errno = (int) ($step['errno'] ?? 0);
         foreach ($step['headers'] ?? [] as $header) {
             ($curl->options[CURLOPT_HEADERFUNCTION])($curl, $header . "\r\n");
         }
@@ -54,6 +62,11 @@ namespace GlpiPlugin\Assetsync20 {
     function curl_error(object $curl): string
     {
         return 'private-curl-error-with-token';
+    }
+
+    function curl_errno(object $curl): int
+    {
+        return $curl->errno ?? 0;
     }
 
     function curl_close(object $curl): void
@@ -80,6 +93,9 @@ namespace {
         public static int $executions = 0;
         public static int $closed = 0;
         public static bool $failInit = false;
+        public static array $trace = [];
+        public static int $setupNs = 0;
+        public static int $finalSetupNs = 0;
     }
 
     function httpMetricsCheck(bool $condition, string $message): void
@@ -111,13 +127,15 @@ namespace {
         HttpMetricsCurl::$executions = 0;
         HttpMetricsCurl::$closed = 0;
         HttpMetricsCurl::$failInit = false;
+        HttpMetricsCurl::$trace = [];
+        HttpMetricsCurl::$setupNs = HttpMetricsCurl::$finalSetupNs = 0;
         GlpiBConnection::beginHttpMetrics();
     }
 
-    function httpFinish(string $id, int $requests, int $errors, float $milliseconds): array
+    function httpFinish(string $id, int $requests, int $errors, float $milliseconds, ?int $handles = null): array
     {
         httpMetricsCheck(HttpMetricsCurl::$steps === [], 'Every expected HTTP execution must have occurred.');
-        httpMetricsCheck(HttpMetricsCurl::$executions === $requests && HttpMetricsCurl::$closed === $requests, 'Request counts must match actual curl_exec calls and handles must close.');
+        httpMetricsCheck(HttpMetricsCurl::$executions === $requests && HttpMetricsCurl::$closed === ($handles ?? $requests), 'Request counts must match actual curl_exec calls and all initialized handles must close.');
         $metrics = GlpiBConnection::finishHttpMetrics();
         $expected = $requests === 0 ? [] : [$id => ['requests' => $requests, 'errors' => $errors, 'latency_ms' => $milliseconds]];
         httpMetricsCheck($metrics === $expected, 'Exact transport counts, errors and latency must match the script.');
@@ -127,6 +145,10 @@ namespace {
             httpMetricsCheck(!str_contains($encoded, $secret), 'HTTP metrics must not contain URL, tokens, headers, errors or payload.');
         }
         return $metrics;
+    }
+
+    if (!empty($httpMetricsBootstrapOnly)) {
+        return;
     }
 
     $init = httpStep('initSession', ['session_token' => 'private-session-token']);
@@ -198,7 +220,7 @@ namespace {
 
     httpStart([$init, $kill]);
     httpMetricsCheck(!httpCall('a', 'createItem', ['Computer', ['name' => "\xB1"]])['success'], 'Payload encoding failure must preserve the operation failure.');
-    httpFinish('a', 2, 0, 10.0);
+    httpFinish('a', 2, 0, 10.0, 3);
 
     httpStart([$init, $timezone, httpStep('Computer/12', '{malformed'), $kill]);
     httpMetricsCheck(httpCall('a', 'getItem', ['Computer', 12])['success'], 'Malformed 2xx decoding must retain the existing success semantics.');
@@ -219,7 +241,7 @@ namespace {
     httpFinish('a', 1, 1, 7.0);
 
     httpStart([$init, $timezone, httpStep('Computer/12', ['id' => 12]), httpStep('killSession', [], 200, 9, true)]);
-    httpMetricsCheck(!httpCall('a', 'getItem', ['Computer', 12])['success'], 'Thrown cleanup failures must retain the existing failure result.');
+    httpMetricsCheck(httpCall('a', 'getItem', ['Computer', 12])['success'], 'Thrown cleanup failures must preserve the successful primary result.');
     httpFinish('a', 4, 1, 24.0);
 
     // Restore an enclosing connection context even when callRemote catches an exception.

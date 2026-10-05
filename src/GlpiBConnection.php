@@ -6,6 +6,7 @@ namespace GlpiPlugin\Assetsync20;
 
 final class GlpiBConnection
 {
+    public const HTTP_CLEANUP_RESERVE_NS = 1_000_000_000;
     private const CONTEXT = 'plugin:assetsync20';
     private const CONNECTIONS_KEY = 'glpib_connections';
     private const CUSTOM_HISTORY_RANGE = '0-20';
@@ -13,6 +14,14 @@ final class GlpiBConnection
     private static ?array $httpMetrics = null;
     private static ?string $httpMetricsConnection = null;
     private static ?array $runCache = null;
+    private static ?int $httpDeadlineNs = null;
+
+    public static function setHttpDeadline(?int $deadlineNs): ?int
+    {
+        $previous = self::$httpDeadlineNs;
+        self::$httpDeadlineNs = $deadlineNs;
+        return $previous;
+    }
 
     public static function beginRunCache(): void
     {
@@ -222,48 +231,16 @@ final class GlpiBConnection
      */
     public static function test(array $connection): array
     {
-        if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
-            return [
-                'success' => false,
-                'message' => 'Base URL, app token, and user token are required.',
-            ];
-        }
-
-        $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Authorization: user_token ' . $connection['user_token'],
-        ]);
-
-        if (!$session['success']) {
-            return $session;
-        }
-
-        $sessionToken = (string) ($session['body']['session_token'] ?? '');
-        if ($sessionToken === '') {
-            return [
-                'success' => false,
-                'message' => 'GLPI B did not return a session token.',
-            ];
-        }
-
-        $fullSession = self::request('GET', self::apiUrl($connection['base_url'], 'getFullSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Session-Token: ' . $sessionToken,
-        ]);
-
-        self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Session-Token: ' . $sessionToken,
-        ]);
-
-        if (!$fullSession['success']) {
-            return $fullSession;
-        }
-
-        return [
-            'success' => true,
-            'message' => 'Connection to GLPI B succeeded.',
-        ];
+        return self::withSession($connection, static function (string $sessionToken) use ($connection): array {
+            $fullSession = self::request('GET', self::apiUrl($connection['base_url'], 'getFullSession'), [
+                'App-Token: ' . $connection['app_token'],
+                'Session-Token: ' . $sessionToken,
+            ]);
+            if (!$fullSession['success']) {
+                return $fullSession;
+            }
+            return ['success' => true, 'message' => 'Connection to GLPI B succeeded.'];
+        });
     }
 
     /**
@@ -272,92 +249,27 @@ final class GlpiBConnection
      */
     public static function fetchNativeFields(array $connection, string $itemtype): array
     {
-        if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
+        $result = self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype): array {
+            $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
+            $fieldsResponse = self::request('GET', self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)), $headers);
+            $rawFieldsResponse = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+            if (!$fieldsResponse['success']) {
+                return $fieldsResponse;
+            }
+            if (!$rawFieldsResponse['success']) {
+                return $rawFieldsResponse;
+            }
+            $fields = self::fieldsFromSearchOptions(
+                self::searchOptionsWithRawMetadata($fieldsResponse['body'], $rawFieldsResponse['body']),
+                $itemtype
+            );
             return [
-                'success' => false,
-                'message' => 'Base URL, app token, and user token are required.',
-                'fields'  => [],
+                'success' => $fields !== [],
+                'message' => $fields !== [] ? 'GLPI B fields loaded.' : 'GLPI B did not return any native fields for this asset type.',
+                'fields' => $fields,
             ];
-        }
-
-        $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Authorization: user_token ' . $connection['user_token'],
-        ]);
-
-        if (!$session['success']) {
-            return [
-                'success' => false,
-                'message' => $session['message'],
-                'fields'  => [],
-            ];
-        }
-
-        $sessionToken = (string) ($session['body']['session_token'] ?? '');
-        if ($sessionToken === '') {
-            return [
-                'success' => false,
-                'message' => 'GLPI B did not return a session token.',
-                'fields'  => [],
-            ];
-        }
-
-        $fieldsResponse = self::request(
-            'GET',
-            self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)),
-            [
-                'App-Token: ' . $connection['app_token'],
-                'Session-Token: ' . $sessionToken,
-            ]
-        );
-
-        $rawFieldsResponse = self::request(
-            'GET',
-            self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]),
-            [
-                'App-Token: ' . $connection['app_token'],
-                'Session-Token: ' . $sessionToken,
-            ]
-        );
-
-        self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Session-Token: ' . $sessionToken,
-        ]);
-
-        if (!$fieldsResponse['success']) {
-            return [
-                'success' => false,
-                'message' => $fieldsResponse['message'],
-                'fields'  => [],
-            ];
-        }
-
-        if (!$rawFieldsResponse['success']) {
-            return [
-                'success' => false,
-                'message' => $rawFieldsResponse['message'],
-                'fields'  => [],
-            ];
-        }
-
-        $fields = self::fieldsFromSearchOptions(
-            self::searchOptionsWithRawMetadata($fieldsResponse['body'], $rawFieldsResponse['body']),
-            $itemtype
-        );
-        if ($fields === []) {
-            return [
-                'success' => false,
-                'message' => 'GLPI B did not return any native fields for this asset type.',
-                'fields'  => [],
-            ];
-        }
-
-        return [
-            'success' => true,
-            'message' => 'GLPI B fields loaded.',
-            'fields'  => $fields,
-        ];
+        });
+        return $result + ['fields' => []];
     }
 
     /**
@@ -388,7 +300,7 @@ final class GlpiBConnection
             );
 
             if (!$optionsResponse['success']) {
-                return self::searchFailure($optionsResponse['message'], $optionsResponse['transient']);
+                return self::searchFailure($optionsResponse['message'], $optionsResponse['transient'], $optionsResponse);
             }
 
             $serialOptionId = self::searchOptionIdForNativeField($optionsResponse['body'], 'serial');
@@ -422,7 +334,7 @@ final class GlpiBConnection
             );
 
             if (!$searchResponse['success']) {
-                return self::searchFailure($searchResponse['message'], $searchResponse['transient']);
+                return self::searchFailure($searchResponse['message'], $searchResponse['transient'], $searchResponse);
             }
 
             $totalCount = self::searchTotalCount($searchResponse['body']);
@@ -475,6 +387,9 @@ final class GlpiBConnection
                     'item'      => [],
                     'missing'   => $response['status_code'] === 404,
                     'transient' => $response['transient'],
+                    'status_code' => $response['status_code'],
+                    'cause' => $response['cause'],
+                    'executed' => $response['executed'],
                 ];
             }
 
@@ -513,6 +428,9 @@ final class GlpiBConnection
                     'message'   => $response['message'],
                     'id'        => 0,
                     'transient' => $response['transient'],
+                    'status_code' => $response['status_code'],
+                    'cause' => $response['cause'],
+                    'executed' => $response['executed'],
                 ];
             }
 
@@ -564,6 +482,9 @@ final class GlpiBConnection
                     'success'   => false,
                     'message'   => $response['message'],
                     'transient' => $response['transient'],
+                    'status_code' => $response['status_code'],
+                    'cause' => $response['cause'],
+                    'executed' => $response['executed'],
                 ];
             }
 
@@ -822,6 +743,7 @@ final class GlpiBConnection
                 throw new RemoteRequestFailure([
                     'success' => false, 'message' => 'GLPI B catalog changed during pagination; retry with a fresh catalog.',
                     'status_code' => $response['status_code'], 'transient' => true, 'cause' => 'catalog_changed',
+                    'executed' => $response['executed'],
                 ]);
             }
             if ($pageTotal > 10000) {
@@ -936,6 +858,9 @@ final class GlpiBConnection
                     'message' => $response['message'],
                     'dates' => [],
                     'transient' => $response['transient'],
+                    'status_code' => $response['status_code'],
+                    'cause' => $response['cause'],
+                    'executed' => $response['executed'],
                     self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
                 ];
             }
@@ -1421,11 +1346,7 @@ final class GlpiBConnection
         ]);
 
         if (!$session['success']) {
-            return [
-                'success'   => false,
-                'message'   => $session['message'],
-                'transient' => $session['transient'],
-            ];
+            return $session;
         }
 
         $sessionToken = (string) ($session['body']['session_token'] ?? '');
@@ -1440,16 +1361,41 @@ final class GlpiBConnection
         try {
             if ($needsDateModTimezone) {
                 $dateModTimezone = self::remoteDateModTimezone($connection, $sessionToken);
-                return $callback($sessionToken, $dateModTimezone);
+                $result = $callback($sessionToken, $dateModTimezone);
+            } else {
+                $result = $callback($sessionToken);
             }
-
-            return $callback($sessionToken);
+        } catch (\Throwable $failure) {
+            $primaryFailure = $failure;
         } finally {
-            self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
-                'App-Token: ' . $connection['app_token'],
-                'Session-Token: ' . $sessionToken,
-            ]);
+            try {
+                $cleanup = self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
+                    'App-Token: ' . $connection['app_token'],
+                    'Session-Token: ' . $sessionToken,
+                ], null, true);
+            } catch (RemoteRequestFailure $failure) {
+                $cleanup = $failure->result;
+            } catch (\Throwable) {
+                // Best-effort cleanup must not replay a successful mutation or hide its failure.
+            }
         }
+        $cleanupFailure = isset($cleanup) && !$cleanup['success']
+            ? array_intersect_key($cleanup, array_flip(['status_code', 'cause', 'executed'])) : [];
+        if (isset($primaryFailure)) {
+            if ($cleanupFailure !== []) {
+                $result = $primaryFailure instanceof RemoteRequestFailure ? $primaryFailure->result : [
+                    'success' => false, 'message' => 'GLPI B request failed: ' . $primaryFailure->getMessage(),
+                    'transient' => !($primaryFailure instanceof \RuntimeException),
+                    'status_code' => 0, 'cause' => '', 'executed' => false,
+                ];
+                throw new RemoteRequestFailure($result + ['cleanup_failure' => $cleanupFailure]);
+            }
+            throw $primaryFailure;
+        }
+        if ($cleanupFailure !== []) {
+            $result['cleanup_failure'] = $cleanupFailure;
+        }
+        return $result;
     }
 
     /**
@@ -1511,7 +1457,7 @@ final class GlpiBConnection
     /**
      * @return array{success:bool,message:string,items:list<array{id:int>>,total_count:int,transient:bool}
      */
-    private static function searchFailure(string $message, bool $transient): array
+    private static function searchFailure(string $message, bool $transient, array $request = []): array
     {
         return [
             'success'     => false,
@@ -1519,6 +1465,9 @@ final class GlpiBConnection
             'items'       => [],
             'total_count' => 0,
             'transient'   => $transient,
+            'status_code' => (int) ($request['status_code'] ?? 0),
+            'cause' => (string) ($request['cause'] ?? ''),
+            'executed' => (bool) ($request['executed'] ?? false),
         ];
     }
 
@@ -1637,8 +1586,15 @@ final class GlpiBConnection
      * @param array<string,mixed>|null $payload
      * @return array{success:bool,message:string,body:array,status_code:int,transient:bool,headers?:array,json_valid?:bool,json_list?:bool}
      */
-    private static function request(string $method, string $url, array $headers, ?array $payload = null): array
+    private static function request(string $method, string $url, array $headers, ?array $payload = null, bool $cleanup = false): array
     {
+        // All operations in the phase share this cutoff; sessions never replenish it.
+        $cutoffNs = self::$httpDeadlineNs === null ? null
+            : self::$httpDeadlineNs - ($cleanup ? 0 : self::HTTP_CLEANUP_RESERVE_NS);
+        if ($cutoffNs !== null && $cutoffNs - hrtime(true) < 1_000_000) {
+            return ['success' => false, 'message' => 'GLPI B request budget exhausted.', 'body' => [],
+                'status_code' => 0, 'transient' => true, 'cause' => 'budget_deadline', 'executed' => false];
+        }
         if (!function_exists('curl_init')) {
             return [
                 'success'     => false,
@@ -1646,6 +1602,8 @@ final class GlpiBConnection
                 'body'        => [],
                 'status_code' => 0,
                 'transient'   => false,
+                'cause'       => '',
+                'executed'    => false,
             ];
         }
 
@@ -1658,53 +1616,74 @@ final class GlpiBConnection
                 'body'        => [],
                 'status_code' => 0,
                 'transient'   => true,
+                'cause'       => '',
+                'executed'    => false,
             ];
         }
 
-        $requestHeaders = array_merge($headers, ['Accept: application/json']);
-        if ($payload !== null) {
-            $requestHeaders[] = 'Content-Type: application/json';
-        }
-
-        $responseHeaders = [];
-        curl_setopt_array($curl, [
-            CURLOPT_CUSTOMREQUEST  => $method,
-            CURLOPT_HTTPHEADER     => $requestHeaders,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT        => 15,
-            CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders): int {
-                $length = strlen($line);
-                $header = trim($line);
-                if (preg_match('/\AHTTP\/\S+\s+\d{3}\b/i', $header)) {
-                    $responseHeaders = []; // Only the final response block supplies pagination proof.
-                } elseif (str_contains($header, ':')) {
-                    [$name, $value] = explode(':', $header, 2);
-                    if (strtolower(trim($name)) === 'content-range') {
-                        $responseHeaders['content-range'][] = trim($value);
-                    }
-                }
-                return $length;
-            },
-        ]);
-
-        if ($payload !== null) {
-            curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($payload, JSON_THROW_ON_ERROR));
-        }
-
-        $started = hrtime(true);
+        $executed = false;
         $rawBody = false;
         $statusCode = 0;
+        $latencyMs = 0.0;
+        $timeoutMs = 15000;
         try {
+            $requestHeaders = array_merge($headers, ['Accept: application/json']);
+            if ($payload !== null) {
+                $requestHeaders[] = 'Content-Type: application/json';
+            }
+
+            $responseHeaders = [];
+            curl_setopt_array($curl, [
+                CURLOPT_CUSTOMREQUEST  => $method,
+                CURLOPT_HTTPHEADER     => $requestHeaders,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders): int {
+                    $length = strlen($line);
+                    $header = trim($line);
+                    if (preg_match('/\AHTTP\/\S+\s+\d{3}\b/i', $header)) {
+                        $responseHeaders = []; // Only the final response block supplies pagination proof.
+                    } elseif (str_contains($header, ':')) {
+                        [$name, $value] = explode(':', $header, 2);
+                        if (strtolower(trim($name)) === 'content-range') {
+                            $responseHeaders['content-range'][] = trim($value);
+                        }
+                    }
+                    return $length;
+                },
+            ]);
+
+            if ($payload !== null) {
+                curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($payload, JSON_THROW_ON_ERROR));
+            }
+
+            $remainingMs = $cutoffNs === null ? 15000 : intdiv($cutoffNs - hrtime(true), 1_000_000);
+            if ($remainingMs < 1) {
+                return ['success' => false, 'message' => 'GLPI B request budget exhausted.', 'body' => [],
+                    'status_code' => 0, 'transient' => true, 'cause' => 'budget_deadline', 'executed' => false];
+            }
+            $timeoutMs = min($cleanup && $cutoffNs !== null ? 1000 : 15000, $remainingMs);
+            curl_setopt($curl, CURLOPT_TIMEOUT_MS, $timeoutMs);
+            curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, $timeoutMs);
+            $started = hrtime(true);
+            if ($cutoffNs !== null && $cutoffNs - $started < 1_000_000) {
+                return ['success' => false, 'message' => 'GLPI B request budget exhausted.', 'body' => [],
+                    'status_code' => 0, 'transient' => true, 'cause' => 'budget_deadline', 'executed' => false];
+            }
+            $executed = true;
             try {
                 $rawBody = curl_exec($curl);
+            } catch (\Throwable $failure) {
+                throw new RemoteRequestFailure(['success' => false, 'message' => 'HTTP request failed: ' . $failure->getMessage(),
+                    'body' => [], 'status_code' => 0, 'transient' => true, 'cause' => 'transport', 'executed' => true]);
             } finally {
                 $latencyMs = (hrtime(true) - $started) / 1_000_000;
             }
             $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
             $error = curl_error($curl);
+            $errorNumber = curl_errno($curl);
         } finally {
             $connectionId = self::$httpMetricsConnection;
-            if (self::$httpMetrics !== null && $connectionId !== null && $connectionId !== '') {
+            if ($executed && self::$httpMetrics !== null && $connectionId !== null && $connectionId !== '') {
                 self::$httpMetrics[$connectionId] ??= ['requests' => 0, 'errors' => 0, 'latency_ms' => 0.0];
                 self::$httpMetrics[$connectionId]['requests']++;
                 // Each executed request contributes at most one transport/non-2xx error.
@@ -1723,6 +1702,9 @@ final class GlpiBConnection
                 'body'        => [],
                 'status_code' => $statusCode,
                 'transient'   => true,
+                'cause'       => $errorNumber === 28 && $timeoutMs < 15000 && $cutoffNs !== null && $cutoffNs - hrtime(true) < 1_000_000
+                    ? 'budget_deadline' : 'transport',
+                'executed'    => true,
             ];
         }
 
@@ -1747,6 +1729,8 @@ final class GlpiBConnection
                 'body'        => $body,
                 'status_code' => $statusCode,
                 'transient'   => self::isTransientStatusCode($statusCode),
+                'cause'       => 'http',
+                'executed'    => true,
                 'headers'     => $responseHeaders,
                 'json_valid'  => $jsonValid,
                 'json_list'   => $jsonList,
@@ -1759,6 +1743,8 @@ final class GlpiBConnection
             'body'        => $body,
             'status_code' => $statusCode,
             'transient'   => false,
+            'cause'       => 'http',
+            'executed'    => true,
             'headers'     => $responseHeaders,
             'json_valid'  => $jsonValid,
             'json_list'   => $jsonList,

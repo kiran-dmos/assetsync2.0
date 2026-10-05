@@ -124,7 +124,7 @@ namespace {
     runMetricsCheck($service->run(2) === 4, 'The existing enqueued plus processed return must be preserved.');
     $summary = runMetricsSummary();
     runMetricsCheck($summary['examined'] === 2 && $summary['enqueued'] === 2 && $summary['jobs_attempted'] === 2 && $summary['jobs_succeeded'] === 2, 'Same-run backfill must count examined, enqueued and successful jobs separately.');
-    runMetricsCheck((float) $summary['queue_ms'] === 2.0 && (float) $summary['scan_ms'] === 1.0 && $summary['stop_reason'] === 'batch_limit' && $summary['scan_stop_reason'] === 'enqueue_limit', 'Both queue passes must contribute to duration with fixed stop codes.');
+    runMetricsCheck((float) $summary['queue_ms'] >= 2.0 && (float) $summary['scan_ms'] >= 1.0 && $summary['stop_reason'] === 'batch_limit' && $summary['scan_stop_reason'] === 'enqueue_limit', 'Both queue passes, including monotonic deadline checks, must contribute to duration with fixed stop codes.');
     runMetricsCheck(RunMetricsClock::$snapshots === 1 && $summary['http'] === [], 'One snapshot must be taken; fake remote operations must not count as HTTP.');
     runMetricsCheck($service->run(2) === 0, 'Unchanged assets must remain no-op work.');
     $summary = runMetricsSummary();
@@ -135,7 +135,7 @@ namespace {
     $service->queueAssetIfNeeded('Computer', 101, 'metrics');
     runMetricsCheck($service->run(1) === 1, 'A full queue batch must retain its return value.');
     $summary = runMetricsSummary();
-    runMetricsCheck($summary['examined'] === 1 && $summary['enqueued'] === 0 && (float) $summary['scan_ms'] === 1.0 && $summary['scan_stop_reason'] === 'visits_complete', 'A full queue batch must still report bounded backfill progress.');
+    runMetricsCheck($summary['examined'] === 1 && $summary['enqueued'] === 0 && (float) $summary['scan_ms'] >= 1.0 && $summary['scan_stop_reason'] === 'visits_complete', 'A full queue batch must still report bounded backfill progress.');
 
     $remote = new class {
         public function searchBySerial(array $connection, string $itemtype, string $serial): array
@@ -249,9 +249,9 @@ namespace {
             RunMetricsClock::$wall += 30;
         }
     };
-    runMetricsCheck($service->run(2) === 1, 'In-flight work must still finish after the soft deadline.');
+    runMetricsCheck($service->run(2) === 1, 'Wall clock changes must not cancel in-flight work.');
     $summary = runMetricsSummary();
-    runMetricsCheck($summary['stop_reason'] === 'deadline' && $summary['scan_stop_reason'] === 'not_started' && $summary['jobs_succeeded'] === 1, 'Deadline reporting must not introduce an HTTP or job deadline policy.');
+    runMetricsCheck($summary['stop_reason'] === 'no_due_jobs' && $summary['scan_stop_reason'] === 'visits_complete' && $summary['jobs_succeeded'] === 1, 'Monotonic phase timing must continue despite a wall clock jump.');
 
     echo "Run metrics tests passed.\n";
 }
