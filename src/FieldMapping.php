@@ -8,6 +8,24 @@ final class FieldMapping
 {
     private const CONTEXT = 'plugin:assetsync20';
     private const FIELD_MAPPINGS_KEY = 'field_mappings';
+    private static ?array $runCache = null;
+
+    public static function beginRunCache(): void
+    {
+        self::$runCache = [];
+    }
+
+    public static function endRunCache(): void
+    {
+        self::$runCache = null;
+    }
+
+    private static function invalidateRunCache(): void
+    {
+        if (self::$runCache !== null) {
+            self::$runCache = [];
+        }
+    }
 
     /**
      * @return array<string,string>
@@ -158,6 +176,7 @@ final class FieldMapping
      */
     public static function save(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields = []): void
     {
+        self::invalidateRunCache();
         $connectionId = trim($connectionId);
         if ($connectionId === '') {
             return;
@@ -167,15 +186,20 @@ final class FieldMapping
         $allMappings = self::loadAll();
         $allMappings[$connectionId][$itemtype] = self::cleanMappings($itemtype, $fieldMappings, $glpiBFields, false);
 
-        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-            \Config::setConfigurationValues(self::CONTEXT, [
-                self::FIELD_MAPPINGS_KEY => json_encode($allMappings, JSON_THROW_ON_ERROR),
-            ]);
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
+                \Config::setConfigurationValues(self::CONTEXT, [
+                    self::FIELD_MAPPINGS_KEY => json_encode($allMappings, JSON_THROW_ON_ERROR),
+                ]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
     public static function install(): void
     {
+        self::invalidateRunCache();
         if (
             !class_exists('\Config')
             || !method_exists('\Config', 'getConfigurationValues')
@@ -184,18 +208,27 @@ final class FieldMapping
             return;
         }
 
-        $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::FIELD_MAPPINGS_KEY]);
-        if (!array_key_exists(self::FIELD_MAPPINGS_KEY, $savedValues)) {
-            \Config::setConfigurationValues(self::CONTEXT, [
-                self::FIELD_MAPPINGS_KEY => json_encode([], JSON_THROW_ON_ERROR),
-            ]);
+        try {
+            $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::FIELD_MAPPINGS_KEY]);
+            if (!array_key_exists(self::FIELD_MAPPINGS_KEY, $savedValues)) {
+                \Config::setConfigurationValues(self::CONTEXT, [
+                    self::FIELD_MAPPINGS_KEY => json_encode([], JSON_THROW_ON_ERROR),
+                ]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
     public static function uninstall(): void
     {
-        if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::CONTEXT, [self::FIELD_MAPPINGS_KEY]);
+        self::invalidateRunCache();
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
+                \Config::deleteConfigurationValues(self::CONTEXT, [self::FIELD_MAPPINGS_KEY]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
@@ -204,6 +237,9 @@ final class FieldMapping
      */
     private static function loadAll(): array
     {
+        if (isset(self::$runCache['mappings'])) {
+            return self::$runCache['mappings'];
+        }
         if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
             return [];
         }
@@ -216,7 +252,13 @@ final class FieldMapping
 
         $decoded = json_decode($savedJson, true);
 
-        return is_array($decoded) ? $decoded : [];
+        if (!is_array($decoded)) {
+            return [];
+        }
+        if (self::$runCache !== null) {
+            self::$runCache['mappings'] = $decoded;
+        }
+        return $decoded;
     }
 
     /**

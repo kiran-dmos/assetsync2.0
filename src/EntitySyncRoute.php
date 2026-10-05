@@ -8,25 +8,44 @@ final class EntitySyncRoute
 {
     private const CONTEXT = 'plugin:assetsync20';
     private const ROUTES_KEY = 'entity_sync_routes';
+    private static ?array $runCache = null;
+
+    public static function beginRunCache(): void
+    {
+        self::$runCache = [];
+    }
+
+    public static function endRunCache(): void
+    {
+        self::$runCache = null;
+    }
+
+    private static function invalidateRunCache(): void
+    {
+        if (self::$runCache !== null) {
+            self::$runCache = [];
+        }
+    }
 
     /**
      * @return list<array{id:string,name:string,glpi_b_connection_id:string,glpi_a_source_entity_id:string,glpi_a_source_entity_name:string,glpi_b_target_entity_id:string,glpi_b_target_entity_name:string,asset_types:list<string>,include_child_entities:bool,active:bool}>
      */
     public static function loadAll(): array
     {
-        if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
-            return [];
-        }
-
-        $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
-        $savedJson = (string) ($savedValues[self::ROUTES_KEY] ?? '');
-        if ($savedJson === '') {
-            return [];
-        }
-
-        $savedRoutes = json_decode($savedJson, true);
-        if (!is_array($savedRoutes)) {
-            return [];
+        if (isset(self::$runCache['routes'])) {
+            $savedRoutes = self::$runCache['routes'];
+        } else {
+            if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
+                return [];
+            }
+            $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
+            $savedRoutes = json_decode((string) ($savedValues[self::ROUTES_KEY] ?? ''), true);
+            if (!is_array($savedRoutes)) {
+                return [];
+            }
+            if (self::$runCache !== null) {
+                self::$runCache['routes'] = $savedRoutes;
+            }
         }
 
         $routes = [];
@@ -80,6 +99,7 @@ final class EntitySyncRoute
      */
     public static function save(array $input): void
     {
+        self::invalidateRunCache();
         $route = self::fromInput($input);
         $routes = self::loadAll();
         $saved = false;
@@ -101,6 +121,7 @@ final class EntitySyncRoute
 
     public static function delete(string $id): void
     {
+        self::invalidateRunCache();
         $id = self::cleanId($id);
         $routes = [];
 
@@ -131,6 +152,7 @@ final class EntitySyncRoute
 
     public static function install(): void
     {
+        self::invalidateRunCache();
         if (
             !class_exists('\Config')
             || !method_exists('\Config', 'getConfigurationValues')
@@ -139,18 +161,27 @@ final class EntitySyncRoute
             return;
         }
 
-        $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
-        if (!array_key_exists(self::ROUTES_KEY, $savedValues)) {
-            \Config::setConfigurationValues(self::CONTEXT, [
-                self::ROUTES_KEY => json_encode([], JSON_THROW_ON_ERROR),
-            ]);
+        try {
+            $savedValues = \Config::getConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
+            if (!array_key_exists(self::ROUTES_KEY, $savedValues)) {
+                \Config::setConfigurationValues(self::CONTEXT, [
+                    self::ROUTES_KEY => json_encode([], JSON_THROW_ON_ERROR),
+                ]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
     public static function uninstall(): void
     {
-        if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
+        self::invalidateRunCache();
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
+                \Config::deleteConfigurationValues(self::CONTEXT, [self::ROUTES_KEY]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
@@ -357,16 +388,21 @@ final class EntitySyncRoute
      */
     private static function saveAll(array $routes): void
     {
+        self::invalidateRunCache();
         $savedRoutes = [];
 
         foreach ($routes as $route) {
             $savedRoutes[] = self::normalize($route);
         }
 
-        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-            \Config::setConfigurationValues(self::CONTEXT, [
-                self::ROUTES_KEY => json_encode($savedRoutes, JSON_THROW_ON_ERROR),
-            ]);
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
+                \Config::setConfigurationValues(self::CONTEXT, [
+                    self::ROUTES_KEY => json_encode($savedRoutes, JSON_THROW_ON_ERROR),
+                ]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 

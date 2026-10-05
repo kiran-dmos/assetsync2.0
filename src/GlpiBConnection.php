@@ -12,6 +12,24 @@ final class GlpiBConnection
     private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
     private static ?array $httpMetrics = null;
     private static ?string $httpMetricsConnection = null;
+    private static ?array $runCache = null;
+
+    public static function beginRunCache(): void
+    {
+        self::$runCache = [];
+    }
+
+    public static function endRunCache(): void
+    {
+        self::$runCache = null;
+    }
+
+    private static function invalidateRunCache(): void
+    {
+        if (self::$runCache !== null) {
+            self::$runCache = [];
+        }
+    }
 
     public static function beginHttpMetrics(): void
     {
@@ -63,8 +81,7 @@ final class GlpiBConnection
      */
     public static function loadAll(): array
     {
-        $savedValues = self::getSavedValues([self::CONNECTIONS_KEY]);
-        $connections = self::decodeConnections((string) ($savedValues[self::CONNECTIONS_KEY] ?? ''));
+        $connections = self::decodeConnections();
 
         if ($connections !== []) {
             return $connections;
@@ -113,6 +130,7 @@ final class GlpiBConnection
      */
     public static function save(array $input): void
     {
+        self::invalidateRunCache();
         $connection = self::fromInput($input);
         $connections = self::loadAll();
         $saved = false;
@@ -134,6 +152,7 @@ final class GlpiBConnection
 
     public static function delete(string $id): void
     {
+        self::invalidateRunCache();
         $id = self::connectionId($id);
         $connections = [];
 
@@ -164,6 +183,7 @@ final class GlpiBConnection
 
     public static function install(): void
     {
+        self::invalidateRunCache();
         if (
             !class_exists('\Config')
             || !method_exists('\Config', 'getConfigurationValues')
@@ -172,18 +192,27 @@ final class GlpiBConnection
             return;
         }
 
-        if (self::loadAll() === []) {
-            self::saveAll([]);
+        try {
+            if (self::loadAll() === []) {
+                self::saveAll([]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
     public static function uninstall(): void
     {
-        if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::CONTEXT, array_merge(
-                [self::CONNECTIONS_KEY],
-                array_keys(self::OLD_KEYS)
-            ));
+        self::invalidateRunCache();
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
+                \Config::deleteConfigurationValues(self::CONTEXT, array_merge(
+                    [self::CONNECTIONS_KEY],
+                    array_keys(self::OLD_KEYS)
+                ));
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
@@ -1245,18 +1274,21 @@ final class GlpiBConnection
     }
 
     /**
-     * @param string $savedJson
      * @return list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}>
      */
-    private static function decodeConnections(string $savedJson): array
+    private static function decodeConnections(): array
     {
-        if ($savedJson === '') {
-            return [];
-        }
-
-        $savedConnections = json_decode($savedJson, true);
-        if (!is_array($savedConnections)) {
-            return [];
+        if (isset(self::$runCache['connections'])) {
+            $savedConnections = self::$runCache['connections'];
+        } else {
+            $savedValues = self::getSavedValues([self::CONNECTIONS_KEY]);
+            $savedConnections = json_decode((string) ($savedValues[self::CONNECTIONS_KEY] ?? ''), true);
+            if (!is_array($savedConnections)) {
+                return [];
+            }
+            if (self::$runCache !== null) {
+                self::$runCache['connections'] = $savedConnections;
+            }
         }
 
         $connections = [];
@@ -1284,6 +1316,7 @@ final class GlpiBConnection
      */
     private static function saveAll(array $connections): void
     {
+        self::invalidateRunCache();
         $savedConnections = [];
 
         foreach ($connections as $connection) {
@@ -1297,10 +1330,14 @@ final class GlpiBConnection
             ];
         }
 
-        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-            \Config::setConfigurationValues(self::CONTEXT, [
-                self::CONNECTIONS_KEY => json_encode($savedConnections, JSON_THROW_ON_ERROR),
-            ]);
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
+                \Config::setConfigurationValues(self::CONTEXT, [
+                    self::CONNECTIONS_KEY => json_encode($savedConnections, JSON_THROW_ON_ERROR),
+                ]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 

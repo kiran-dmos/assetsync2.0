@@ -9,9 +9,19 @@ define('GLPI_VERSION', '11.0.7');
 class Config
 {
     public static array $values = [];
+    public static array $reads = [];
+    public static ?Closure $beforeRead = null;
+    public static ?Closure $beforeWrite = null;
+    public static ?Closure $beforeDelete = null;
 
     public static function getConfigurationValues($context, array $names = []): array
     {
+        foreach ($names as $name) {
+            self::$reads[$name] = (self::$reads[$name] ?? 0) + 1;
+        }
+        if (self::$beforeRead !== null) {
+            (self::$beforeRead)($context, $names);
+        }
         $values = self::$values[$context] ?? [];
 
         if ($names === []) {
@@ -23,11 +33,17 @@ class Config
 
     public static function setConfigurationValues($context, array $values = []): void
     {
+        if (self::$beforeWrite !== null) {
+            (self::$beforeWrite)($context, $values);
+        }
         self::$values[$context] = array_merge(self::$values[$context] ?? [], $values);
     }
 
     public static function deleteConfigurationValues($context, array $values = []): void
     {
+        if (self::$beforeDelete !== null) {
+            (self::$beforeDelete)($context, $values);
+        }
         foreach ($values as $name) {
             unset(self::$values[$context][$name]);
         }
@@ -519,13 +535,29 @@ class Search
     }
 }
 
-function getItemTypeForTable($table): string
+final class FakeItemTypes
 {
+    public static array $classReads = [];
+    public static array $tableReads = [];
+    public static ?Closure $classResult = null;
+    public static ?Closure $tableResult = null;
+}
+
+function getItemTypeForTable($table): mixed
+{
+    FakeItemTypes::$classReads[$table] = (FakeItemTypes::$classReads[$table] ?? 0) + 1;
+    if (FakeItemTypes::$classResult !== null) {
+        return (FakeItemTypes::$classResult)($table);
+    }
     return 'PluginFieldsComputerdmosasset';
 }
 
-function getTableForItemType($class): string
+function getTableForItemType($class): mixed
 {
+    FakeItemTypes::$tableReads[$class] = (FakeItemTypes::$tableReads[$class] ?? 0) + 1;
+    if (FakeItemTypes::$tableResult !== null) {
+        return (FakeItemTypes::$tableResult)($class);
+    }
     if ($class === 'PluginFieldsDepartmentfieldDropdown') {
         return 'glpi_plugin_fields_departmentfielddropdowns';
     }

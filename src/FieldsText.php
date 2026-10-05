@@ -13,6 +13,17 @@ final class FieldsText
     private const TYPE_DATE = 'date';
     private const TYPE_DATETIME = 'datetime';
     private const TYPE_DROPDOWN = 'dropdown';
+    private static ?array $runCache = null;
+
+    public static function beginRunCache(): void
+    {
+        self::$runCache = [];
+    }
+
+    public static function endRunCache(): void
+    {
+        self::$runCache = null;
+    }
 
     public static function isCustom(string $key): bool
     {
@@ -21,11 +32,18 @@ final class FieldsText
 
     public static function descriptor(string $itemtype, string $key): array
     {
+        if (isset(self::$runCache['descriptors'][$itemtype][$key])) {
+            return self::$runCache['descriptors'][$itemtype][$key];
+        }
         if (!preg_match('/^' . preg_quote($itemtype, '/') . '\.(PluginFields[A-Za-z0-9]+)\.([a-z][a-z0-9_]*)$/D', $key, $parts)) {
             throw new \RuntimeException('Invalid Fields-plugin identifier: ' . $key);
         }
 
-        return ['class' => $parts[1], 'field' => $parts[2], 'table' => \getTableForItemType($parts[1])];
+        $descriptor = ['class' => $parts[1], 'field' => $parts[2], 'table' => self::tableForItemType($parts[1])];
+        if (self::$runCache !== null && is_string($descriptor['table']) && $descriptor['table'] !== '') {
+            self::$runCache['descriptors'][$itemtype][$key] = $descriptor;
+        }
+        return $descriptor;
     }
 
     public static function key(string $itemtype, array $option): string
@@ -40,7 +58,31 @@ final class FieldsText
             return '';
         }
 
-        return $itemtype . '.' . \getItemTypeForTable($table) . '.' . $field;
+        return $itemtype . '.' . self::itemTypeForTable($table) . '.' . $field;
+    }
+
+    private static function tableForItemType(string $class): mixed
+    {
+        if (isset(self::$runCache['tables'][$class])) {
+            return self::$runCache['tables'][$class];
+        }
+        $table = \getTableForItemType($class);
+        if (self::$runCache !== null && is_string($table) && $table !== '') {
+            self::$runCache['tables'][$class] = $table;
+        }
+        return $table;
+    }
+
+    private static function itemTypeForTable(string $table): mixed
+    {
+        if (isset(self::$runCache['classes'][$table])) {
+            return self::$runCache['classes'][$table];
+        }
+        $class = \getItemTypeForTable($table);
+        if (self::$runCache !== null && is_string($class) && $class !== '') {
+            self::$runCache['classes'][$table] = $class;
+        }
+        return $class;
     }
 
     public static function isDropdownKey(string $key): bool
@@ -407,7 +449,7 @@ final class FieldsText
         if (self::dropdownDefinitionNameFromTable($table) !== '') {
             $class = self::rowClassFromOptionUid($option);
             if ($class !== '') {
-                return \getTableForItemType($class);
+                return self::tableForItemType($class);
             }
 
             return '';

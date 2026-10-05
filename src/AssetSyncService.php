@@ -63,6 +63,11 @@ final class AssetSyncService
         $batchSize = max(1, $batchSize);
         $deadline = time() + max(1, $timeLimitSeconds);
         try {
+            GlpiBConnection::beginRunCache();
+            EntitySyncRoute::beginRunCache();
+            FieldMapping::beginRunCache();
+            BillingFieldConfig::beginRunCache();
+            FieldsText::beginRunCache();
             $processed = $this->processQueue($batchSize, $deadline);
             $enqueued = 0;
             if ($processed < $batchSize && time() < $deadline) {
@@ -82,6 +87,11 @@ final class AssetSyncService
             $this->runMetrics['stop_reason'] = time() >= $deadline ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : 'no_due_jobs');
             return $enqueued + $processed;
         } finally {
+            GlpiBConnection::endRunCache();
+            EntitySyncRoute::endRunCache();
+            FieldMapping::endRunCache();
+            BillingFieldConfig::endRunCache();
+            FieldsText::endRunCache();
             $summary = $this->runMetrics;
             $this->runMetrics = null;
             $summary['http'] = GlpiBConnection::finishHttpMetrics();

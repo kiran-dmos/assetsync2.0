@@ -8,6 +8,24 @@ final class BillingFieldConfig
 {
     private const CONTEXT = 'plugin:assetsync20';
     private const KEY = 'billing_fields';
+    private static ?array $runCache = null;
+
+    public static function beginRunCache(): void
+    {
+        self::$runCache = [];
+    }
+
+    public static function endRunCache(): void
+    {
+        self::$runCache = null;
+    }
+
+    private static function invalidateRunCache(): void
+    {
+        if (self::$runCache !== null) {
+            self::$runCache = [];
+        }
+    }
 
     private const ROLES = [
         'hardware' => [
@@ -47,6 +65,9 @@ final class BillingFieldConfig
 
     public static function load(): ?array
     {
+        if (isset(self::$runCache['config'])) {
+            return self::$runCache['config'];
+        }
         if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
             throw new \RuntimeException('GLPI configuration storage is unavailable.');
         }
@@ -61,11 +82,15 @@ final class BillingFieldConfig
             throw new \RuntimeException('Billing field configuration is invalid JSON. Re-save it on the Billing Field Configuration page.');
         }
 
+        if (self::$runCache !== null) {
+            self::$runCache['config'] = $config;
+        }
         return $config;
     }
 
     public static function save(array $input, bool $confirmDisableLegacy = false): void
     {
+        self::invalidateRunCache();
         $config = self::validate($input);
         if (!$config['hardware']['enabled'] && !$config['swsd']['enabled']
             && !$confirmDisableLegacy && self::load() === null) {
@@ -75,7 +100,11 @@ final class BillingFieldConfig
             throw new \RuntimeException('GLPI configuration storage is unavailable.');
         }
 
-        \Config::setConfigurationValues(self::CONTEXT, [self::KEY => json_encode($config, JSON_THROW_ON_ERROR)]);
+        try {
+            \Config::setConfigurationValues(self::CONTEXT, [self::KEY => json_encode($config, JSON_THROW_ON_ERROR)]);
+        } finally {
+            self::invalidateRunCache();
+        }
     }
 
     public static function legacyDraft(): array
@@ -200,8 +229,13 @@ final class BillingFieldConfig
 
     public static function uninstall(): void
     {
-        if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::CONTEXT, [self::KEY]);
+        self::invalidateRunCache();
+        try {
+            if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
+                \Config::deleteConfigurationValues(self::CONTEXT, [self::KEY]);
+            }
+        } finally {
+            self::invalidateRunCache();
         }
     }
 
