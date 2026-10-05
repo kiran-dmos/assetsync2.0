@@ -10,7 +10,7 @@ $guard = new ReflectionMethod(GlpiBConnection::class, 'assertCustomContainerAcce
 $responses = [
     'getActiveProfile' => ['active_profile' => ['id' => 4, 'computer' => 3]],
     'PluginFieldsContainer/1' => ['id' => 1, 'is_active' => 1, 'itemtypes' => '["Computer"]', 'entities_id' => 0, 'is_recursive' => 0],
-    'PluginFieldsContainer/1/PluginFieldsProfile?range=0-999' => [['profiles_id' => 4, 'plugin_fields_containers_id' => 1, 'right' => '4']],
+    'PluginFieldsContainer/1/PluginFieldsProfile' => [['id' => 1, 'profiles_id' => 4, 'plugin_fields_containers_id' => 1, 'right' => '4']],
     'Computer/2' => ['id' => 2, 'entities_id' => 0],
 ];
 
@@ -18,12 +18,13 @@ function verifyAccess(array $responses, bool $writing, ?string $error = null): v
 {
     global $guard;
     try {
-        $guard->invoke(null, 'Computer', 2, 1, $writing, static function (string $endpoint) use ($responses): array {
+        $read = static function (string $endpoint) use ($responses): array {
             if (!array_key_exists($endpoint, $responses)) {
                 throw new RuntimeException('Permission metadata unavailable: ' . $endpoint);
             }
             return $responses[$endpoint];
-        });
+        };
+        $guard->invoke(null, 'Computer', 2, 1, $writing, $read, $read);
     } catch (RuntimeException $exception) {
         if ($error !== null && str_contains($exception->getMessage(), $error)) {
             return;
@@ -37,19 +38,25 @@ function verifyAccess(array $responses, bool $writing, ?string $error = null): v
 
 verifyAccess($responses, true);
 verifyAccess($responses, false);
+try {
+    $guard->invoke(null, 'Computer', 2, 1, true, static fn (string $endpoint): array => $responses[$endpoint]);
+    throw new LogicException('A missing complete catalog reader authorized access.');
+} catch (RuntimeException $error) {
+    if (!str_contains($error->getMessage(), 'complete profile catalog reader')) { throw $error; }
+}
 $denied = $responses;
-$denied['PluginFieldsContainer/1/PluginFieldsProfile?range=0-999'][0]['right'] = '1';
+$denied['PluginFieldsContainer/1/PluginFieldsProfile'][0]['right'] = '1';
 verifyAccess($denied, false);
 verifyAccess($denied, true, 'container permission denied');
-$denied['PluginFieldsContainer/1/PluginFieldsProfile?range=0-999'][0]['right'] = '0';
+$denied['PluginFieldsContainer/1/PluginFieldsProfile'][0]['right'] = '0';
 verifyAccess($denied, false, 'container permission denied');
 verifyAccess($denied, true, 'container permission denied');
 $denied = $responses;
-$denied['PluginFieldsContainer/1/PluginFieldsProfile?range=0-999'] = [];
+$denied['PluginFieldsContainer/1/PluginFieldsProfile'] = [];
 verifyAccess($denied, true, 'container permission denied');
-$denied['PluginFieldsContainer/1/PluginFieldsProfile?range=0-999'] = [['profiles_id' => 5, 'plugin_fields_containers_id' => 1, 'right' => 4]];
+$denied['PluginFieldsContainer/1/PluginFieldsProfile'] = [['profiles_id' => 5, 'plugin_fields_containers_id' => 1, 'right' => 4]];
 verifyAccess($denied, true, 'container permission denied');
-$denied['PluginFieldsContainer/1/PluginFieldsProfile?range=0-999'] = [['profiles_id' => 4, 'plugin_fields_containers_id' => 9, 'right' => 4]];
+$denied['PluginFieldsContainer/1/PluginFieldsProfile'] = [['profiles_id' => 4, 'plugin_fields_containers_id' => 9, 'right' => 4]];
 verifyAccess($denied, true, 'container permission denied');
 $denied = $responses;
 $denied['getActiveProfile'] = [];
@@ -71,7 +78,7 @@ foreach (['is_active' => 0, 'itemtypes' => '["Monitor"]', 'id' => 2] as $field =
     $denied['PluginFieldsContainer/1'][$field] = $value;
     verifyAccess($denied, true, 'container is unavailable');
 }
-foreach (['PluginFieldsContainer/1', 'PluginFieldsContainer/1/PluginFieldsProfile?range=0-999', 'Computer/2'] as $endpoint) {
+foreach (['PluginFieldsContainer/1', 'PluginFieldsContainer/1/PluginFieldsProfile', 'Computer/2'] as $endpoint) {
     $denied = $responses;
     unset($denied[$endpoint]);
     verifyAccess($denied, true, 'Permission metadata unavailable');

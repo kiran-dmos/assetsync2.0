@@ -655,9 +655,12 @@ final class GlpiBConnection
                 self::assertCustomContainerAccess($itemtype, $itemsId, $container['id'], $writing, static function (string $endpoint) use ($connection, $headers): array {
                     $result = self::request('GET', self::apiUrl($connection['base_url'], $endpoint), $headers);
                     if (!$result['success']) {
-                        throw new \RuntimeException('Cannot establish GLPI B Fields container permission: cannot read ' . $endpoint . '. Verify the API account\'s Fields configuration/profile-read and asset/entity access. ' . $result['message']);
+                        $result['message'] = 'Cannot establish GLPI B Fields container permission. Verify the API account\'s Fields configuration/profile-read and asset/entity access. ' . $result['message'];
+                        throw new RemoteRequestFailure($result);
                     }
                     return $result['body'];
+                }, static function (string $endpoint) use ($connection, $headers): array {
+                    return self::remoteCollectionRows($connection, $headers, $endpoint);
                 });
                 $endpoint = rawurlencode($itemtype) . '/' . $itemsId . '/' . rawurlencode($class);
                 $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, ['range' => '0-1']), $headers);
@@ -778,32 +781,70 @@ final class GlpiBConnection
             throw new \RuntimeException('The remote Fields-plugin dropdown class is unavailable: ' . ($metadata['key'] ?? 'unknown'));
         }
 
-        $response = self::request(
-            'GET',
-            self::apiUrlWithQuery($connection['base_url'], rawurlencode($class), ['range' => '0-999', 'get_hateoas' => 0]),
-            $headers
-        );
-        if (!$response['success']) {
-            throw new \RuntimeException('Cannot read GLPI B Fields-plugin dropdown options for ' . ($metadata['key'] ?? 'unknown') . '. ' . $response['message']);
-        }
+        return self::remoteCollectionRows($connection, $headers, rawurlencode($class));
+    }
 
-        $body = $response['body'];
-        if (isset($body['data']) && is_array($body['data'])) {
-            $body = $body['data'];
-        }
-
-        if (!is_array($body)) {
-            return [];
-        }
-
+    /** Return a catalog only after proving every page complete; never expose a partial list. */
+    private static function remoteCollectionRows(array $connection, array $headers, string $endpoint): array
+    {
         $rows = [];
-        foreach ($body as $row) {
-            if (is_array($row)) {
+        $offset = 0;
+        $total = null;
+        $lastId = 0;
+        for ($page = 0; $page < 10; $page++) {
+            $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, [
+                'range' => $offset . '-' . ($offset + 999), 'sort' => 'id', 'order' => 'ASC', 'get_hateoas' => 0,
+            ]), $headers);
+            if (!$response['success']) {
+                if ($offset > 0 && $response['status_code'] === 400 && ($response['body'][0] ?? '') === 'ERROR_RANGE_EXCEED_TOTAL') {
+                    $response['transient'] = true;
+                    $response['cause'] = 'catalog_changed';
+                    $response['message'] = 'GLPI B catalog shrank during pagination; retry with a fresh catalog.';
+                }
+                throw new RemoteRequestFailure($response);
+            }
+            $body = $response['body'];
+            $ranges = $response['headers']['content-range'] ?? [];
+            if (!$response['json_valid'] || !$response['json_list'] || !array_is_list($body)) {
+                throw new \RuntimeException('GLPI B catalog is incomplete: expected a valid JSON row list.');
+            }
+            // GLPI returns 200 [] without Content-Range for a genuinely empty collection.
+            if ($body === [] && $offset === 0 && $response['status_code'] === 200 && $ranges === []) {
+                return [];
+            }
+            if (count($ranges) !== 1 || !preg_match('/\A(\d+)-(\d+)\/(\d+)\z/', $ranges[0], $range)) {
+                throw new \RuntimeException('GLPI B catalog is incomplete: missing or invalid Content-Range.');
+            }
+            $start = (int) $range[1];
+            $end = (int) $range[2];
+            $pageTotal = (int) $range[3];
+            if ($total !== null && $pageTotal !== $total) {
+                throw new RemoteRequestFailure([
+                    'success' => false, 'message' => 'GLPI B catalog changed during pagination; retry with a fresh catalog.',
+                    'status_code' => $response['status_code'], 'transient' => true, 'cause' => 'catalog_changed',
+                ]);
+            }
+            if ($pageTotal > 10000) {
+                throw new \RuntimeException('GLPI B catalog is incomplete: exceeds the 10000-row limit.');
+            }
+            if ($start !== $offset || $end < $start || $end >= $pageTotal || $end > $offset + 999 || count($body) !== $end - $start + 1) {
+                throw new \RuntimeException('GLPI B catalog is incomplete: inconsistent range or row count.');
+            }
+            foreach ($body as $row) {
+                $id = is_array($row) ? self::cleanRemoteId($row['id'] ?? 0) : 0;
+                if ($id <= $lastId) {
+                    throw new \RuntimeException('GLPI B catalog is incomplete: IDs must be unique and ascending.');
+                }
+                $lastId = $id;
                 $rows[] = $row;
             }
+            $total = $pageTotal;
+            $offset = $end + 1;
+            if ($offset === $total) {
+                return $rows; // A valid final page may still use HTTP 206.
+            }
         }
-
-        return $rows;
+        throw new \RuntimeException('GLPI B catalog is incomplete: exceeds the 10-page limit.');
     }
 
     /**
@@ -921,7 +962,7 @@ final class GlpiBConnection
     }
 
     /** Mirror Fields' profile and container entity checks before accessing a generated child row. */
-    private static function assertCustomContainerAccess(string $itemtype, int $itemsId, int $containerId, bool $writing, callable $read): void
+    private static function assertCustomContainerAccess(string $itemtype, int $itemsId, int $containerId, bool $writing, callable $read, ?callable $readCollection = null): void
     {
         $profile = $read('getActiveProfile')['active_profile'] ?? [];
         $profileId = (int) ($profile['id'] ?? 0);
@@ -936,7 +977,10 @@ final class GlpiBConnection
             || !isset($container['entities_id'], $container['is_recursive'])) {
             throw new \RuntimeException('Cannot establish GLPI B Fields container permission: container is unavailable, inactive, or not applicable to this asset type.');
         }
-        $rights = $read('PluginFieldsContainer/' . $containerId . '/PluginFieldsProfile?range=0-999');
+        if ($readCollection === null) {
+            throw new \RuntimeException('Cannot establish GLPI B Fields container permission: a complete profile catalog reader is required.');
+        }
+        $rights = $readCollection('PluginFieldsContainer/' . $containerId . '/PluginFieldsProfile');
         $right = 0;
         foreach ($rights as $row) {
             if (is_array($row) && (int) ($row['profiles_id'] ?? 0) === $profileId && (int) ($row['plugin_fields_containers_id'] ?? 0) === $containerId) {
@@ -1592,7 +1636,7 @@ final class GlpiBConnection
     /**
      * @param list<string> $headers
      * @param array<string,mixed>|null $payload
-     * @return array{success:bool,message:string,body:array<string,mixed>,status_code:int,transient:bool}
+     * @return array{success:bool,message:string,body:array,status_code:int,transient:bool,headers?:array,json_valid?:bool,json_list?:bool}
      */
     private static function request(string $method, string $url, array $headers, ?array $payload = null): array
     {
@@ -1623,11 +1667,25 @@ final class GlpiBConnection
             $requestHeaders[] = 'Content-Type: application/json';
         }
 
+        $responseHeaders = [];
         curl_setopt_array($curl, [
             CURLOPT_CUSTOMREQUEST  => $method,
             CURLOPT_HTTPHEADER     => $requestHeaders,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT        => 15,
+            CURLOPT_HEADERFUNCTION => static function ($handle, string $line) use (&$responseHeaders): int {
+                $length = strlen($line);
+                $header = trim($line);
+                if (preg_match('/\AHTTP\/\S+\s+\d{3}\b/i', $header)) {
+                    $responseHeaders = []; // Only the final response block supplies pagination proof.
+                } elseif (str_contains($header, ':')) {
+                    [$name, $value] = explode(':', $header, 2);
+                    if (strtolower(trim($name)) === 'content-range') {
+                        $responseHeaders['content-range'][] = trim($value);
+                    }
+                }
+                return $length;
+            },
         ]);
 
         if ($payload !== null) {
@@ -1669,9 +1727,18 @@ final class GlpiBConnection
             ];
         }
 
-        $body = json_decode((string) $rawBody, true);
-        if (!is_array($body)) {
-            $body = [];
+        $body = [];
+        $jsonValid = false;
+        $jsonList = false;
+        try {
+            $decoded = json_decode((string) $rawBody, false, 512, JSON_THROW_ON_ERROR);
+            $jsonValid = true;
+            $jsonList = is_array($decoded);
+            $body = json_decode((string) $rawBody, true, 512, JSON_THROW_ON_ERROR);
+            if (!is_array($body)) {
+                $body = [];
+            }
+        } catch (\JsonException) {
         }
 
         if ($statusCode < 200 || $statusCode >= 300) {
@@ -1681,6 +1748,9 @@ final class GlpiBConnection
                 'body'        => $body,
                 'status_code' => $statusCode,
                 'transient'   => self::isTransientStatusCode($statusCode),
+                'headers'     => $responseHeaders,
+                'json_valid'  => $jsonValid,
+                'json_list'   => $jsonList,
             ];
         }
 
@@ -1690,6 +1760,9 @@ final class GlpiBConnection
             'body'        => $body,
             'status_code' => $statusCode,
             'transient'   => false,
+            'headers'     => $responseHeaders,
+            'json_valid'  => $jsonValid,
+            'json_list'   => $jsonList,
         ];
     }
 

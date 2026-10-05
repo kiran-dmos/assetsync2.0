@@ -37,6 +37,9 @@ namespace GlpiPlugin\Assetsync20 {
         }
         \HttpMetricsCurl::$nanoseconds += $step['ms'] * 1_000_000;
         $curl->status = $step['status'];
+        foreach ($step['headers'] ?? [] as $header) {
+            ($curl->options[CURLOPT_HEADERFUNCTION])($curl, $header . "\r\n");
+        }
         if (!empty($step['throw'])) {
             throw new \RuntimeException('private-curl-exception');
         }

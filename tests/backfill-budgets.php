@@ -303,7 +303,7 @@ try {
         }
     };
     backfillCheck($service->enqueueBackfill(10) === 0 && backfillQueries() === [], 'Expiry before the initial candidate query must stop that query.');
-    backfillCheck(backfillCursor('route-01') === '0' && backfillCursor('route-02') === null, 'Expiry during a visit must save the visited tuple without advancing asset rows.');
+    backfillCheck(backfillCursor('route-01') === null && backfillCursor('route-02') === null, 'An incomplete visit must rotate without creating or advancing asset cursors.');
 
     $now = 0.0;
     $service = backfillSetup(1, 6, $clock);
@@ -363,11 +363,11 @@ try {
     $entityQueries = 0;
     $GLOBALS['DB']->requests = [];
     $GLOBALS['DB']->afterRequest = static function (array $query) use (&$entityQueries, &$now): void {
-        if (($query['FROM'] ?? '') === 'glpi_entities' && ++$entityQueries === 2) {
+        if (($query['FROM'] ?? '') === 'glpi_entities' && ++$entityQueries === 3) {
             $now = 2.0;
         }
     };
-    backfillCheck($service->enqueueBackfill(10) === 0 && count(backfillQueries()) === 1 && $entityQueries === 2, 'Expiry during wrap entity expansion must prevent the actual wrap candidate query.');
+    backfillCheck($service->enqueueBackfill(10) === 0 && count(backfillQueries()) === 1 && $entityQueries === 3, 'Expiry during wrap source verification must prevent the actual wrap candidate query.');
     backfillCheck(backfillCursor('route-01') === '999', 'A cancelled wrap query must preserve its asset cursor.');
 
     $now = 0.0;

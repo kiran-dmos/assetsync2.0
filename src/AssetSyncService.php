@@ -57,6 +57,8 @@ final class AssetSyncService
             'jobs_blocked' => 0,
             'jobs_skipped' => 0,
             'jobs_write_failed' => 0,
+            'incomplete_scope_count' => 0,
+            'incomplete_scopes' => [],
             'stop_reason' => 'error',
             'scan_stop_reason' => 'not_started',
         ];
@@ -193,6 +195,11 @@ final class AssetSyncService
 
             if ($rows === [] && $cursor > 0 && $this->scanHasTime($deadline, $scanDeadline)) {
                 $rows = $this->routeAssetRows($route, $itemtype, 0, $queryLimit, $deadline, $scanDeadline);
+            }
+            if ($rows === null) {
+                // Rotate the tuple, but never wrap or advance an incomplete scope's asset cursor.
+                $this->saveScanProgress($cursors, $tuple);
+                continue;
             }
 
             foreach ($rows as $row) {
@@ -774,13 +781,14 @@ final class AssetSyncService
 
     /**
      * @param array<string,mixed> $route
-     * @return list<array<string,mixed>>
+     * @return list<array<string,mixed>>|null Null means the scope could not be proved complete.
      */
-    private function routeAssetRows(array $route, string $itemtype, int $afterId, int $limit, int $deadline, float $scanDeadline): array
+    private function routeAssetRows(array $route, string $itemtype, int $afterId, int $limit, int $deadline, float $scanDeadline): ?array
     {
         $db = $this->db();
         if ($db === null || !method_exists($db, 'request')) {
-            return [];
+            $this->recordIncompleteScope($route, 'unavailable');
+            return null;
         }
 
         $table = $this->assetTable($itemtype);
@@ -788,29 +796,38 @@ final class AssetSyncService
             return [];
         }
 
-        $entityIds = $this->routeEntityIds($route, $deadline, $scanDeadline);
-        if ($entityIds === [] || !$this->scanHasTime($deadline, $scanDeadline)) {
-            return [];
+        $scope = $this->routeEntityIds($route, $deadline, $scanDeadline);
+        if (!$scope['complete'] || !$this->scanHasTime($deadline, $scanDeadline)) {
+            $this->recordIncompleteScope($route, $scope['complete'] ? 'expired' : $scope['reason']);
+            return null;
         }
 
-        $rows = $db->request([
-            'SELECT' => ['id', 'entities_id'],
-            'FROM'   => $table,
-            'WHERE'  => [
-                'entities_id' => array_map('intval', $entityIds),
-                'is_deleted'  => 0,
-                'id'          => ['>', $afterId],
-            ],
-            'ORDER'  => 'id ASC',
-            'LIMIT'  => max(1, $limit),
-        ]);
-
-        $assets = [];
-
-        foreach ($rows as $row) {
-            if (is_array($row)) {
-                $assets[] = $row;
+        try {
+            $rows = $db->request([
+                'SELECT' => ['id', 'entities_id'],
+                'FROM'   => $table,
+                'WHERE'  => [
+                    'entities_id' => array_map('intval', $scope['ids']),
+                    'is_deleted'  => 0,
+                    'id'          => ['>', $afterId],
+                ],
+                'ORDER'  => 'id ASC',
+                'LIMIT'  => max(1, $limit),
+            ]);
+            if (!is_iterable($rows)) {
+                throw new \RuntimeException('Asset query unavailable.');
             }
+
+            $assets = [];
+
+            foreach ($rows as $row) {
+                if (is_array($row)) {
+                    $assets[] = $row;
+                }
+            }
+        } catch (\Throwable) {
+            $this->recordIncompleteScope($route, 'query_failed');
+            return null;
         }
 
         return $assets;
@@ -818,54 +835,112 @@ final class AssetSyncService
 
     /**
      * @param array<string,mixed> $route
-     * @return list<string>
+     * @return array{complete:bool,ids:list<string>,reason:string}
      */
     private function routeEntityIds(array $route, int $deadline, float $scanDeadline): array
     {
         $sourceEntityId = trim((string) ($route['glpi_a_source_entity_id'] ?? ''));
-        if ($sourceEntityId === '') {
-            return [];
+        if ($sourceEntityId === '' || !ctype_digit($sourceEntityId)) {
+            return ['complete' => false, 'ids' => [], 'reason' => 'invalid_tree'];
         }
 
+        $sourceEntityId = (string) (int) $sourceEntityId;
         $entityIds = [$sourceEntityId];
         if (empty($route['include_child_entities'])) {
-            return $entityIds;
+            return ['complete' => true, 'ids' => $entityIds, 'reason' => ''];
         }
 
         $db = $this->db();
         if ($db === null || !method_exists($db, 'request')) {
-            return $entityIds;
+            return ['complete' => false, 'ids' => [], 'reason' => 'unavailable'];
         }
 
         $seen = [$sourceEntityId => true];
-        $queue = [$sourceEntityId];
-
-        while ($queue !== [] && count($entityIds) < self::MAX_ROUTE_ENTITY_IDS && $this->scanHasTime($deadline, $scanDeadline)) {
-            $parentId = array_shift($queue);
-            $rows = $db->request([
-                'SELECT' => ['id'],
+        $frontier = [$sourceEntityId];
+        try {
+            if (!$this->scanHasTime($deadline, $scanDeadline)) {
+                return ['complete' => false, 'ids' => [], 'reason' => 'expired'];
+            }
+            // A descendant cycle can return to the source through its parent. Root 0 is self-parented.
+            $sourceRows = $db->request([
+                'SELECT' => ['id', 'entities_id'],
                 'FROM'   => 'glpi_entities',
-                'WHERE'  => ['entities_id' => (int) $parentId],
-                'ORDER'  => 'id ASC',
+                'WHERE'  => ['id' => (int) $sourceEntityId],
+                'LIMIT'  => 1,
             ]);
-
-            foreach ($rows as $row) {
-                $childId = trim((string) ($row['id'] ?? ''));
-                if ($childId === '' || isset($seen[$childId])) {
-                    continue;
-                }
-
-                $seen[$childId] = true;
-                $entityIds[] = $childId;
-                $queue[] = $childId;
-
-                if (count($entityIds) >= self::MAX_ROUTE_ENTITY_IDS) {
-                    break;
+            if (!is_iterable($sourceRows)) {
+                return ['complete' => false, 'ids' => [], 'reason' => 'query_failed'];
+            }
+            $sourceParent = null;
+            foreach ($sourceRows as $row) {
+                if (is_array($row) && (string) ($row['id'] ?? '') === $sourceEntityId && ctype_digit((string) ($row['entities_id'] ?? ''))) {
+                    $sourceParent = (string) (int) $row['entities_id'];
                 }
             }
+            if ($sourceParent === null || ($sourceEntityId === '0' ? $sourceParent !== '0' : $sourceParent === $sourceEntityId)) {
+                return ['complete' => false, 'ids' => [], 'reason' => 'invalid_tree'];
+            }
+
+            while ($frontier !== []) {
+                if (!$this->scanHasTime($deadline, $scanDeadline)) {
+                    return ['complete' => false, 'ids' => [], 'reason' => 'expired'];
+                }
+                $remaining = self::MAX_ROUTE_ENTITY_IDS - count($entityIds);
+                $rows = $db->request([
+                    'SELECT' => ['id', 'entities_id'],
+                    'FROM'   => 'glpi_entities',
+                    'WHERE'  => ['entities_id' => array_map('intval', $frontier), 'NOT' => ['id' => array_map('intval', $entityIds)]],
+                    'ORDER'  => 'id ASC',
+                    'LIMIT'  => $remaining + 1,
+                ]);
+                if (!is_iterable($rows)) {
+                    return ['complete' => false, 'ids' => [], 'reason' => 'query_failed'];
+                }
+                $next = [];
+                foreach ($rows as $row) {
+                    if (!is_array($row) || !ctype_digit((string) ($row['id'] ?? '')) || !ctype_digit((string) ($row['entities_id'] ?? ''))) {
+                        return ['complete' => false, 'ids' => [], 'reason' => 'invalid_tree'];
+                    }
+                    $childId = (string) (int) $row['id'];
+                    if (isset($seen[$childId]) || !in_array((string) (int) $row['entities_id'], $frontier, true)) {
+                        return ['complete' => false, 'ids' => [], 'reason' => 'invalid_tree'];
+                    }
+                    if ($sourceEntityId !== '0' && $childId === $sourceParent) {
+                        return ['complete' => false, 'ids' => [], 'reason' => 'invalid_tree'];
+                    }
+                    if (count($next) >= $remaining) {
+                        return ['complete' => false, 'ids' => [], 'reason' => 'entity_cap'];
+                    }
+                    $seen[$childId] = true;
+                    $next[] = $childId;
+                }
+                $entityIds = array_merge($entityIds, $next);
+                $frontier = $next;
+            }
+            if (!$this->scanHasTime($deadline, $scanDeadline)) {
+                return ['complete' => false, 'ids' => [], 'reason' => 'expired'];
+            }
+        } catch (\Throwable) {
+            return ['complete' => false, 'ids' => [], 'reason' => 'query_failed'];
         }
 
-        return $entityIds;
+        return ['complete' => true, 'ids' => $entityIds, 'reason' => ''];
+    }
+
+    private function recordIncompleteScope(array $route, string $reason): void
+    {
+        $scope = ['route_id' => (string) ($route['id'] ?? ''), 'reason' => $reason];
+        if ($this->runMetrics !== null) {
+            $this->runMetrics['incomplete_scope_count']++;
+            $this->runMetrics['incomplete_scopes'][] = $scope;
+            return;
+        }
+        try {
+            if (class_exists('\\Toolbox') && method_exists('\\Toolbox', 'logInFile')) {
+                \Toolbox::logInFile('assetsync20', 'AssetSync2.0 incomplete scan scope ' . json_encode($scope, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE) . PHP_EOL);
+            }
+        } catch (\Throwable) {
+        }
     }
 
     /**
@@ -1636,6 +1711,8 @@ final class AssetSyncService
                     'transient' => false,
                 ];
             }
+        } catch (RemoteRequestFailure $error) {
+            return $error->result;
         } catch (\Throwable $error) {
             return [
                 'success' => false,

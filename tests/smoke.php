@@ -418,6 +418,12 @@ final class FakeDB
     private function rowMatches(array $row, array $where): bool
     {
         foreach ($where as $field => $expected) {
+            if ($field === 'NOT') {
+                if ($this->rowMatches($row, $expected)) {
+                    return false;
+                }
+                continue;
+            }
             if ($expected instanceof \Glpi\DBAL\QueryExpression) {
                 if (!str_contains($expected->expression, 'UNIX_TIMESTAMP(`started_at`)')) {
                     throw new RuntimeException('Unexpected queue condition: ' . $expected->expression);

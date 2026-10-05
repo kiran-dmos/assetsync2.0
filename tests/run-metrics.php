@@ -196,6 +196,14 @@ namespace {
             throw new RuntimeException('private-scan-error');
         }
     };
+    runMetricsCheck($service->run(1) === 0, 'A failed candidate query must report an incomplete scope without partial scan work.');
+    $summary = runMetricsSummary();
+    runMetricsCheck($summary['jobs_attempted'] === 0 && $summary['examined'] === 0 && $summary['incomplete_scope_count'] === 1
+        && $summary['incomplete_scopes'] === [['route_id' => 'route-01', 'reason' => 'query_failed']], 'Candidate query failures must be explicitly reported without raw errors.');
+
+    $GLOBALS['metricsService'] = $service = runMetricsSetup(1, null, static function (): float {
+        throw new RuntimeException('private-scan-error');
+    });
     try {
         $service->run(1);
         throw new LogicException('The scan exception was swallowed.');
