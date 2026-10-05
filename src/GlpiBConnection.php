@@ -446,7 +446,7 @@ final class GlpiBConnection
      * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
      * @return array{success:bool,message:string,item:array<string,mixed>,missing:bool,transient:bool,date_mod_timezone?:string}
      */
-    public static function getItem(array $connection, string $itemtype, int $itemsId): array
+    public static function getItem(array $connection, string $itemtype, int $itemsId, bool $needsDateModTimezone = true): array
     {
         if ($itemsId <= 0) {
             return [
@@ -486,7 +486,7 @@ final class GlpiBConnection
                 'transient' => false,
                 self::DATE_MOD_TIMEZONE_KEY => $dateModTimezone,
             ];
-        }, true);
+        }, $needsDateModTimezone);
     }
 
     /**
@@ -1437,10 +1437,9 @@ final class GlpiBConnection
             ];
         }
 
-        $dateModTimezone = $needsDateModTimezone ? self::remoteDateModTimezone($connection, $sessionToken) : '';
-
         try {
             if ($needsDateModTimezone) {
+                $dateModTimezone = self::remoteDateModTimezone($connection, $sessionToken);
                 return $callback($sessionToken, $dateModTimezone);
             }
 
@@ -1464,7 +1463,7 @@ final class GlpiBConnection
         ]);
 
         if (!$fullSession['success']) {
-            return '';
+            throw new RemoteRequestFailure($fullSession);
         }
 
         return self::sessionTimezone($fullSession['body']);

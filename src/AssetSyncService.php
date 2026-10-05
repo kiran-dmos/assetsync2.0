@@ -470,13 +470,7 @@ final class AssetSyncService
             return;
         }
         $customKeys = array_keys($customTypes);
-        if ($customKeys !== []) {
-            $validation = $this->callRemote('customTextValues', [$connection, $itemtype, 0, $customKeys, [], $customTypes]);
-            if (!$this->remoteSucceeded($validation)) {
-                $this->handleRemoteFailure($job, $route['id'], $validation, $attempts, null);
-                return;
-            }
-        }
+        $needsDateModTimezone = in_array('both', array_column($mappings, 'source_of_truth'), true);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
         $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : (int) ($job['remote_items_id'] ?? 0);
         $remoteItem = null;
@@ -484,7 +478,7 @@ final class AssetSyncService
         $createdRemote = false;
 
         if ($remoteItemsId > 0) {
-            $remoteResult = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId]);
+            $remoteResult = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId, $needsDateModTimezone]);
             if (!$this->remoteSucceeded($remoteResult)) {
                 if (!empty($remoteResult['missing'])) {
                     $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_MISSING_REMOTE, 'The linked GLPI B asset is missing.', $remoteItemsId);
@@ -519,7 +513,7 @@ final class AssetSyncService
                     return;
                 }
 
-                $remoteResult = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId]);
+                $remoteResult = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId, $needsDateModTimezone]);
                 if (!$this->remoteSucceeded($remoteResult)) {
                     if (!empty($remoteResult['missing'])) {
                         $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_MISSING_REMOTE, 'The matched GLPI B asset is missing.', $remoteItemsId);
@@ -533,6 +527,13 @@ final class AssetSyncService
                 $remoteItem = is_array($remoteResult['item'] ?? null) ? $remoteResult['item'] : [];
                 $remoteDateModTimezone = $this->dateModTimezone($remoteResult[self::DATE_MOD_TIMEZONE_KEY] ?? '');
             } else {
+                if ($customKeys !== []) {
+                    $validation = $this->callRemote('customTextValues', [$connection, $itemtype, 0, $customKeys, [], $customTypes]);
+                    if (!$this->remoteSucceeded($validation)) {
+                        $this->handleRemoteFailure($job, $route['id'], $validation, $attempts, null);
+                        return;
+                    }
+                }
                 $createResult = $this->callRemote('createItem', [$connection, $itemtype, $this->createInput($asset, $route, $mappings)]);
                 if (!$this->remoteSucceeded($createResult)) {
                     $this->handleRemoteFailure($job, $route['id'], $createResult, $attempts, null);
@@ -638,7 +639,7 @@ final class AssetSyncService
         }
 
         if ($customChanges !== []) {
-            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, $customChanges, $customTypes, true]);
+            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, array_keys($customChanges), $customChanges, $customTypes, true]);
             if (!$this->remoteSucceeded($updateResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;

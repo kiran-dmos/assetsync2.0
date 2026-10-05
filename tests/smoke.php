@@ -818,6 +818,8 @@ final class FakeGlpiBClient
     public array $customHistoryLogs = [];
     /** @var list<array{itemtype:string,items_id:int,option_ids:list<string>,itemtype_links:list<string>}> */
     public array $customHistoryRequests = [];
+    public array $requests = [];
+    public ?Closure $customRequestResult = null;
     private int $nextId = 1000;
 
     /**
@@ -826,6 +828,7 @@ final class FakeGlpiBClient
      */
     public function searchBySerial(array $connection, string $itemtype, string $serial): array
     {
+        $this->requests[] = ['method' => 'searchBySerial'];
         $matches = [];
 
         foreach ($this->records[$this->key($connection, $itemtype)] ?? [] as $id => $record) {
@@ -847,8 +850,9 @@ final class FakeGlpiBClient
      * @param array{id:string} $connection
      * @return array{success:bool,message:string,item:array<string,mixed>,missing:bool,transient:bool}
      */
-    public function getItem(array $connection, string $itemtype, int $itemsId): array
+    public function getItem(array $connection, string $itemtype, int $itemsId, bool $needsDateModTimezone = true): array
     {
+        $this->requests[] = ['method' => 'getItem', 'items_id' => $itemsId, 'needs_date_mod_timezone' => $needsDateModTimezone];
         $record = $this->records[$this->key($connection, $itemtype)][$itemsId] ?? null;
 
         return [
@@ -857,7 +861,7 @@ final class FakeGlpiBClient
             'item' => $record ?? [],
             'missing' => $record === null,
             'transient' => false,
-            'date_mod_timezone' => $this->dateModTimezone,
+            'date_mod_timezone' => $needsDateModTimezone ? $this->dateModTimezone : '',
         ];
     }
 
@@ -868,6 +872,7 @@ final class FakeGlpiBClient
      */
     public function createItem(array $connection, string $itemtype, array $input): array
     {
+        $this->requests[] = ['method' => 'createItem', 'input' => $input];
         $id = $this->nextId++;
         $record = $input;
         $record['id'] = $id;
@@ -889,6 +894,7 @@ final class FakeGlpiBClient
      */
     public function updateItem(array $connection, string $itemtype, int $itemsId, array $input): array
     {
+        $this->requests[] = ['method' => 'updateItem', 'items_id' => $itemsId, 'input' => $input];
         $key = $this->key($connection, $itemtype);
         if (!isset($this->records[$key][$itemsId])) {
             return [
@@ -916,6 +922,14 @@ final class FakeGlpiBClient
      */
     public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false): array
     {
+        $this->requests[] = ['method' => 'customTextValues', 'items_id' => $itemsId, 'keys' => $keys,
+            'changes' => $changes, 'expected_types' => $expectedTypes, 'allow_readonly' => $allowReadonly];
+        if ($this->customRequestResult !== null) {
+            $result = ($this->customRequestResult)($itemsId, $keys, $changes, $expectedTypes, $allowReadonly);
+            if ($result !== null) {
+                return $result;
+            }
+        }
         if (array_intersect($keys, $this->unavailableCustomKeys) !== []) {
             return ['success' => false, 'message' => 'Mapped remote field unavailable.', 'transient' => false];
         }
@@ -971,6 +985,7 @@ final class FakeGlpiBClient
      */
     public function customHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs): array
     {
+        $this->requests[] = ['method' => 'customHistoryDates', 'items_id' => $itemsId, 'refs' => $historyRefs];
         $recordKey = $this->key($connection, $itemtype);
         $optionIds = [];
         $itemtypeLinks = [];

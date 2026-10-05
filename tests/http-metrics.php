@@ -145,6 +145,17 @@ namespace {
     httpMetricsCheck($metrics === ['a' => ['requests' => 7, 'errors' => 0, 'latency_ms' => 35.0], 'b' => ['requests' => 4, 'errors' => 0, 'latency_ms' => 20.0]], 'Operations must include init, optional timezone, work and kill calls under the correct connection.');
     httpMetricsCheck(HttpMetricsCurl::$executions === 11 && HttpMetricsCurl::$closed === 11 && HttpMetricsCurl::$steps === [], 'Per-connection totals must reconcile with actual executions.');
 
+    $oneWayItem = ['id' => 12, 'name' => 'One-way item', 'date_mod' => '2026-10-05 12:00:00'];
+    httpStart([$init, httpStep('Computer/12', $oneWayItem), $kill]);
+    $oneWay = httpCall('a', 'getItem', ['Computer', 12, false]);
+    httpMetricsCheck($oneWay['success'] && $oneWay['item'] === $oneWayItem && $oneWay['date_mod_timezone'] === '', 'One-way reads must preserve item/date data without requesting unnecessary timezone permission.');
+    httpFinish('a', 3, 0, 15.0);
+
+    httpStart([$init, httpStep('getFullSession', ['glpitimezone' => '0']), httpStep('Computer/12', $oneWayItem), $kill]);
+    $unknownTimezone = httpCall('a', 'getItem', ['Computer', 12, true]);
+    httpMetricsCheck($unknownTimezone['success'] && $unknownTimezone['item'] === $oneWayItem && $unknownTimezone['date_mod_timezone'] === '', 'A successful unnamed timezone must remain unknown for existing Both conflict handling, not become a transport failure.');
+    httpFinish('a', 4, 0, 20.0);
+
     foreach ([
         [httpStep('initSession', [], 503), 1],
         [httpStep('initSession', false, 503), 1],
@@ -155,9 +166,25 @@ namespace {
         httpFinish('a', 1, $errors, 5.0);
     }
 
-    httpStart([$init, httpStep('getFullSession', [], 503), httpStep('Computer/12', ['id' => 12]), httpStep('killSession', [], 500)]);
-    httpMetricsCheck(httpCall('a', 'getItem', ['Computer', 12])['success'], 'Timezone and cleanup HTTP errors must not change existing successful operation semantics.');
-    httpFinish('a', 4, 2, 20.0);
+    httpStart([$init, httpStep('getFullSession', [], 503), httpStep('killSession', [], 500)]);
+    $failedTimezone = httpCall('a', 'getItem', ['Computer', 12]);
+    httpMetricsCheck(!$failedTimezone['success'] && $failedTimezone['transient'] && $failedTimezone['status_code'] === 503, 'Timezone failure must preserve retry/status classification and still execute cleanup, without reading the item.');
+    httpFinish('a', 3, 2, 15.0);
+
+    foreach ([429, 503, 403, 0] as $status) {
+        foreach (['getItem', 'customHistoryDates'] as $method) {
+            httpStart([$init, httpStep('getFullSession', $status === 0 ? false : [], $status), $kill]);
+            $arguments = $method === 'getItem'
+                ? ['Computer', 12]
+                : ['Computer', 12, ['custom' => ['option_id' => '10', 'itemtype_link' => 'PluginFieldsComputerdmosasset']]];
+            $result = httpCall('a', $method, $arguments);
+            httpMetricsCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status, 'Timezone HTTP failures must preserve exact status/classification for asset/history reads, with no work request or mutation.');
+            httpFinish('a', 3, 1, 15.0);
+        }
+    }
+    httpStart([$init, httpStep('getFullSession', [], 200, 7, true), $kill]);
+    httpMetricsCheck(!httpCall('a', 'getItem', ['Computer', 12])['success'], 'A thrown timezone lookup must still execute session cleanup.');
+    httpFinish('a', 3, 1, 17.0);
 
     httpStart([$init, $timezone, httpStep('Computer/12', [], 404), httpStep('killSession', false, 500)]);
     $missing = httpCall('a', 'getItem', ['Computer', 12]);

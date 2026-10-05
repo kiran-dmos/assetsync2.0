@@ -41,6 +41,8 @@ namespace {
     use GlpiPlugin\Assetsync20\AssetSyncLink;
     use GlpiPlugin\Assetsync20\AssetSyncQueue;
     use GlpiPlugin\Assetsync20\AssetSyncService;
+    use GlpiPlugin\Assetsync20\EntitySyncRoute;
+    use GlpiPlugin\Assetsync20\FieldMapping;
     use GlpiPlugin\Assetsync20\GlpiBConnection;
     use GlpiPlugin\Assetsync20\RemoteRequestFailure;
 
@@ -312,6 +314,147 @@ namespace {
     $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key]]);
     catalogCheck(!$result['success'] && $result['transient'] && $result['status_code'] === 503, 'Permission callback must retain a transient HTTP failure, not turn it into a permanent RuntimeException.');
     catalogFinish(5, 1);
+
+    $singleGrant = catalogPage(0, 1, 1, $profilePath);
+    $singleGrant['body'] = '[{"id":1,"profiles_id":4,"plugin_fields_containers_id":1,"right":4}]';
+    foreach (['getActiveProfile', 'PluginFieldsContainer/1', 'Computer/2', 'Entity/7'] as $endpoint) {
+        foreach ([429, 503, 403, 0] as $status) {
+            $permissionSteps = [$init, $options, $definition, $active, $container, $singleGrant, $asset];
+            if ($endpoint === 'Entity/7') {
+                $recursive = $responses['PluginFieldsContainer/1'];
+                $recursive['is_recursive'] = 1;
+                $permissionSteps[4] = catalogStep('PluginFieldsContainer/1', $recursive);
+                $permissionSteps[6] = catalogStep('Computer/2', ['id' => 2, 'entities_id' => 7]);
+                $permissionSteps[] = catalogStep('Entity/7', ['id' => 7, 'entities_id' => 0]);
+            }
+            $steps = [];
+            foreach ($permissionSteps as $step) {
+                if ($step['path'] === $endpoint) {
+                    $steps[] = catalogStep($endpoint, $status === 0 ? false : [], $status);
+                    break;
+                }
+                $steps[] = $step;
+            }
+            $steps[] = $kill;
+            catalogStart($steps);
+            $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key], [$key => 'new']]);
+            catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status, 'Every noncollection permission reader must preserve transport/429/503/403 classification: ' . $endpoint);
+            catalogCheck(!in_array('PUT', CatalogCurl::$methods, true) && !in_array('POST', CatalogCurl::$methods, true), 'Failed permission reads must prevent all mutations.');
+            catalogFinish(count($steps), 1);
+        }
+    }
+    foreach ([429, 503, 403, 0] as $status) {
+        catalogStart([...$prefix, $dropdownFirst, catalogStep('PluginFieldsDepartmentfieldDropdown', $status === 0 ? false : [], $status), $kill]);
+        $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1'], [$dropdownKey => 'dropdown']]);
+        catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status && !in_array('PUT', CatalogCurl::$methods, true), 'Later dropdown failures must retain status/classification and prevent writes even after a first-page match.');
+        catalogFinish(12, 1);
+    }
+
+    // Same-container changes share a write; missing child rows still use one POST/readback.
+    $secondKey = 'Computer.PluginFieldsComputerdmosasset.notesfield';
+    $sameOptions = json_decode($options['body'], true);
+    $sameOptions[11] = ['table' => 'glpi_plugin_fields_computerdmosassets', 'field' => 'notesfield', 'pfields_type' => 'text', 'pfields_fields_id' => 2];
+    $secondDefinition = catalogStep('PluginFieldsField/2', ['id' => 2, 'name' => 'notesfield', 'type' => 'text', 'is_active' => 1, 'plugin_fields_containers_id' => 1]);
+    $changes = [$key => 'new', $secondKey => 'new notes'];
+    $written = ['namefield' => 'new', 'notesfield' => 'new notes'];
+    foreach ([false, true] as $missing) {
+        $before = ['id' => 10, 'items_id' => 2, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => 1, 'namefield' => 'old', 'notesfield' => 'old notes'];
+        $after = array_replace($before, $written);
+        $mutation = $missing
+            ? catalogStep('PluginFieldsComputerdmosasset', ['id' => 10], 201) + ['method' => 'POST', 'input' => $written + ['items_id' => 2, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => 1]]
+            : catalogStep('PluginFieldsComputerdmosasset/10') + ['method' => 'PUT', 'input' => $written];
+        catalogStart([$init, catalogStep('listSearchOptions/Computer', $sameOptions), $definition, $secondDefinition,
+            $active, $container, $singleGrant, $asset, catalogStep('Computer/2/PluginFieldsComputerdmosasset', $missing ? [] : [$before]),
+            $mutation, catalogStep('PluginFieldsComputerdmosasset/10', $after), $kill]);
+        $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, array_keys($changes), $changes, array_fill_keys(array_keys($changes), 'text'), true]);
+        catalogCheck($result['success'] && $result['item'] === $changes && count(array_filter(CatalogCurl::$methods, static fn (string $method): bool => in_array($method, ['POST', 'PUT'], true))) === 1, 'Multiple changed fields in one container must share exactly one verified mutation.');
+        catalogFinish(12);
+    }
+
+    // A second generated container repeats fresh permission reads and has its own verified write.
+    FakeItemTypes::$classResult = static fn (string $table): string => $table === 'glpi_plugin_fields_computerotherassets' ? 'PluginFieldsComputerotherasset' : 'PluginFieldsComputerdmosasset';
+    FakeItemTypes::$tableResult = static fn (string $class): string => $class === 'PluginFieldsComputerotherasset' ? 'glpi_plugin_fields_computerotherassets' : 'glpi_plugin_fields_computerdmosassets';
+    $otherKey = 'Computer.PluginFieldsComputerotherasset.notesfield';
+    $otherOptions = $sameOptions;
+    $otherOptions[11]['table'] = 'glpi_plugin_fields_computerotherassets';
+    $otherDefinition = catalogStep('PluginFieldsField/2', ['id' => 2, 'name' => 'notesfield', 'type' => 'text', 'is_active' => 1, 'plugin_fields_containers_id' => 2]);
+    $otherContainer = $responses['PluginFieldsContainer/1'];
+    $otherContainer['id'] = 2;
+    $otherGrant = catalogPage(0, 1, 1, 'PluginFieldsContainer/2/PluginFieldsProfile');
+    $otherGrant['body'] = '[{"id":2,"profiles_id":4,"plugin_fields_containers_id":2,"right":4}]';
+    $otherRow = ['id' => 20, 'items_id' => 2, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => 2, 'notesfield' => 'old notes'];
+    $otherAfter = array_replace($otherRow, ['notesfield' => 'new notes']);
+    catalogStart([$init, catalogStep('listSearchOptions/Computer', $otherOptions), $definition, $otherDefinition,
+        $active, $container, $singleGrant, $asset, $row, $put, $verified,
+        $active, catalogStep('PluginFieldsContainer/2', $otherContainer), $otherGrant, $asset,
+        catalogStep('Computer/2/PluginFieldsComputerotherasset', [$otherRow]),
+        catalogStep('PluginFieldsComputerotherasset/20') + ['method' => 'PUT', 'input' => ['notesfield' => 'new notes']],
+        catalogStep('PluginFieldsComputerotherasset/20', $otherAfter), $kill]);
+    $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key, $otherKey], [$key => 'new', $otherKey => 'new notes'], [$key => 'text', $otherKey => 'text'], true]);
+    catalogCheck($result['success'] && $result['item'] === [$key => 'new', $otherKey => 'new notes'] && count(array_filter(CatalogCurl::$methods, static fn (string $method): bool => $method === 'PUT')) === 2, 'Multiple changed containers must retain independent permission checks and readback per write.');
+    catalogFinish(19);
+    FakeItemTypes::$classResult = FakeItemTypes::$tableResult = null;
+
+    // Field definitions and persisted values remain fresh on every operation, without option caching.
+    foreach (['type', 'inactive', 'readonly', 'persist'] as $failure) {
+        catalogStart([$init, $options, $definition, $active, $container, $singleGrant, $asset, $row, $kill]);
+        $initial = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key]]);
+        catalogCheck($initial['success'], 'Initial mapped-field read must succeed before changing destination state.');
+        catalogFinish(9);
+        $changedDefinition = json_decode($definition['body'], true);
+        if ($failure === 'type') { $changedDefinition['type'] = 'number'; }
+        if ($failure === 'inactive') { $changedDefinition['is_active'] = 0; }
+        if ($failure === 'readonly') { $changedDefinition['is_readonly'] = 1; }
+        $steps = [$init, $options, catalogStep('PluginFieldsField/1', $changedDefinition)];
+        if ($failure === 'persist') {
+            $steps = [...$steps, $active, $container, $singleGrant, $asset, $row, $put,
+                catalogStep('PluginFieldsComputerdmosasset/10', array_replace($child, ['namefield' => 'old']))];
+        }
+        $steps[] = $kill;
+        catalogStart($steps);
+        $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key], [$key => 'new']]);
+        catalogCheck(!$result['success'] && !$result['transient'], 'Changed destination type/active/readonly or failed persistence must still block: ' . $failure);
+        catalogCheck(count(array_filter(CatalogCurl::$methods, static fn (string $method): bool => $method === 'PUT')) === ($failure === 'persist' ? 1 : 0), 'Validation failures must not write, and failed persistence must not replay a PUT.');
+        catalogFinish(count($steps));
+        if ($failure === 'readonly') {
+            catalogStart([$init, $options, catalogStep('PluginFieldsField/1', $changedDefinition),
+                $active, $container, $singleGrant, $asset, $row, $put, $verified, $kill]);
+            $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$key], [$key => 'new'], [$key => 'text'], true]);
+            catalogCheck($result['success'] && $result['item'][$key] === 'new', 'Explicit allowReadonly true must still permit A-owned derived writes with fresh type/active/permission/persistence checks.');
+            catalogFinish(11);
+        }
+    }
+
+    // One-way jobs cannot depend on getFullSession permission; Both failures still retry after cleanup.
+    foreach ([429, 503, null] as $status) {
+        $GLOBALS['DB'] = new FakeDB();
+        Config::$values = [];
+        AssetSyncQueue::install();
+        AssetSyncLink::install();
+        GlpiBConnection::save($connection + ['active' => true]);
+        EntitySyncRoute::save(['id' => 'both-timezone', 'glpi_b_connection_id' => 'catalog',
+            'glpi_a_source_entity_id' => '1', 'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
+        FieldMapping::save('catalog', 'Computer', [1 => ['glpi_b_field_key' => 'name', 'source_of_truth' => $status === null ? 'glpi_a' : 'both']]);
+        $GLOBALS['DB']->insert('glpi_entities', ['id' => 1, 'entities_id' => 0]);
+        $GLOBALS['DB']->insert('glpi_computers', ['id' => 101, 'entities_id' => 1, 'is_deleted' => 0,
+            'serial' => 'BOTH-TIMEZONE', 'name' => 'Local Both value', 'date_mod' => '2026-10-01 00:00:00']);
+        AssetSyncLink::save(['itemtype' => 'Computer', 'items_id' => 101, 'glpi_b_connection_id' => 'catalog',
+            'route_id' => 'both-timezone', 'remote_items_id' => 12, 'status' => AssetSyncLink::STATUS_SYNCED]);
+        $service = new AssetSyncService();
+        catalogCheck($service->queueAssetIfNeeded('Computer', 101, 'catalog'), 'Timezone fixture must enqueue.');
+        if ($status === null) {
+            catalogStart([$init, catalogStep('Computer/12', ['id' => 12, 'name' => 'Local Both value',
+                'serial' => 'BOTH-TIMEZONE', 'entities_id' => 100, 'date_mod' => '2026-10-01 00:00:00']), $kill]);
+            catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'done',
+                'A one-way job must complete using item data alone, even when getFullSession would return403; any unexpected timezone GET fails this strict transport.');
+            catalogFinish(3);
+        } else {
+            catalogStart([$init, catalogStep('getFullSession', [], $status), $kill]);
+            catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'retry'
+                && !in_array('PUT', CatalogCurl::$methods, true), 'A Both timezone 429/503 must retry without mutation and still kill the session.');
+            catalogFinish(3, 1);
+        }
+    }
 
     echo "Remote catalog pagination tests passed ($checks checks).\n";
 }
