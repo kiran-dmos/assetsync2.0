@@ -1192,7 +1192,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.5',
+    'version' => '0.1.6',
 ];
 
 foreach ($expectations as $key => $expected) {
