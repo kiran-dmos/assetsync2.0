@@ -21,6 +21,7 @@ final class AssetSyncService
     private $remoteClient;
     private ?\DateTimeImmutable $billingDate;
     private \Closure $scanClock;
+    private ?array $runMetrics = null;
 
     /**
      * @param object|string|null $remoteClient
@@ -42,23 +43,72 @@ final class AssetSyncService
 
     public function run(int $batchSize = 10, int $timeLimitSeconds = 25, bool $forceInboundRecheck = false): int
     {
+        $started = hrtime(true);
+        $this->runMetrics = [
+            'total_ms' => 0.0,
+            'queue_ms' => 0.0,
+            'scan_ms' => 0.0,
+            'examined' => 0,
+            'enqueued' => 0,
+            'jobs_attempted' => 0,
+            'jobs_succeeded' => 0,
+            'jobs_retried' => 0,
+            'jobs_blocked' => 0,
+            'jobs_skipped' => 0,
+            'jobs_write_failed' => 0,
+            'stop_reason' => 'error',
+            'scan_stop_reason' => 'not_started',
+        ];
+        GlpiBConnection::beginHttpMetrics();
         $batchSize = max(1, $batchSize);
         $deadline = time() + max(1, $timeLimitSeconds);
-        $processed = $this->processQueue($batchSize, $deadline);
-        $enqueued = 0;
-        if ($processed < $batchSize && time() < $deadline) {
-            $remaining = $batchSize - $processed;
-            $enqueued = $this->enqueueBackfill($remaining, $deadline, $forceInboundRecheck);
-            $processed += $this->processQueue($remaining, $deadline);
-        }
+        try {
+            $processed = $this->processQueue($batchSize, $deadline);
+            $enqueued = 0;
+            if ($processed < $batchSize && time() < $deadline) {
+                $remaining = $batchSize - $processed;
+                $scanStarted = hrtime(true);
+                try {
+                    $enqueued = $this->enqueueBackfill($remaining, $deadline, $forceInboundRecheck);
+                } catch (\Throwable $error) {
+                    $this->runMetrics['scan_stop_reason'] = 'error';
+                    throw $error;
+                } finally {
+                    $this->runMetrics['scan_ms'] = (hrtime(true) - $scanStarted) / 1_000_000;
+                }
+                $processed += $this->processQueue($remaining, $deadline);
+            }
 
-        return $enqueued + $processed;
+            $this->runMetrics['stop_reason'] = time() >= $deadline ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : 'no_due_jobs');
+            return $enqueued + $processed;
+        } finally {
+            $summary = $this->runMetrics;
+            $this->runMetrics = null;
+            $summary['http'] = GlpiBConnection::finishHttpMetrics();
+            $summary['jobs_unresolved'] = $summary['jobs_attempted'] - $summary['jobs_succeeded'] - $summary['jobs_retried']
+                - $summary['jobs_blocked'] - $summary['jobs_skipped'] - $summary['jobs_write_failed'];
+            $summary['queue'] = AssetSyncQueue::metricsSnapshot();
+            $summary['total_ms'] = (hrtime(true) - $started) / 1_000_000;
+            foreach (['total_ms', 'queue_ms', 'scan_ms'] as $key) {
+                $summary[$key] = round($summary[$key], 3);
+            }
+            // Reporting must not change the run result or hide its original exception.
+            try {
+                if (class_exists('\\Toolbox') && method_exists('\\Toolbox', 'logInFile')) {
+                    \Toolbox::logInFile('assetsync20', 'AssetSync2.0 run ' . json_encode($summary, JSON_THROW_ON_ERROR | JSON_INVALID_UTF8_SUBSTITUTE) . PHP_EOL);
+                }
+            } catch (\Throwable) {
+            }
+        }
     }
 
     public function enqueueBackfill(int $limit = 10, ?int $deadline = null, bool $forceInboundRecheck = false): int
     {
         $db = $this->db();
         if ($db === null || !method_exists($db, 'request')) {
+            if ($this->runMetrics !== null) {
+                $this->runMetrics['scan_stop_reason'] = 'unavailable';
+            }
             return 0;
         }
 
@@ -86,6 +136,9 @@ final class AssetSyncService
         $startIndex = $lastIndex === false ? 0 : $lastIndex + 1;
         $enqueued = 0;
         $examined = 0;
+        if ($this->runMetrics !== null) {
+            $this->runMetrics['scan_stop_reason'] = $tuples === [] ? 'no_eligible_tuples' : 'visits_complete';
+        }
 
         for ($visited = 0; $visited < min(self::MAX_SCAN_VISITS, count($tuples)); $visited++) {
             if ($enqueued >= $limit || $examined >= self::MAX_SCAN_CANDIDATES || !$this->scanHasTime($deadline, $scanDeadline)) {
@@ -111,6 +164,9 @@ final class AssetSyncService
 
                 // Count started lookups even if time runs out before preparation.
                 $examined++;
+                if ($this->runMetrics !== null) {
+                    $this->runMetrics['examined']++;
+                }
                 $itemsId = (int) ($row['id'] ?? 0);
                 if ($itemsId <= 0) {
                     continue;
@@ -124,6 +180,9 @@ final class AssetSyncService
                 $cursor = $itemsId;
                 if ($queued) {
                     $enqueued++;
+                    if ($this->runMetrics !== null) {
+                        $this->runMetrics['enqueued']++;
+                    }
                 }
             }
 
@@ -131,6 +190,15 @@ final class AssetSyncService
             $this->saveScanProgress($cursors, $tuple);
         }
 
+        if ($this->runMetrics !== null && $this->runMetrics['scan_stop_reason'] === 'visits_complete') {
+            if ($enqueued >= $limit) {
+                $this->runMetrics['scan_stop_reason'] = 'enqueue_limit';
+            } elseif ($examined >= self::MAX_SCAN_CANDIDATES) {
+                $this->runMetrics['scan_stop_reason'] = 'candidate_limit';
+            } elseif ($visited >= self::MAX_SCAN_VISITS && count($tuples) > self::MAX_SCAN_VISITS) {
+                $this->runMetrics['scan_stop_reason'] = 'visit_limit';
+            }
+        }
         return $enqueued;
     }
 
@@ -224,20 +292,30 @@ final class AssetSyncService
 
     public function processQueue(int $limit = 10, ?int $deadline = null): int
     {
+        $started = hrtime(true);
         $deadline = $deadline ?? (time() + 25);
         $processed = 0;
 
-        while ($processed < $limit && time() < $deadline) {
-            $jobs = AssetSyncQueue::claimDue(1);
-            if ($jobs === []) {
-                break;
+        try {
+            while ($processed < $limit && time() < $deadline) {
+                $jobs = AssetSyncQueue::claimDue(1);
+                if ($jobs === []) {
+                    break;
+                }
+
+                if ($this->runMetrics !== null) {
+                    $this->runMetrics['jobs_attempted']++;
+                }
+                $this->processJob($jobs[0]);
+                $processed++;
             }
 
-            $this->processJob($jobs[0]);
-            $processed++;
+            return $processed;
+        } finally {
+            if ($this->runMetrics !== null) {
+                $this->runMetrics['queue_ms'] += (hrtime(true) - $started) / 1_000_000;
+            }
         }
-
-        return $processed;
     }
 
     /**
@@ -252,6 +330,7 @@ final class AssetSyncService
         $attempts = (int) ($job['attempts'] ?? 1);
 
         if ($queueId <= 0 || $itemtype === '' || $itemsId <= 0 || $connectionId === '') {
+            $this->recordJobOutcome('skipped', true);
             return;
         }
 
@@ -263,7 +342,7 @@ final class AssetSyncService
 
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
-            AssetSyncLink::saveStatus(
+            $saved = AssetSyncLink::saveStatus(
                 $itemtype,
                 $itemsId,
                 $connectionId,
@@ -271,7 +350,8 @@ final class AssetSyncService
                 AssetSyncLink::STATUS_OUT_OF_SCOPE,
                 'The local asset no longer exists or is deleted.'
             );
-            AssetSyncQueue::finish($queueId, 'Local asset is no longer syncable.');
+            $finished = AssetSyncQueue::finish($queueId, 'Local asset is no longer syncable.');
+            $this->recordJobOutcome('skipped', $saved && $finished);
             return;
         }
 
@@ -282,7 +362,7 @@ final class AssetSyncService
         }
 
         if ($scope['status'] !== 'matched' || $scope['route'] === null) {
-            AssetSyncLink::saveStatus(
+            $saved = AssetSyncLink::saveStatus(
                 $itemtype,
                 $itemsId,
                 $connectionId,
@@ -290,7 +370,8 @@ final class AssetSyncService
                 AssetSyncLink::STATUS_OUT_OF_SCOPE,
                 'The asset is no longer in scope for this GLPI B connection.'
             );
-            AssetSyncQueue::finish($queueId, 'Asset is out of scope.');
+            $finished = AssetSyncQueue::finish($queueId, 'Asset is out of scope.');
+            $this->recordJobOutcome('skipped', $saved && $finished);
             return;
         }
 
@@ -516,7 +597,7 @@ final class AssetSyncService
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE, $error->getMessage(), $remoteItemsId);
             return;
         }
-        AssetSyncLink::save([
+        $saved = AssetSyncLink::save([
             'itemtype'             => $itemtype,
             'items_id'             => $itemsId,
             'glpi_b_connection_id' => $connectionId,
@@ -527,7 +608,8 @@ final class AssetSyncService
             'last_payload_date'    => $this->payloadDate($finalAsset),
             'last_error'           => '',
         ]);
-        AssetSyncQueue::finish($queueId, 'Asset synchronized.', $remoteItemsId);
+        $finished = AssetSyncQueue::finish($queueId, 'Asset synchronized.', $remoteItemsId);
+        $this->recordJobOutcome('succeeded', $saved && $finished);
     }
 
     /**
@@ -1424,7 +1506,7 @@ final class AssetSyncService
         $itemsId = (int) ($job['items_id'] ?? 0);
         $connectionId = (string) ($job['glpi_b_connection_id'] ?? '');
 
-        AssetSyncLink::saveStatus(
+        $saved = AssetSyncLink::saveStatus(
             $itemtype,
             $itemsId,
             $connectionId,
@@ -1435,7 +1517,8 @@ final class AssetSyncService
             (string) ($job['payload_hash'] ?? ''),
             (int) ($job['payload_epoch'] ?? 0) > 0 ? gmdate('Y-m-d H:i:s', (int) $job['payload_epoch']) : null
         );
-        AssetSyncQueue::block((int) ($job['id'] ?? 0), $message, $remoteItemsId);
+        $blocked = AssetSyncQueue::block((int) ($job['id'] ?? 0), $message, $remoteItemsId);
+        $this->recordJobOutcome('blocked', $saved && $blocked);
     }
 
     /**
@@ -1447,7 +1530,8 @@ final class AssetSyncService
         $message = (string) ($remoteResult['message'] ?? 'GLPI B request failed.');
 
         if (!empty($remoteResult['transient'])) {
-            AssetSyncQueue::retry((int) ($job['id'] ?? 0), $attempts, $message);
+            $retried = AssetSyncQueue::retry((int) ($job['id'] ?? 0), $attempts, $message);
+            $this->recordJobOutcome('retried', $retried);
             return;
         }
 
@@ -1462,12 +1546,20 @@ final class AssetSyncService
         return !empty($result['success']);
     }
 
+    private function recordJobOutcome(string $outcome, bool $written): void
+    {
+        if ($this->runMetrics !== null) {
+            $this->runMetrics[$written ? 'jobs_' . $outcome : 'jobs_write_failed']++;
+        }
+    }
+
     /**
      * @param list<mixed> $arguments
      * @return array<string,mixed>
      */
     private function callRemote(string $method, array $arguments): array
     {
+        $previousConnection = GlpiBConnection::setHttpMetricsConnection((string) ($arguments[0]['id'] ?? ''));
         try {
             if (is_string($this->remoteClient) && method_exists($this->remoteClient, $method)) {
                 $result = $this->remoteClient::$method(...$arguments);
@@ -1486,6 +1578,8 @@ final class AssetSyncService
                 'message' => 'GLPI B request failed: ' . $error->getMessage(),
                 'transient' => !($error instanceof \RuntimeException),
             ];
+        } finally {
+            GlpiBConnection::setHttpMetricsConnection($previousConnection);
         }
 
         return is_array($result) ? $result : [
@@ -1576,7 +1670,19 @@ final class AssetSyncService
 
     private function scanHasTime(int $deadline, float $scanDeadline): bool
     {
-        return time() < $deadline && ($this->scanClock)() < $scanDeadline;
+        if (time() >= $deadline) {
+            if ($this->runMetrics !== null) {
+                $this->runMetrics['scan_stop_reason'] = 'deadline';
+            }
+            return false;
+        }
+        if (($this->scanClock)() >= $scanDeadline) {
+            if ($this->runMetrics !== null) {
+                $this->runMetrics['scan_stop_reason'] = 'scan_budget';
+            }
+            return false;
+        }
+        return true;
     }
 
     /**

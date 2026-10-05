@@ -195,6 +195,90 @@ final class AssetSyncQueue
         return $claimed;
     }
 
+    /**
+     * Ages describe the current enqueue, retry eligibility, or running attempt.
+     * @return array<string,mixed>
+     */
+    public static function metricsSnapshot(): array
+    {
+        $unavailable = ['available' => false];
+        $db = self::db();
+        if ($db === null || !method_exists($db, 'doQuery') || !method_exists($db, 'fetchAssoc')) {
+            return $unavailable;
+        }
+
+        $now = time();
+        $due = self::dueSql($now);
+        $backoff = 'LEAST(3600, 60 * POW(2, LEAST(5, GREATEST(0, `attempts` - 1))))';
+        // Convert each TIMESTAMP to an epoch before fallback or aggregation.
+        $pending = 'COALESCE(NULLIF(UNIX_TIMESTAMP(`date_mod`), 0), UNIX_TIMESTAMP(`date_creation`))';
+        $finished = 'COALESCE(UNIX_TIMESTAMP(`finished_at`), 0)';
+        $retry = "CASE WHEN {$finished} > 0 THEN {$finished} + {$backoff} ELSE UNIX_TIMESTAMP(`available_at`) END";
+        $running = 'COALESCE(NULLIF(UNIX_TIMESTAMP(`started_at`), 0), UNIX_TIMESTAMP(`date_mod`))';
+        $sql = <<<SQL
+SELECT category, COUNT(*) AS count,
+       MAX(CASE WHEN age_epoch > 0 AND age_epoch <= {$now} THEN {$now} - age_epoch END) AS oldest_age_s,
+       SUM(CASE WHEN category IN ('pending', 'retry_due', 'running_reclaimable', 'running_active')
+                    AND (age_epoch IS NULL OR age_epoch <= 0 OR age_epoch > {$now}) THEN 1 ELSE 0 END) AS unknown_age
+FROM (
+    SELECT CASE
+               WHEN `status` = 'pending' THEN 'pending'
+               WHEN `status` = 'retry' AND {$due} THEN 'retry_due'
+               WHEN `status` = 'retry' THEN 'retry_waiting'
+               WHEN `status` = 'running' AND {$due} THEN 'running_reclaimable'
+               WHEN `status` = 'running' THEN 'running_active'
+               ELSE 'blocked'
+           END AS category,
+           CASE `status`
+               WHEN 'pending' THEN {$pending}
+               WHEN 'retry' THEN {$retry}
+               WHEN 'running' THEN {$running}
+           END AS age_epoch
+    FROM `glpi_plugin_assetsync20_syncqueue`
+    WHERE `status` IN ('pending', 'retry', 'running', 'blocked')
+) AS queue_metrics
+GROUP BY category
+SQL;
+
+        try {
+            $result = $db->doQuery($sql);
+            if ($result === false) {
+                return $unavailable;
+            }
+            $summary = ['available' => true];
+            $ageKeys = [
+                'pending' => 'oldest_wait_s',
+                'retry_due' => 'oldest_overdue_s',
+                'retry_waiting' => null,
+                'running_reclaimable' => 'oldest_job_age_s',
+                'running_active' => 'oldest_job_age_s',
+                'blocked' => null,
+            ];
+            foreach ($ageKeys as $category => $ageKey) {
+                $summary[$category] = ['count' => 0];
+                if ($ageKey !== null) {
+                    $summary[$category][$ageKey] = null;
+                    $summary[$category]['unknown_age'] = 0;
+                }
+            }
+            while ($row = $db->fetchAssoc($result)) {
+                $category = (string) ($row['category'] ?? '');
+                if (!array_key_exists($category, $ageKeys)) {
+                    return $unavailable;
+                }
+                $summary[$category]['count'] = (int) $row['count'];
+                $ageKey = $ageKeys[$category];
+                if ($ageKey !== null) {
+                    $summary[$category][$ageKey] = $row['oldest_age_s'] === null ? null : (int) $row['oldest_age_s'];
+                    $summary[$category]['unknown_age'] = (int) $row['unknown_age'];
+                }
+            }
+            return $summary;
+        } catch (\Throwable) {
+            return $unavailable;
+        }
+    }
+
     public static function finish(int $id, string $message = '', ?int $remoteItemsId = null): bool
     {
         return self::updateStatus($id, self::STATUS_DONE, null, $message, $remoteItemsId);

@@ -155,6 +155,8 @@ final class FakeDB
     public ?Closure $afterRequest = null;
     public ?Closure $afterInsert = null;
     public ?Closure $afterTableExists = null;
+    public ?Closure $queryResult = null;
+    public ?Closure $beforeUpdate = null;
 
     public function guessTimezone(): string
     {
@@ -173,6 +175,12 @@ final class FakeDB
 
     public function doQuery(string $sql)
     {
+        if ($this->queryResult !== null) {
+            $result = ($this->queryResult)($sql);
+            if ($result !== null) {
+                return $result;
+            }
+        }
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return [['session_timezone' => $this->guessTimezone()]];
         }
@@ -208,8 +216,11 @@ final class FakeDB
         return true;
     }
 
-    public function fetchAssoc(array $rows): ?array
+    public function fetchAssoc($rows): ?array
     {
+        if ($rows instanceof PDOStatement) {
+            return $rows->fetch(PDO::FETCH_ASSOC) ?: null;
+        }
         return $rows[0] ?? null;
     }
 
@@ -246,6 +257,9 @@ final class FakeDB
      */
     public function update(string $table, array $params, array $where): bool
     {
+        if ($this->beforeUpdate !== null && ($this->beforeUpdate)($table, $params, $where) === false) {
+            return false;
+        }
         $params = $this->resolveExpressions($params);
         $this->affectedRows = 0;
         foreach ($this->tables[$table] ?? [] as $index => $row) {

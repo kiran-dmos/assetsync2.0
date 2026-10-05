@@ -10,6 +10,35 @@ final class GlpiBConnection
     private const CONNECTIONS_KEY = 'glpib_connections';
     private const CUSTOM_HISTORY_RANGE = '0-20';
     private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
+    private static ?array $httpMetrics = null;
+    private static ?string $httpMetricsConnection = null;
+
+    public static function beginHttpMetrics(): void
+    {
+        self::$httpMetrics = [];
+        self::$httpMetricsConnection = null;
+    }
+
+    public static function setHttpMetricsConnection(?string $connectionId): ?string
+    {
+        $previous = self::$httpMetricsConnection;
+        if (self::$httpMetrics !== null) {
+            self::$httpMetricsConnection = $connectionId;
+        }
+        return $previous;
+    }
+
+    public static function finishHttpMetrics(): array
+    {
+        $metrics = self::$httpMetrics ?? [];
+        self::$httpMetrics = null;
+        self::$httpMetricsConnection = null;
+        foreach ($metrics as &$connection) {
+            $connection['latency_ms'] = round($connection['latency_ms'], 3);
+        }
+        unset($connection);
+        return $metrics;
+    }
 
     private const OLD_KEYS = [
         'glpib_name'       => '',
@@ -1568,10 +1597,30 @@ final class GlpiBConnection
             curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($payload, JSON_THROW_ON_ERROR));
         }
 
-        $rawBody = curl_exec($curl);
-        $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-        $error = curl_error($curl);
-        curl_close($curl);
+        $started = hrtime(true);
+        $rawBody = false;
+        $statusCode = 0;
+        try {
+            try {
+                $rawBody = curl_exec($curl);
+            } finally {
+                $latencyMs = (hrtime(true) - $started) / 1_000_000;
+            }
+            $statusCode = (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+            $error = curl_error($curl);
+        } finally {
+            $connectionId = self::$httpMetricsConnection;
+            if (self::$httpMetrics !== null && $connectionId !== null && $connectionId !== '') {
+                self::$httpMetrics[$connectionId] ??= ['requests' => 0, 'errors' => 0, 'latency_ms' => 0.0];
+                self::$httpMetrics[$connectionId]['requests']++;
+                // Each executed request contributes at most one transport/non-2xx error.
+                if ($rawBody === false || $statusCode < 200 || $statusCode >= 300) {
+                    self::$httpMetrics[$connectionId]['errors']++;
+                }
+                self::$httpMetrics[$connectionId]['latency_ms'] += $latencyMs;
+            }
+            curl_close($curl);
+        }
 
         if ($rawBody === false) {
             return [
