@@ -151,6 +151,10 @@ final class FakeDB
     private array $nextIds = [];
     private int $affectedRows = 0;
     public string $timezone = '';
+    public array $requests = [];
+    public ?Closure $afterRequest = null;
+    public ?Closure $afterInsert = null;
+    public ?Closure $afterTableExists = null;
 
     public function guessTimezone(): string
     {
@@ -159,7 +163,12 @@ final class FakeDB
 
     public function tableExists(string $table): bool
     {
-        return array_key_exists($table, $this->tables);
+        $exists = array_key_exists($table, $this->tables);
+        if ($this->afterTableExists !== null) {
+            ($this->afterTableExists)($table);
+        }
+
+        return $exists;
     }
 
     public function doQuery(string $sql)
@@ -224,6 +233,9 @@ final class FakeDB
         }
 
         $this->tables[$table][] = $params;
+        if ($this->afterInsert !== null) {
+            ($this->afterInsert)($table, $params);
+        }
 
         return true;
     }
@@ -256,6 +268,7 @@ final class FakeDB
      */
     public function request(array $query): FakeDBResult
     {
+        $this->requests[] = $query;
         $table = (string) ($query['FROM'] ?? '');
         $rows = array_values($this->tables[$table] ?? []);
         $where = is_array($query['WHERE'] ?? null) ? $query['WHERE'] : [];
@@ -290,6 +303,10 @@ final class FakeDB
                 }
                 return $result;
             }, $filtered);
+        }
+
+        if ($this->afterRequest !== null) {
+            ($this->afterRequest)($query);
         }
 
         return new FakeDBResult($filtered);
@@ -1187,6 +1204,10 @@ require_once dirname(__DIR__) . '/setup.php';
 require_once dirname(__DIR__) . '/hook.php';
 plugin_init_assetsync20();
 
+if ($smokeBootstrapOnly ?? false) {
+    return;
+}
+
 $metadata = plugin_version_assetsync20();
 
 $expectations = [
@@ -2026,8 +2047,17 @@ if (($secondForcedAsset['name'] ?? '') !== 'Manual Local 507' || hasPendingProdu
     throw new RuntimeException('Manual force backfill should not exceed the configured batch limit.');
 }
 
-$syncService->run(1, 25, true);
-$secondForcedAsset = $DB->firstRow('glpi_computers', ['id' => 507]);
+$rotationVisits = array_sum(array_map(
+    static fn (array $route): int => count($route['asset_types']),
+    \GlpiPlugin\Assetsync20\EntitySyncRoute::loadAll()
+));
+for ($attempt = 0; $attempt < $rotationVisits; $attempt++) {
+    $syncService->run(1, 25, true);
+    $secondForcedAsset = $DB->firstRow('glpi_computers', ['id' => 507]);
+    if (($secondForcedAsset['name'] ?? '') === 'Manual Remote 507') {
+        break;
+    }
+}
 
 if (($secondForcedAsset['name'] ?? '') !== 'Manual Remote 507') {
     throw new RuntimeException('Manual force backfill should pick up the next inbound asset on a later bounded run.');
@@ -3260,6 +3290,8 @@ if ($queueService->run(1) !== 2
 $GLOBALS['DB'] = $mainDb;
 Config::$values = $mainConfig;
 
+require __DIR__ . '/backfill-budgets.php';
+
 Config::$values = [
     'plugin:assetsync20' => [
         'glpib_name' => 'Legacy GLPI B',
@@ -3267,6 +3299,8 @@ Config::$values = [
         'glpib_app_token' => (new GLPIKey())->encrypt('legacy-app-secret'),
         'glpib_user_token' => (new GLPIKey())->encrypt('legacy-user-secret'),
         'glpib_active' => '1',
+        'asset_sync_scan_cursors' => '{"old-route:Computer":"5"}',
+        'asset_sync_scan_last_visited' => '["old-connection","old-route","Computer"]',
     ],
 ];
 
@@ -3292,7 +3326,7 @@ if (!plugin_assetsync20_uninstall()) {
 
 $remainingValues = Config::getConfigurationValues('plugin:assetsync20');
 
-foreach (['glpib_connections', 'field_mappings', 'entity_sync_routes', 'asset_sync_scan_cursors', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
+foreach (['glpib_connections', 'field_mappings', 'entity_sync_routes', 'asset_sync_scan_cursors', 'asset_sync_scan_last_visited', 'glpib_name', 'glpib_base_url', 'glpib_app_token', 'glpib_user_token', 'glpib_active'] as $deletedKey) {
     if (array_key_exists($deletedKey, $remainingValues)) {
         throw new RuntimeException('Uninstall should delete ' . $deletedKey . '.');
     }

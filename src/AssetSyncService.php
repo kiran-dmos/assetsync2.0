@@ -8,6 +8,11 @@ final class AssetSyncService
 {
     private const SCAN_CONTEXT = 'plugin:assetsync20';
     private const SCAN_CURSORS_KEY = 'asset_sync_scan_cursors';
+    private const SCAN_LAST_VISITED_KEY = 'asset_sync_scan_last_visited';
+    private const MAX_SCAN_CANDIDATES = 50;
+    private const MAX_SCAN_VISITS = 10;
+    private const MAX_VISIT_CANDIDATES = 5;
+    private const SCAN_SECONDS = 2;
     private const MAX_ROUTE_ENTITY_IDS = 1000;
     private const INBOUND_RECHECK_SECONDS = 3600;
     private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
@@ -15,20 +20,23 @@ final class AssetSyncService
     /** @var object|string */
     private $remoteClient;
     private ?\DateTimeImmutable $billingDate;
+    private \Closure $scanClock;
 
     /**
      * @param object|string|null $remoteClient
+     * @param callable():float|null $scanClock Monotonic seconds, injectable for scan tests.
      */
-    public function __construct($remoteClient = null, ?\DateTimeImmutable $billingDate = null)
+    public function __construct($remoteClient = null, ?\DateTimeImmutable $billingDate = null, ?callable $scanClock = null)
     {
         $this->remoteClient = $remoteClient ?? GlpiBConnection::class;
         $this->billingDate = $billingDate;
+        $this->scanClock = \Closure::fromCallable($scanClock ?? static fn (): float => hrtime(true) / 1_000_000_000);
     }
 
     public static function uninstall(): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY]);
+            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY]);
         }
     }
 
@@ -56,52 +64,71 @@ final class AssetSyncService
 
         $limit = max(1, $limit);
         $deadline = $deadline ?? (time() + 25);
+        $scanDeadline = ($this->scanClock)() + min(self::SCAN_SECONDS, max(0, $deadline - time()));
         $connections = $this->activeConnectionsById();
         $cursors = $this->loadScanCursors();
-        $enqueued = 0;
-
+        $pairs = [];
         foreach (EntitySyncRoute::loadAll() as $route) {
-            if ($enqueued >= $limit || time() >= $deadline) {
-                break;
-            }
-
             if (!$route['active'] || !isset($connections[$route['glpi_b_connection_id']])) {
                 continue;
             }
 
             foreach ($route['asset_types'] as $itemtype) {
-                if ($enqueued >= $limit || time() >= $deadline) {
+                $tuple = json_encode([$route['glpi_b_connection_id'], $route['id'], $itemtype], JSON_THROW_ON_ERROR);
+                $pairs[$tuple] = ['route' => $route, 'itemtype' => $itemtype];
+            }
+        }
+
+        // Tuple keys give a stable order and keep duplicate tuples to one visit.
+        ksort($pairs, SORT_STRING);
+        $tuples = array_keys($pairs);
+        $lastIndex = array_search($this->loadLastScanVisit(), $tuples, true);
+        $startIndex = $lastIndex === false ? 0 : $lastIndex + 1;
+        $enqueued = 0;
+        $examined = 0;
+
+        for ($visited = 0; $visited < min(self::MAX_SCAN_VISITS, count($tuples)); $visited++) {
+            if ($enqueued >= $limit || $examined >= self::MAX_SCAN_CANDIDATES || !$this->scanHasTime($deadline, $scanDeadline)) {
+                break;
+            }
+
+            $tuple = $tuples[($startIndex + $visited) % count($tuples)];
+            $route = $pairs[$tuple]['route'];
+            $itemtype = $pairs[$tuple]['itemtype'];
+            $cursorKey = $route['id'] . ':' . $itemtype;
+            $cursor = max(0, (int) ($cursors[$cursorKey] ?? 0));
+            $queryLimit = min(self::MAX_VISIT_CANDIDATES, self::MAX_SCAN_CANDIDATES - $examined, $limit - $enqueued);
+            $rows = $this->routeAssetRows($route, $itemtype, $cursor, $queryLimit, $deadline, $scanDeadline);
+
+            if ($rows === [] && $cursor > 0 && $this->scanHasTime($deadline, $scanDeadline)) {
+                $rows = $this->routeAssetRows($route, $itemtype, 0, $queryLimit, $deadline, $scanDeadline);
+            }
+
+            foreach ($rows as $row) {
+                if ($enqueued >= $limit || $examined >= self::MAX_SCAN_CANDIDATES || !$this->scanHasTime($deadline, $scanDeadline)) {
                     break;
                 }
 
-                $cursorKey = $route['id'] . ':' . $itemtype;
-                $cursor = (int) ($cursors[$cursorKey] ?? 0);
-                $rows = $this->routeAssetRows($route, $itemtype, $cursor, $limit - $enqueued);
-
-                if ($rows === [] && $cursor > 0) {
-                    $cursor = 0;
-                    $rows = $this->routeAssetRows($route, $itemtype, $cursor, $limit - $enqueued);
+                // Count started lookups even if time runs out before preparation.
+                $examined++;
+                $itemsId = (int) ($row['id'] ?? 0);
+                if ($itemsId <= 0) {
+                    continue;
                 }
 
-                foreach ($rows as $row) {
-                    if ($enqueued >= $limit || time() >= $deadline) {
-                        break;
-                    }
-
-                    $itemsId = (int) ($row['id'] ?? 0);
-                    if ($itemsId <= 0) {
-                        continue;
-                    }
-
-                    $cursor = $itemsId;
-                    if ($this->queueAssetIfNeeded($itemtype, $itemsId, $route['glpi_b_connection_id'], $forceInboundRecheck)) {
-                        $enqueued++;
-                    }
+                $queued = $this->prepareAndQueueAsset($itemtype, $itemsId, $route['glpi_b_connection_id'], $forceInboundRecheck, $deadline, $scanDeadline);
+                if ($queued === null) {
+                    break;
                 }
 
-                $cursors[$cursorKey] = (string) $cursor;
-                $this->saveScanCursors($cursors);
+                $cursor = $itemsId;
+                if ($queued) {
+                    $enqueued++;
+                }
             }
+
+            $cursors[$cursorKey] = (string) $cursor;
+            $this->saveScanProgress($cursors, $tuple);
         }
 
         return $enqueued;
@@ -109,9 +136,19 @@ final class AssetSyncService
 
     public function queueAssetIfNeeded(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck = false): bool
     {
+        return $this->prepareAndQueueAsset($itemtype, $itemsId, $connectionId, $forceInboundRecheck) ?? false;
+    }
+
+    // A scan stopped before preparation returns null, leaving its asset cursor unchanged.
+    private function prepareAndQueueAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline = null, ?float $scanDeadline = null): ?bool
+    {
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
             return false;
+        }
+
+        if ($deadline !== null && $scanDeadline !== null && !$this->scanHasTime($deadline, $scanDeadline)) {
+            return null;
         }
 
         $scope = $this->resolveScope($itemtype, $asset, $connectionId);
@@ -132,6 +169,10 @@ final class AssetSyncService
         }
 
         $route = $scope['route'];
+        if ($deadline !== null && $scanDeadline !== null && !$this->scanHasTime($deadline, $scanDeadline)) {
+            return null;
+        }
+
         try {
             $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
             $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
@@ -589,7 +630,7 @@ final class AssetSyncService
      * @param array<string,mixed> $route
      * @return list<array<string,mixed>>
      */
-    private function routeAssetRows(array $route, string $itemtype, int $afterId, int $limit): array
+    private function routeAssetRows(array $route, string $itemtype, int $afterId, int $limit, int $deadline, float $scanDeadline): array
     {
         $db = $this->db();
         if ($db === null || !method_exists($db, 'request')) {
@@ -601,8 +642,8 @@ final class AssetSyncService
             return [];
         }
 
-        $entityIds = $this->routeEntityIds($route);
-        if ($entityIds === []) {
+        $entityIds = $this->routeEntityIds($route, $deadline, $scanDeadline);
+        if ($entityIds === [] || !$this->scanHasTime($deadline, $scanDeadline)) {
             return [];
         }
 
@@ -633,7 +674,7 @@ final class AssetSyncService
      * @param array<string,mixed> $route
      * @return list<string>
      */
-    private function routeEntityIds(array $route): array
+    private function routeEntityIds(array $route, int $deadline, float $scanDeadline): array
     {
         $sourceEntityId = trim((string) ($route['glpi_a_source_entity_id'] ?? ''));
         if ($sourceEntityId === '') {
@@ -653,7 +694,7 @@ final class AssetSyncService
         $seen = [$sourceEntityId => true];
         $queue = [$sourceEntityId];
 
-        while ($queue !== [] && count($entityIds) < self::MAX_ROUTE_ENTITY_IDS) {
+        while ($queue !== [] && count($entityIds) < self::MAX_ROUTE_ENTITY_IDS && $this->scanHasTime($deadline, $scanDeadline)) {
             $parentId = array_shift($queue);
             $rows = $db->request([
                 'SELECT' => ['id'],
@@ -1502,13 +1543,40 @@ final class AssetSyncService
     /**
      * @param array<string,string> $cursors
      */
-    private function saveScanCursors(array $cursors): void
+    private function saveScanProgress(array $cursors, string $tuple): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
             \Config::setConfigurationValues(self::SCAN_CONTEXT, [
                 self::SCAN_CURSORS_KEY => json_encode($cursors, JSON_THROW_ON_ERROR),
+                self::SCAN_LAST_VISITED_KEY => $tuple,
             ]);
         }
+    }
+
+    private function loadLastScanVisit(): ?string
+    {
+        if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
+            return null;
+        }
+
+        $values = \Config::getConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_LAST_VISITED_KEY]);
+        $json = $values[self::SCAN_LAST_VISITED_KEY] ?? null;
+        $tuple = is_string($json) ? json_decode($json, true) : null;
+        if (!is_array($tuple) || !array_is_list($tuple) || count($tuple) !== 3) {
+            return null;
+        }
+        foreach ($tuple as $value) {
+            if (!is_string($value) || $value === '') {
+                return null;
+            }
+        }
+
+        return json_encode($tuple, JSON_THROW_ON_ERROR);
+    }
+
+    private function scanHasTime(int $deadline, float $scanDeadline): bool
+    {
+        return time() < $deadline && ($this->scanClock)() < $scanDeadline;
     }
 
     /**
