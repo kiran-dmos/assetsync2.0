@@ -9,6 +9,7 @@ final class AssetSyncService
     private const SCAN_CONTEXT = 'plugin:assetsync20';
     private const SCAN_CURSORS_KEY = 'asset_sync_scan_cursors';
     private const SCAN_LAST_VISITED_KEY = 'asset_sync_scan_last_visited';
+    private const QUEUE_LAST_VISITED_KEY = 'asset_sync_queue_last_visited';
     private const MAX_SCAN_CANDIDATES = 50;
     private const MAX_SCAN_VISITS = 10;
     private const MAX_VISIT_CANDIDATES = 5;
@@ -37,7 +38,7 @@ final class AssetSyncService
     public static function uninstall(): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY]);
+            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY, self::QUEUE_LAST_VISITED_KEY]);
         }
     }
 
@@ -62,26 +63,46 @@ final class AssetSyncService
         GlpiBConnection::beginHttpMetrics();
         $batchSize = max(1, $batchSize);
         $deadline = time() + max(1, $timeLimitSeconds);
+        $db = $this->db();
+        $locked = false;
         try {
+            // Shared Config cursors need one run at a time, without waiting on another cron.
+            $lockResult = null;
+            if ($db !== null && method_exists($db, 'doQuery') && method_exists($db, 'fetchAssoc')) {
+                try {
+                    $result = $db->doQuery("SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired");
+                    $lockResult = $result === false ? null : $db->fetchAssoc($result);
+                } catch (\Throwable) {
+                }
+            }
+            $acquired = is_array($lockResult) ? ($lockResult['acquired'] ?? null) : null;
+            if (!in_array($acquired, [1, '1'], true)) {
+                $this->runMetrics['stop_reason'] = in_array($acquired, [0, '0'], true) ? 'lock_busy' : 'lock_unavailable';
+                return 0;
+            }
+            $locked = true;
             GlpiBConnection::beginRunCache();
             EntitySyncRoute::beginRunCache();
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
-            $processed = $this->processQueue($batchSize, $deadline);
+            // Reserve up to two seconds for scanning when the run has time to spare.
+            $queueDeadline = $deadline - min(self::SCAN_SECONDS, max(0, $deadline - time() - 1));
+            $processed = $this->processQueue(1, $queueDeadline);
             $enqueued = 0;
-            if ($processed < $batchSize && time() < $deadline) {
-                $remaining = $batchSize - $processed;
+            if (time() < $deadline) {
                 $scanStarted = hrtime(true);
                 try {
-                    $enqueued = $this->enqueueBackfill($remaining, $deadline, $forceInboundRecheck);
+                    $enqueued = $this->enqueueBackfill($batchSize, $deadline, $forceInboundRecheck);
                 } catch (\Throwable $error) {
                     $this->runMetrics['scan_stop_reason'] = 'error';
                     throw $error;
                 } finally {
                     $this->runMetrics['scan_ms'] = (hrtime(true) - $scanStarted) / 1_000_000;
                 }
-                $processed += $this->processQueue($remaining, $deadline);
+            }
+            if ($processed < $batchSize && time() < $deadline) {
+                $processed += $this->processQueue($batchSize - $processed, $deadline);
             }
 
             $this->runMetrics['stop_reason'] = time() >= $deadline ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : 'no_due_jobs');
@@ -92,6 +113,13 @@ final class AssetSyncService
             FieldMapping::endRunCache();
             BillingFieldConfig::endRunCache();
             FieldsText::endRunCache();
+            if ($locked) {
+                try {
+                    $db->doQuery("SELECT RELEASE_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE()))) AS released");
+                } catch (\Throwable) {
+                    // Lock cleanup must not hide a processing exception or change its result.
+                }
+            }
             $summary = $this->runMetrics;
             $this->runMetrics = null;
             $summary['http'] = GlpiBConnection::finishHttpMetrics();
@@ -307,17 +335,43 @@ final class AssetSyncService
         $processed = 0;
 
         try {
-            while ($processed < $limit && time() < $deadline) {
-                $jobs = AssetSyncQueue::claimDue(1);
-                if ($jobs === []) {
-                    break;
+            if ($limit <= 0 || time() >= $deadline) {
+                return 0;
+            }
+            $connectionIds = AssetSyncQueue::dueConnectionIds();
+            $lastVisited = $this->loadLastQueueVisit();
+            $lastIndex = array_search($lastVisited, $connectionIds, true);
+            $startIndex = 0;
+            if ($lastIndex !== false) {
+                $startIndex = $lastIndex + 1;
+            } elseif ($lastVisited !== null) {
+                // Keep moving when the last visited connection has drained or was removed.
+                foreach ($connectionIds as $index => $connectionId) {
+                    if (strcmp($connectionId, $lastVisited) > 0) {
+                        $startIndex = $index;
+                        break;
+                    }
                 }
+            }
+            $connectionIds = array_merge(array_slice($connectionIds, $startIndex), array_slice($connectionIds, 0, $startIndex));
+            while ($connectionIds !== [] && $processed < $limit && time() < $deadline) {
+                foreach ($connectionIds as $index => $connectionId) {
+                    if ($processed >= $limit || time() >= $deadline) {
+                        break;
+                    }
+                    $this->saveLastQueueVisit($connectionId);
+                    $jobs = AssetSyncQueue::claimDue(1, $connectionId);
+                    if ($jobs === []) {
+                        unset($connectionIds[$index]);
+                        continue;
+                    }
 
-                if ($this->runMetrics !== null) {
-                    $this->runMetrics['jobs_attempted']++;
+                    if ($this->runMetrics !== null) {
+                        $this->runMetrics['jobs_attempted']++;
+                    }
+                    $this->processJob($jobs[0]);
+                    $processed++;
                 }
-                $this->processJob($jobs[0]);
-                $processed++;
             }
 
             return $processed;
@@ -1642,6 +1696,23 @@ final class AssetSyncService
         }
 
         return $cursors;
+    }
+
+    private function loadLastQueueVisit(): ?string
+    {
+        if (!class_exists('\Config') || !method_exists('\Config', 'getConfigurationValues')) {
+            return null;
+        }
+        $values = \Config::getConfigurationValues(self::SCAN_CONTEXT, [self::QUEUE_LAST_VISITED_KEY]);
+        $id = $values[self::QUEUE_LAST_VISITED_KEY] ?? null;
+        return is_string($id) ? $id : null;
+    }
+
+    private function saveLastQueueVisit(string $connectionId): void
+    {
+        if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
+            \Config::setConfigurationValues(self::SCAN_CONTEXT, [self::QUEUE_LAST_VISITED_KEY => $connectionId]);
+        }
     }
 
     /**

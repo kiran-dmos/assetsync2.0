@@ -135,7 +135,7 @@ namespace {
     $service->queueAssetIfNeeded('Computer', 101, 'metrics');
     runMetricsCheck($service->run(1) === 1, 'A full queue batch must retain its return value.');
     $summary = runMetricsSummary();
-    runMetricsCheck($summary['examined'] === 0 && $summary['enqueued'] === 0 && $summary['scan_ms'] === 0 && $summary['scan_stop_reason'] === 'not_started', 'A full queue batch must skip backfill.');
+    runMetricsCheck($summary['examined'] === 1 && $summary['enqueued'] === 0 && (float) $summary['scan_ms'] === 1.0 && $summary['scan_stop_reason'] === 'visits_complete', 'A full queue batch must still report bounded backfill progress.');
 
     $remote = new class {
         public function searchBySerial(array $connection, string $itemtype, string $serial): array
@@ -157,7 +157,7 @@ namespace {
     foreach (range(101, 105) as $id) {
         AssetSyncQueue::enqueue('Computer', $id, 'metrics', 'route-01', 'hash', null);
     }
-    runMetricsCheck($service->run(5) === 5, 'Mixed outcomes must still consume the queue batch.');
+    runMetricsCheck($service->run(5) === 7, 'Mixed outcomes must consume the queue batch and report the two freshly prepared scan enqueues.');
     $summary = runMetricsSummary();
     runMetricsCheck($summary['jobs_attempted'] === 5 && $summary['jobs_succeeded'] === 1 && $summary['jobs_retried'] === 1 && $summary['jobs_blocked'] === 1 && $summary['jobs_skipped'] === 2, 'Success, retry, block and out-of-scope exits must be counted accurately.');
     runMetricsCheck(array_column($GLOBALS['DB']->tables[AssetSyncQueue::TABLE], 'status') === ['done', 'retry', 'blocked', 'done', 'done'], 'Observation must preserve job transitions.');

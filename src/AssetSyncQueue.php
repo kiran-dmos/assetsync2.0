@@ -109,17 +109,55 @@ final class AssetSyncQueue
             return AssetSyncDbTime::write($db, static fn (): bool => $db->insert(self::TABLE, $fields));
         }
 
-        if (!method_exists($db, 'update')) {
+        if (!method_exists($db, 'update') || !method_exists($db, 'affectedRows')) {
             return false;
         }
 
-        return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, ['id' => (int) $existing['id']]));
+        $affectedRows = 0;
+        $updated = AssetSyncDbTime::write($db, static function () use ($db, $fields, $existing, &$affectedRows): bool {
+            // Do not replace preparation that another worker has already claimed or changed.
+            $written = $db->update(self::TABLE, $fields, [
+                'id'           => (int) $existing['id'],
+                'status'       => (string) ($existing['status'] ?? ''),
+                'attempts'     => (int) ($existing['attempts'] ?? 0),
+                'route_id'     => (string) ($existing['route_id'] ?? ''),
+                'payload_hash' => (string) ($existing['payload_hash'] ?? ''),
+            ]);
+            if ($written) {
+                $affectedRows = $db->affectedRows();
+            }
+            return $written;
+        });
+        return $updated && $affectedRows === 1;
+    }
+
+    /** @return list<string> */
+    public static function dueConnectionIds(): array
+    {
+        $db = self::db();
+        if ($db === null || !method_exists($db, 'request')) {
+            return [];
+        }
+        $rows = $db->request([
+            'SELECT' => ['glpi_b_connection_id'],
+            'FROM' => self::TABLE,
+            'WHERE' => [new \Glpi\DBAL\QueryExpression(self::dueSql(time()))],
+            'GROUPBY' => 'glpi_b_connection_id',
+            'ORDER' => new \Glpi\DBAL\QueryExpression('CAST(glpi_b_connection_id AS BINARY) ASC'),
+        ]);
+        $ids = [];
+        foreach ($rows as $row) {
+            if (is_array($row) && isset($row['glpi_b_connection_id'])) {
+                $ids[] = (string) $row['glpi_b_connection_id'];
+            }
+        }
+        return $ids;
     }
 
     /**
      * @return list<array<string,mixed>>
      */
-    public static function claimDue(int $limit): array
+    public static function claimDue(int $limit, ?string $connectionId = null): array
     {
         $db = self::db();
         if ($db === null || !method_exists($db, 'request') || !method_exists($db, 'update') || !method_exists($db, 'affectedRows')) {
@@ -128,6 +166,10 @@ final class AssetSyncQueue
 
         $limit = max(1, $limit);
         $now = time();
+        $where = [new \Glpi\DBAL\QueryExpression(self::dueSql($now))];
+        if ($connectionId !== null) {
+            $where['glpi_b_connection_id'] = $connectionId;
+        }
         $rows = $db->request([
             'SELECT' => [
                 '*',
@@ -138,7 +180,7 @@ final class AssetSyncQueue
                 new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch'),
             ],
             'FROM'  => self::TABLE,
-            'WHERE' => [new \Glpi\DBAL\QueryExpression(self::dueSql($now))],
+            'WHERE' => $where,
             'ORDER' => 'id ASC',
             'LIMIT' => max(50, $limit * 5),
         ]);

@@ -415,17 +415,17 @@ try {
     $service = backfillSetup(2, 5);
     backfillCheck($service->queueAssetIfNeeded('Computer', 101, 'scan'), 'Queue-first setup must enqueue existing work.');
     $GLOBALS['DB']->requests = [];
-    backfillCheck($service->run(3) === 5, 'A partial queue batch must return enqueued plus processed volume.');
-    backfillCheck(array_column(backfillQueries(), 'LIMIT') === [2, 1], 'Backfill queries must use only the batch allowance left after queue processing.');
+    backfillCheck($service->run(3) === 6, 'A partial queue batch must return independently bounded enqueued plus processed volume.');
+    backfillCheck(array_column(backfillQueries(), 'LIMIT') === [3, 1], 'Backfill queries must retain the full batch enqueue allowance after one existing job.');
     $jobs = $GLOBALS['DB']->tables[AssetSyncQueue::TABLE];
-    backfillCheck(array_column($jobs, 'items_id') === [101, 102, 201] && array_column($jobs, 'status') === ['done', 'done', 'done'], 'Queue-first partial batches must process new jobs in the same run without exceeding the processing cap.');
+    backfillCheck(array_column($jobs, 'items_id') === [101, 102, 103, 201] && array_column($jobs, 'status') === ['done', 'done', 'done', 'pending'], 'Queue-first partial batches must process new jobs in the same run without exceeding the processing cap.');
 
     $service = backfillSetup(2, 3);
     $service->queueAssetIfNeeded('Computer', 101, 'scan');
     $service->queueAssetIfNeeded('Computer', 102, 'scan');
     Config::setConfigurationValues('plugin:assetsync20', ['asset_sync_scan_last_visited' => '["scan","route-02","Computer"]']);
     $GLOBALS['DB']->requests = [];
-    backfillCheck($service->run(1) === 1 && backfillQueries() === [] && backfillLastVisit() === ['scan', 'route-02', 'Computer'], 'A full queue batch must not scan or change rotation state.');
+    backfillCheck($service->run(1) === 2 && count(backfillQueries()) === 2 && backfillCursor('route-01') === '101' && backfillCursor('route-02') === '201', 'A full queue batch must still advance bounded scan cursors and enqueue allowance.');
     backfillCheck(backfillJob(102)['status'] === 'pending', 'The full queue batch must leave excess queue jobs pending.');
 
     $now = 0.0;
@@ -440,7 +440,7 @@ try {
 
     Config::setConfigurationValues('plugin:assetsync20', ['unrelated' => 'keep']);
     AssetSyncService::uninstall();
-    backfillCheck(!isset(Config::$values['plugin:assetsync20']['asset_sync_scan_cursors']) && !isset(Config::$values['plugin:assetsync20']['asset_sync_scan_last_visited']), 'Service uninstall must delete both scan Config keys.');
+    backfillCheck(!isset(Config::$values['plugin:assetsync20']['asset_sync_scan_cursors']) && !isset(Config::$values['plugin:assetsync20']['asset_sync_scan_last_visited']) && !isset(Config::$values['plugin:assetsync20']['asset_sync_queue_last_visited']), 'Service uninstall must delete scan and queue rotation Config keys.');
     backfillCheck(Config::$values['plugin:assetsync20']['unrelated'] === 'keep', 'Service uninstall must preserve unrelated Config values.');
 } finally {
     $GLOBALS['DB'] = $backfillMainDb;

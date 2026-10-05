@@ -173,6 +173,9 @@ final class FakeDB
     public ?Closure $afterTableExists = null;
     public ?Closure $queryResult = null;
     public ?Closure $beforeUpdate = null;
+    public array $sqlQueries = [];
+    public ?int $runLockResult = 1;
+    public bool $runLockHeld = false;
 
     public function guessTimezone(): string
     {
@@ -191,6 +194,7 @@ final class FakeDB
 
     public function doQuery(string $sql)
     {
+        $this->sqlQueries[] = $sql;
         if ($this->queryResult !== null) {
             $result = ($this->queryResult)($sql);
             if ($result !== null) {
@@ -199,6 +203,18 @@ final class FakeDB
         }
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return [['session_timezone' => $this->guessTimezone()]];
+        }
+        if ($sql === "SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired") {
+            $acquired = $this->runLockHeld ? 0 : $this->runLockResult;
+            if ($acquired === 1) {
+                $this->runLockHeld = true;
+            }
+            return [['acquired' => $acquired]];
+        }
+        if ($sql === "SELECT RELEASE_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE()))) AS released") {
+            $released = $this->runLockHeld ? 1 : null;
+            $this->runLockHeld = false;
+            return [['released' => $released]];
         }
 
         if (preg_match("/^SET SESSION time_zone = '([^']+)'$/", $sql, $match)) {
@@ -310,8 +326,22 @@ final class FakeDB
             }
         }
 
+        if (isset($query['GROUPBY'])) {
+            $groups = [];
+            foreach ($filtered as $row) {
+                $groups[(string) ($row[$query['GROUPBY']] ?? '')] = $row;
+            }
+            $filtered = array_values($groups);
+        }
         if (isset($query['ORDER'])) {
-            $filtered = $this->sortRows($filtered, (string) $query['ORDER']);
+            $order = $query['ORDER'];
+            if ($order instanceof \Glpi\DBAL\QueryExpression) {
+                if ($order->expression !== 'CAST(glpi_b_connection_id AS BINARY) ASC') {
+                    throw new RuntimeException('Unexpected SQL order: ' . $order->expression);
+                }
+                $order = 'glpi_b_connection_id ASC';
+            }
+            $filtered = $this->sortRows($filtered, (string) $order);
         }
 
         if (isset($query['LIMIT'])) {
@@ -467,7 +497,9 @@ final class FakeDB
         $descending = strtolower((string) ($parts[1] ?? 'asc')) === 'desc';
 
         usort($rows, static function (array $left, array $right) use ($field, $descending): int {
-            $result = ((int) ($left[$field] ?? 0)) <=> ((int) ($right[$field] ?? 0));
+            $result = $field === 'glpi_b_connection_id'
+                ? strcmp((string) ($left[$field] ?? ''), (string) ($right[$field] ?? ''))
+                : ((int) ($left[$field] ?? 0)) <=> ((int) ($right[$field] ?? 0));
 
             return $descending ? -$result : $result;
         });
@@ -3318,13 +3350,15 @@ $queueService = new \GlpiPlugin\Assetsync20\AssetSyncService(new FakeGlpiBClient
 if ($queueService->run(1) !== 1
     || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 701])['status'] !== 'done'
     || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 702])['status'] !== 'pending'
-    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null) {
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null
+    || (json_decode(Config::$values['plugin:assetsync20']['asset_sync_scan_cursors'], true)['queue-route:Computer'] ?? null) !== '701') {
     throw new RuntimeException('A full batch must process existing queue work before backfill');
 }
 if ($queueService->run(1) !== 1
     || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 702])['status'] !== 'done'
-    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null) {
-    throw new RuntimeException('The queue-first batch cap must leave unscanned work for a later run');
+    || $GLOBALS['DB']->firstRow(\GlpiPlugin\Assetsync20\AssetSyncQueue::TABLE, ['items_id' => 703]) !== null
+    || (json_decode(Config::$values['plugin:assetsync20']['asset_sync_scan_cursors'], true)['queue-route:Computer'] ?? null) !== '702') {
+    throw new RuntimeException('The queue-first batch cap must allow bounded scan progress without extra processing');
 }
 Config::setConfigurationValues('plugin:assetsync20', [
     'asset_sync_scan_cursors' => json_encode(['queue-route:Computer' => '702']),

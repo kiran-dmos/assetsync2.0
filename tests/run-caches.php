@@ -402,6 +402,9 @@ cachesEnded();
 cacheCheck((new ReflectionProperty(GlpiBConnection::class, 'httpMetrics'))->getValue() === null, 'HTTP observations must still clear after processing exceptions.');
 $GLOBALS['DB']->afterRequest = null;
 $GLOBALS['DB']->queryResult = static function (string $sql) {
+    if (!str_starts_with($sql, 'SELECT category,')) {
+        return null;
+    }
     cachesEnded();
     throw new RuntimeException('reporting query failed');
 };
