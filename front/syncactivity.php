@@ -166,6 +166,17 @@ if ($filters['id'] !== '') {
             echo '<tr><th scope="row">' . $html($label) . '</th><td>' . $time($detail[$key]) . '</td></tr>';
         }
         echo '</tbody></table><p class="assetsync-activity-note">Current queue and link records do not contain per-field results. No previous values or changes are reconstructed from current assets or mappings.</p>';
+        echo '<h4>Native UUID reconciliation</h4><ul>';
+        foreach ($detail['uuid_outcomes'] ?? [] as $code) {
+            $label = \GlpiPlugin\Assetsync20\AssetUuidService::OUTCOMES[$code] ?? null;
+            if ($label !== null) {
+                echo '<li>' . $html($label) . '</li>';
+            }
+        }
+        if (empty($detail['uuid_outcomes'])) {
+            echo '<li>No UUID operation recorded.</li>';
+        }
+        echo '</ul>';
     }
     echo '</section>';
 }

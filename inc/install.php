@@ -9,6 +9,7 @@ use GlpiPlugin\Assetsync20\AssetSyncCron;
 use GlpiPlugin\Assetsync20\AssetSyncLink;
 use GlpiPlugin\Assetsync20\AssetSyncQueue;
 use GlpiPlugin\Assetsync20\AssetSyncService;
+use GlpiPlugin\Assetsync20\AssetUuidOperation;
 use GlpiPlugin\Assetsync20\BillingFieldConfig;
 
 function plugin_assetsync20_install(): bool
@@ -17,7 +18,7 @@ function plugin_assetsync20_install(): bool
     FieldMapping::install();
     EntitySyncRoute::install();
 
-    if (!AssetSyncLink::install() || !AssetSyncQueue::install()) {
+    if (!AssetSyncLink::install() || !AssetSyncQueue::install() || !AssetUuidOperation::install()) {
         return false;
     }
 
@@ -35,5 +36,5 @@ function plugin_assetsync20_uninstall(): bool
     EntitySyncRoute::uninstall();
     AssetSyncService::uninstall();
 
-    return AssetSyncQueue::uninstall() && AssetSyncLink::uninstall();
+    return AssetUuidOperation::uninstall() && AssetSyncQueue::uninstall() && AssetSyncLink::uninstall();
 }

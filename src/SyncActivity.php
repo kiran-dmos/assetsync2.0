@@ -263,6 +263,31 @@ final class SyncActivity
             $query = $this->rowQuery($type, $where);
             $query['LIMIT'] = 1;
             foreach ($this->db->request($query) as $row) {
+                // Only the selected, already authorized asset detail may read UUID evidence.
+                $row['uuid_outcomes'] = ['upgrade_required'];
+                if (AssetUuidOperation::available()) {
+                    $row['uuid_outcomes'] = [];
+                    $operation = AssetUuidOperation::find($type, (int) $row['items_id']);
+                    if ($operation !== null) {
+                        try {
+                            $state = AssetUuidOperation::state($operation);
+                            $codes = [$operation['status']];
+                            $connection = $this->connections[$row['glpi_b_connection_id']] ?? [];
+                            $remoteSide = AssetUuidService::remoteSideKey((string) $row['glpi_b_connection_id'], (int) $row['link_remote_items_id'], $connection['base_url'] ?? '');
+                            foreach (['a', $remoteSide] as $side) {
+                                $evidence = $state['sides'][$side] ?? [];
+                                $codes[] = $evidence['outcome'] ?? '';
+                                $codes[] = $evidence['audit'] ?? '';
+                                if (isset($evidence['time_uncertain'])) {
+                                    $codes[] = $evidence['time_uncertain'] ? 'time_uncertain' : 'time_verified';
+                                }
+                            }
+                            $row['uuid_outcomes'] = array_values(array_unique(array_filter($codes, static fn (string $code): bool => isset(AssetUuidService::OUTCOMES[$code]))));
+                        } catch (\Throwable) {
+                            $row['uuid_outcomes'] = ['unknown'];
+                        }
+                    }
+                }
                 return $row;
             }
         }
@@ -390,6 +415,7 @@ final class SyncActivity
             case 'blocked':
                 return 'Stored link condition (not a confirmed error from this attempt): ' . match ($row['link_status'] ?? '') {
                     'blocked_configuration' => 'Sync stopped because its setup needs attention. Check the connection, Entity Route and Field Mapping.',
+                    'blocked_uuid_time' => 'UUID timestamp evidence is uncertain. Differing Both fields are deferred; one-way mappings can continue on retry.',
                     'blocked_identity', 'blocked_duplicate' => 'The GLPI B asset could not be identified safely. Check for missing or duplicate assets before trying again.',
                     'blocked_route_conflict' => 'More than one Entity Route matches this asset. Check which route should be used.',
                     'blocked_field_conflict' => 'The values differ, but the latest change could not be chosen. Check update times or choose GLPI A or GLPI B in Field Mapping.',

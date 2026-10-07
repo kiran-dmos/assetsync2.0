@@ -8,6 +8,7 @@ final class FieldMapping
 {
     private const CONTEXT = 'plugin:assetsync20';
     private const FIELD_MAPPINGS_KEY = 'field_mappings';
+    public const UUID_MAPPING_CONFLICT = 'Native UUID is reserved for UUID reconciliation. This mapping is excluded from ordinary synchronization.';
     private static ?array $runCache = null;
 
     public static function beginRunCache(): void
@@ -63,6 +64,9 @@ final class FieldMapping
         $mappings = [];
 
         foreach (self::load($connectionId, $itemtype) as $mapping) {
+            if (self::isReservedUuidRow($itemtype, $mapping)) {
+                continue;
+            }
             if (!isset(self::sourceOptions()[$mapping['source_of_truth']])) {
                 throw new \RuntimeException('Invalid saved mapping authority: ' . $mapping['glpi_a_field_key']);
             }
@@ -148,7 +152,7 @@ final class FieldMapping
     }
 
     /**
-     * @return list<array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string,_legacy:bool}>
+     * @return list<array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string,_legacy:bool,_raw:array<string,mixed>}>
      */
     public static function load(string $connectionId, string $itemtype): array
     {
@@ -188,6 +192,10 @@ final class FieldMapping
 
         $itemtype = self::validItemtype($itemtype);
         $allMappings = self::loadAll();
+        $reservedRows = array_values(array_filter(
+            self::load($connectionId, $itemtype),
+            static fn (array $row): bool => self::isReservedUuidRow($itemtype, $row, $glpiBFields)
+        ));
         $rowInput = array_is_list($fieldMappings);
         foreach ($fieldMappings as $value) {
             if (is_array($value) && array_key_exists('glpi_a_field_key', $value)) {
@@ -200,6 +208,22 @@ final class FieldMapping
         $localTypes = [];
         foreach ($rows as $index => $row) {
             try {
+                if (self::isReservedUuidRow($itemtype, $row, $glpiBFields)) {
+                    $retained = false;
+                    foreach ($reservedRows as $savedIndex => $savedRow) {
+                        // Consume one identical saved row, so a duplicate POST cannot add another UUID mapping.
+                        if (self::sameStoredMapping($row, $savedRow)) {
+                            $savedRows[] = $savedRow['_raw'];
+                            unset($reservedRows[$savedIndex]);
+                            $retained = true;
+                            break;
+                        }
+                    }
+                    if (!$retained) {
+                        throw new \RuntimeException('New or altered native UUID mappings are not allowed. ' . self::UUID_MAPPING_CONFLICT);
+                    }
+                    continue;
+                }
                 if (!isset(self::sourceOptions()[$row['source_of_truth']])) {
                     throw new \RuntimeException('Invalid source of truth.');
                 }
@@ -321,14 +345,73 @@ final class FieldMapping
         foreach ($legacy ? $scope : $scope['rows'] as $key => $value) {
             $record = is_array($value) ? $value : ['source_of_truth' => $value];
             $row = [];
+            $rawRecord = [];
             foreach (['glpi_a_field_key', 'glpi_b_field_key', 'glpi_b_field_id', 'glpi_b_field_uid', 'glpi_b_field_label', 'source_of_truth'] as $field) {
                 $raw = $record[$field] ?? ($field === 'glpi_a_field_key' && $legacy ? $key : '');
                 $row[$field] = is_scalar($raw) ? trim((string) $raw) : '[invalid value]';
+                if (array_key_exists($field, $record)) {
+                    $rawRecord[$field] = $record[$field];
+                } elseif ($field === 'glpi_a_field_key' && $legacy) {
+                    $rawRecord[$field] = (string) $key;
+                }
             }
             $row['_legacy'] = $legacy;
+            $row['_raw'] = $rawRecord;
             $rows[] = $row;
         }
         return $rows;
+    }
+
+    private static function sameStoredMapping(array $left, array $right): bool
+    {
+        foreach (['glpi_a_field_key', 'glpi_b_field_key', 'glpi_b_field_id', 'glpi_b_field_uid', 'glpi_b_field_label', 'source_of_truth'] as $field) {
+            $leftValue = $left['_raw'][$field] ?? '';
+            $rightValue = $right['_raw'][$field] ?? '';
+            if ((is_scalar($leftValue) ? (string) $leftValue : $leftValue)
+                !== (is_scalar($rightValue) ? (string) $rightValue : $rightValue)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Only exact native identities or independently resolved metadata prove the reservation. */
+    public static function isReservedUuidRow(string $itemtype, array $row, array $remoteFields = []): bool
+    {
+        if (!isset(self::assetTypes()[$itemtype])) {
+            return false;
+        }
+        $a = is_scalar($row['glpi_a_field_key'] ?? null) ? trim((string) $row['glpi_a_field_key']) : '';
+        if ($a === 'uuid' || $a === $itemtype . '.uuid') {
+            return true; // Also applies to types without a UUID search option.
+        }
+        if ($a !== '' && ctype_digit($a)) {
+            try {
+                if (self::safeLocalSyncField($itemtype, $a) === 'uuid') {
+                    return true;
+                }
+            } catch (\RuntimeException) {
+                // Unknown metadata is not proof of a UUID field.
+            }
+        }
+        $b = is_scalar($row['glpi_b_field_key'] ?? null) ? trim((string) $row['glpi_b_field_key']) : '';
+        $uid = is_scalar($row['glpi_b_field_uid'] ?? null) ? trim((string) $row['glpi_b_field_uid']) : '';
+        try {
+            if (self::safeRemoteSyncField($itemtype, ['glpi_b_field_key' => $b, 'glpi_b_field_uid' => $uid]) === 'uuid') {
+                return true;
+            }
+        } catch (\RuntimeException) {
+            // Numeric-only B references must never be resolved from A's options.
+        }
+        if ($b !== '' && ctype_digit($b) && $uid === '' && $remoteFields !== []) {
+            try {
+                $field = self::selectedField($remoteFields, $b);
+                return ($field['key'] ?? '') === 'uuid' && ($field['group'] ?? '') === 'Native';
+            } catch (\RuntimeException) {
+                return false;
+            }
+        }
+        return false;
     }
 
     /** Resolve discovery aliases, never labels, and reject ambiguous search metadata. */
@@ -385,6 +468,9 @@ final class FieldMapping
                     $field['key'] = $descriptor['field'];
                     $field['uid'] = $descriptor['uid'];
                     $field['type'] = $descriptor['type'];
+                    if ($descriptor['field'] === 'uuid') {
+                        throw new \RuntimeException(self::UUID_MAPPING_CONFLICT);
+                    }
                 }
                 $field['supported'] = true;
             } catch (\RuntimeException $error) {
@@ -459,6 +545,9 @@ final class FieldMapping
             }
             $otherRows = self::load($connection['id'], $itemtype);
             foreach ($otherRows as $row) {
+                if (self::isReservedUuidRow($itemtype, $row)) {
+                    continue;
+                }
                 $a = self::safeLocalSyncField($itemtype, $row['glpi_a_field_key']);
                 if (isset($aOwners[$a]) && ($row['source_of_truth'] !== 'glpi_a'
                     || array_filter($aOwners[$a], static fn ($source) => $source !== 'glpi_a'))) {

@@ -88,8 +88,11 @@ final class GlpiBConnection
     /**
      * @return list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}>
      */
-    public static function loadAll(): array
+    public static function loadAll(bool $fresh = false): array
     {
+        if ($fresh) {
+            self::invalidateRunCache();
+        }
         $connections = self::decodeConnections();
 
         if ($connections !== []) {
@@ -497,13 +500,104 @@ final class GlpiBConnection
                 ];
             }
 
-            self::verifyNativeWrite($connection, $itemtype, $itemsId, $input, $sessionToken);
+            $item = self::verifyNativeWrite($connection, $itemtype, $itemsId, $input, $sessionToken);
             return [
                 'success'   => true,
                 'message'   => 'GLPI B asset updated.',
+                'item'      => $item,
                 'transient' => false,
             ];
         });
+    }
+
+    /** Raw native UUID reads/writes deliberately do not depend on a search option. */
+    public static function uuidSnapshot(array $connection, string $itemtype, int $id, int $entityId, bool $writing = false, ?string $expectedUuid = null, ?string $newUuid = null, bool $withHistory = true): array
+    {
+        if (!isset(FieldMapping::assetTypes()[$itemtype]) || $id <= 0 || empty($connection['active'])) {
+            return ['success' => false, 'outcome' => 'unknown'];
+        }
+        $withHistory = $withHistory || $newUuid !== null;
+        return self::withSession($connection, static function (string $token, string $timezone = '') use ($connection, $itemtype, $id, $entityId, $writing, $expectedUuid, $newUuid, $withHistory): array {
+            $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $token];
+            $read = static function (string $endpoint) use ($connection, $headers): array {
+                $response = self::request('GET', self::apiUrl($connection['base_url'], $endpoint), $headers);
+                if (!$response['success']) {
+                    throw new RemoteRequestFailure($response);
+                }
+                return $response['body'];
+            };
+            // Parent READ/entity validation precedes both asset and global lock discovery.
+            $item = $read($itemtype . '/' . $id);
+            if (!AssetUuidService::validAsset($item, $id, $entityId)) {
+                return ['success' => false, 'outcome' => 'unknown'];
+            }
+            if ($writing) {
+                $profile = $read('getActiveProfile')['active_profile'] ?? [];
+                $right = $itemtype === 'NetworkEquipment' ? 'networking' : strtolower($itemtype);
+                if ((((int) ($profile[$right] ?? 0)) & 3) !== 3 || (((int) ($profile['locked_field'] ?? 0)) & 2) !== 2) {
+                    return ['success' => false, 'outcome' => 'permission'];
+                }
+                $localLocks = self::remoteCollectionRows($connection, $headers, $itemtype . '/' . $id . '/Lockedfield',
+                    ['searchText' => ['field' => '^uuid$']], 100, 1000);
+                $globalLocks = self::remoteCollectionRows($connection, $headers, 'Lockedfield',
+                    ['searchText' => ['itemtype' => '^' . $itemtype . '$', 'field' => '^uuid$', 'is_global' => '^1$']], 100, 1000);
+                $lock = AssetUuidService::lockOutcome($itemtype, $id, $localLocks, $globalLocks);
+                if ($lock !== 'unlocked') {
+                    return ['success' => false, 'outcome' => $lock];
+                }
+            }
+            if ($newUuid !== null) {
+                if (!$writing || AssetUuidService::normalize($newUuid) !== $newUuid || (string) ($item['uuid'] ?? '') !== $expectedUuid) {
+                    return ['success' => false, 'outcome' => 'changed'];
+                }
+                $response = self::request('PUT', self::apiUrl($connection['base_url'], $itemtype . '/' . $id), $headers,
+                    ['input' => ['id' => $id, 'uuid' => $newUuid]]);
+                if (!$response['success']) {
+                    throw new RemoteRequestFailure($response);
+                }
+                $item = $read($itemtype . '/' . $id);
+                if (!AssetUuidService::validAsset($item, $id, $entityId) || AssetUuidService::normalize($item['uuid']) !== $newUuid) {
+                    return ['success' => false, 'outcome' => 'unverified'];
+                }
+            }
+            return ['success' => true, 'item' => $item, 'history' => $withHistory ? self::uuidHistory($connection, $headers, $itemtype, $id) : ['known' => false],
+                'date_mod_timezone' => $timezone, 'outcome' => $newUuid === null ? 'observed' : 'verified'];
+        }, $withHistory);
+    }
+
+    /** A bounded newest-first interval, not a claim that all asset history is available. */
+    private static function uuidHistory(array $connection, array $headers, string $itemtype, int $id): array
+    {
+        try {
+            $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $itemtype . '/' . $id . '/Log',
+                ['range' => '0-99', 'sort' => 'id', 'order' => 'DESC', 'get_hateoas' => 0]), $headers);
+            $rows = $response['body'];
+            $ranges = $response['headers']['content-range'] ?? [];
+            if (!$response['success'] || !$response['json_valid'] || !$response['json_list'] || !array_is_list($rows)) {
+                return ['known' => false];
+            }
+            if ($rows === [] && $response['status_code'] === 200 && $ranges === []) {
+                return ['known' => true, 'total' => 0, 'rows' => [], 'uuid_options' => []];
+            }
+            if (count($ranges) !== 1 || !preg_match('/\A0-(\d+)\/(\d+)\z/', $ranges[0], $range)
+                || (int) $range[1] + 1 !== count($rows) || count($rows) !== min(100, (int) $range[2])) {
+                return ['known' => false];
+            }
+            $last = PHP_INT_MAX;
+            foreach ($rows as $row) {
+                $rowId = self::cleanRemoteId($row['id'] ?? null);
+                if ($rowId <= 0 || $rowId >= $last || ($row['itemtype'] ?? null) !== $itemtype || (int) ($row['items_id'] ?? 0) !== $id) {
+                    return ['known' => false];
+                }
+                $last = $rowId;
+            }
+            $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . $itemtype, ['raw' => 1]), $headers);
+            return ['known' => true, 'total' => (int) $range[2], 'rows' => $rows,
+                'uuid_options' => $options['success'] ? AssetUuidService::uuidOptionIds($itemtype, $options['body']) : [],
+                'native_options' => $options['success'] ? AssetUuidService::nativeHistoryFields($itemtype, $options['body']) : []];
+        } catch (\Throwable) {
+            return ['known' => false];
+        }
     }
 
     private static function verifyNativeWrite(array $connection, string $itemtype, int $id, array $input, string $sessionToken): array
@@ -868,16 +962,16 @@ final class GlpiBConnection
     }
 
     /** Return a catalog only after proving every page complete; never expose a partial list. */
-    private static function remoteCollectionRows(array $connection, array $headers, string $endpoint): array
+    private static function remoteCollectionRows(array $connection, array $headers, string $endpoint, array $query = [], int $pageSize = 1000, int $maxRows = 10000): array
     {
         $rows = [];
         $offset = 0;
         $total = null;
         $lastId = 0;
         for ($page = 0; $page < 10; $page++) {
-            $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, [
-                'range' => $offset . '-' . ($offset + 999), 'sort' => 'id', 'order' => 'ASC', 'get_hateoas' => 0,
-            ]), $headers);
+            $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, array_merge($query, [
+                'range' => $offset . '-' . ($offset + $pageSize - 1), 'sort' => 'id', 'order' => 'ASC', 'get_hateoas' => 0,
+            ])), $headers);
             if (!$response['success']) {
                 if ($offset > 0 && $response['status_code'] === 400 && ($response['body'][0] ?? '') === 'ERROR_RANGE_EXCEED_TOTAL') {
                     $response['transient'] = true;
@@ -908,10 +1002,10 @@ final class GlpiBConnection
                     'executed' => $response['executed'],
                 ]);
             }
-            if ($pageTotal > 10000) {
-                throw new \RuntimeException('GLPI B catalog is incomplete: exceeds the 10000-row limit.');
+            if ($pageTotal > $maxRows) {
+                throw new \RuntimeException('GLPI B catalog is incomplete: exceeds the ' . $maxRows . '-row limit.');
             }
-            if ($start !== $offset || $end < $start || $end >= $pageTotal || $end > $offset + 999 || count($body) !== $end - $start + 1) {
+            if ($start !== $offset || $end < $start || $end >= $pageTotal || $end > $offset + $pageSize - 1 || count($body) !== $end - $start + 1) {
                 throw new \RuntimeException('GLPI B catalog is incomplete: inconsistent range or row count.');
             }
             foreach ($body as $row) {

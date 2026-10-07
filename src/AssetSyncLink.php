@@ -15,6 +15,7 @@ final class AssetSyncLink
     public const STATUS_BLOCKED_DUPLICATE = 'blocked_duplicate';
     public const STATUS_BLOCKED_ROUTE_CONFLICT = 'blocked_route_conflict';
     public const STATUS_BLOCKED_FIELD_CONFLICT = 'blocked_field_conflict';
+    public const STATUS_BLOCKED_UUID_TIME = 'blocked_uuid_time';
     public const STATUS_BLOCKED_MISSING_REMOTE = 'blocked_missing_remote';
     public const STATUS_BLOCKED_LOCAL_UPDATE = 'blocked_local_update';
     public const STATUS_BLOCKED_REMOTE_ERROR = 'blocked_remote_error';

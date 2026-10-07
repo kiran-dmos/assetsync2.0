@@ -93,6 +93,12 @@ final class AssetSyncService
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
+            $uuidDeadlineNs = $this->runDeadlineNs;
+            $uuidAvailable = AssetUuidOperation::available();
+            if ($uuidAvailable) {
+                // Ordinary work gets the first job; reserve at most eight seconds for one UUID operation.
+                $this->runDeadlineNs -= min(8_000_000_000, max(0, $this->runDeadlineNs - hrtime(true) - 3_000_000_000));
+            }
             // Reserve up to two seconds for scanning when the run has time to spare.
             $remainingNs = max(0, $this->runDeadlineNs - hrtime(true));
             $this->phaseDeadlineNs = $this->runDeadlineNs - min(self::SCAN_SECONDS * 1_000_000_000, max(0, $remainingNs - 1_000_000_000));
@@ -116,6 +122,15 @@ final class AssetSyncService
 
             $this->runMetrics['stop_reason'] = hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS + 1_000_000 > $this->runDeadlineNs
                 ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : ($this->pausedConnections !== [] ? 'connections_paused' : 'no_due_jobs'));
+            $this->runDeadlineNs = $uuidDeadlineNs;
+            $this->phaseDeadlineNs = $uuidDeadlineNs;
+            try {
+                $this->runMetrics['uuid'] = $uuidAvailable
+                    ? (new AssetUuidService($this->remoteClient))->run($uuidDeadlineNs, $this->pausedConnections ?? [])
+                    : ['outcome' => 'upgrade_required', 'attempted' => 0];
+            } catch (\Throwable) {
+                $this->runMetrics['uuid'] = ['outcome' => 'unknown'];
+            }
             return $enqueued + $processed;
         } finally {
             $this->runDeadlineNs = null;
@@ -279,6 +294,12 @@ final class AssetSyncService
     // A scan stopped before preparation returns null, leaving its asset cursor unchanged.
     private function prepareAndQueueAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline = null, ?float $scanDeadline = null): ?bool
     {
+        return AssetUuidOperation::withAssetLock($itemtype, $itemsId,
+            fn (): ?bool => $this->prepareAndQueueLockedAsset($itemtype, $itemsId, $connectionId, $forceInboundRecheck, $deadline, $scanDeadline));
+    }
+
+    private function prepareAndQueueLockedAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline, ?float $scanDeadline): ?bool
+    {
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
             return false;
@@ -356,6 +377,9 @@ final class AssetSyncService
             }
 
             if (str_starts_with($linkStatus, 'blocked_')) {
+                if ($linkStatus === AssetSyncLink::STATUS_BLOCKED_UUID_TIME && (int) ($link['remote_items_id'] ?? 0) > 0) {
+                    return $this->hasInboundMapping($mappings);
+                }
                 // Retry only a known remote asset, through the normal validation path.
                 if (!$forceInboundRecheck
                     || $linkStatus !== AssetSyncLink::STATUS_BLOCKED_LOCAL_UPDATE
@@ -441,6 +465,11 @@ final class AssetSyncService
      * @param array<string,mixed> $job
      */
     public function processJob(array $job): void
+    {
+        AssetUuidOperation::withAssetLock((string) ($job['itemtype'] ?? ''), (int) ($job['items_id'] ?? 0), fn () => $this->processLockedJob($job));
+    }
+
+    private function processLockedJob(array $job): void
     {
         $queueId = (int) ($job['id'] ?? 0);
         $itemtype = (string) ($job['itemtype'] ?? '');
@@ -713,6 +742,25 @@ final class AssetSyncService
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_MISSING_REMOTE, 'The linked GLPI B asset is deleted.', $remoteItemsId);
             return;
         }
+        $ordinaryRemoteBefore = $remoteItem;
+        if ($needsDateModTimezone && !$createdRemote) {
+            try {
+                if (AssetUuidOperation::find($itemtype, $itemsId) !== null) {
+                    [$guardedLocal, $remoteItem] = AssetUuidService::guardPair($itemtype, $itemsId, $connectionId, $remoteItemsId, $connection['base_url'],
+                        $this->loadLocalAsset($itemtype, $itemsId) ?? $asset, $remoteItem, $remoteDateModTimezone,
+                        fn (): array => $this->callRemote('uuidSnapshot', [$connection, $itemtype, $remoteItemsId, (int) $route['glpi_b_target_entity_id']]));
+                    $comparisonAsset['date_mod'] = $guardedLocal['date_mod'] ?? '';
+                    unset($comparisonAsset['_date_mod_epoch']);
+                    foreach (['_date_mod_epoch', '_uuid_time_uncertain'] as $key) {
+                        if (array_key_exists($key, $guardedLocal)) {
+                            $comparisonAsset[$key] = $guardedLocal[$key];
+                        }
+                    }
+                }
+            } catch (\Throwable) {
+                $comparisonAsset['_uuid_time_uncertain'] = $remoteItem['_uuid_time_uncertain'] = true;
+            }
+        }
         if (!$createdRemote && isset($remoteDescriptors['states_id'])) {
             $states = $this->callRemote('nativeStateCatalog', [$connection, $itemtype, $nativeContext['catalogs']['states_id'],
                 $remoteItem['states_id'] ?? null, $stateLabels, $nativeContext['entity_path']]);
@@ -828,6 +876,9 @@ final class AssetSyncService
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;
             }
+            if (isset($updateResult['item']) && is_array($updateResult['item'])) {
+                $ordinaryRemoteAfter = $updateResult['item'];
+            }
         }
 
         if ($customChanges !== []) {
@@ -865,6 +916,31 @@ final class AssetSyncService
             $this->recordJobOutcome('succeeded', false);
             return;
         }
+        // Optional evidence must not delay remaining ordinary custom/local writes or invalidate their success.
+        if (isset($ordinaryRemoteAfter)) {
+            try {
+                $history = [];
+                if (AssetUuidOperation::find($itemtype, $itemsId) !== null && $remoteDateModTimezone !== '') {
+                    $evidence = $this->callRemote('uuidSnapshot', [$connection, $itemtype, $remoteItemsId, (int) $route['glpi_b_target_entity_id']]);
+                    if (!empty($evidence['success']) && $evidence['item'] === $ordinaryRemoteAfter && ($evidence['date_mod_timezone'] ?? '') === $remoteDateModTimezone) {
+                        $history = $evidence['history'];
+                    }
+                }
+                AssetUuidService::ordinaryWriteVerified($itemtype, $itemsId, AssetUuidService::remoteSideKey($connectionId, $remoteItemsId, $connection['base_url']),
+                    $ordinaryRemoteBefore, $ordinaryRemoteAfter, $nativeChanges, $remoteDateModTimezone, $history);
+            } catch (\Throwable) {
+                // Failed evidence persistence leaves the prior guard in place.
+            }
+        }
+        if ($changes['uuid_conflicts'] !== []) {
+            $message = 'UUID timestamp uncertainty deferred differing Both fields; valid one-way changes were processed: '
+                . implode(', ', $changes['uuid_conflicts']) . '.';
+            $saved = AssetSyncLink::saveStatus($itemtype, $itemsId, $connectionId, $route['id'], AssetSyncLink::STATUS_BLOCKED_UUID_TIME,
+                $message, $remoteItemsId, $this->payloadHash($finalAsset, $route, $mappings), $this->payloadDate($finalAsset));
+            $retried = AssetSyncQueue::retry($job, $message, $remoteItemsId);
+            $this->recordJobOutcome('retried', $saved && $retried);
+            return;
+        }
         $saved = AssetSyncLink::save([
             'itemtype'             => $itemtype,
             'items_id'             => $itemsId,
@@ -895,6 +971,9 @@ final class AssetSyncService
         ];
 
         foreach ($mappings as $mapping) {
+            if ($mapping['glpi_a_field'] === 'uuid' || $mapping['glpi_b_field'] === 'uuid') {
+                continue;
+            }
             $payload['fields'][] = [
                 'a' => $mapping['glpi_a_field'],
                 'b' => $mapping['glpi_b_field'],
@@ -1305,7 +1384,7 @@ final class AssetSyncService
             return false;
         }
 
-        $this->assertLocalNativeAccess($itemtype, $itemsId);
+        $before = $this->assertLocalNativeAccess($itemtype, $itemsId);
         $input = array_merge(['id' => $itemsId], $fields);
         if (!$item->update($input) || !$item->getFromDB($itemsId)) {
             return false;
@@ -1320,10 +1399,15 @@ final class AssetSyncService
                 throw new \RuntimeException('GLPI A did not persist native field: ' . $key);
             }
         }
+        try {
+            AssetUuidService::ordinaryWriteVerified($itemtype, $itemsId, 'a', $before, $item->fields, $fields);
+        } catch (\Throwable) {
+            // UUID evidence is ancillary to this already verified ordinary write.
+        }
         return true;
     }
 
-    private function assertLocalNativeAccess(string $itemtype, int $itemsId, ?int $expectedEntity = null): void
+    private function assertLocalNativeAccess(string $itemtype, int $itemsId, ?int $expectedEntity = null): array
     {
         $item = new $itemtype();
         if (!$item->getFromDB($itemsId) || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
@@ -1334,6 +1418,7 @@ final class AssetSyncService
         if (!$cron && (!method_exists($item, 'can') || !$item->can($itemsId, defined('UPDATE') ? UPDATE : 2))) {
             throw new \RuntimeException('GLPI A asset update permission denied.');
         }
+        return $item->fields;
     }
 
     private function nativeSnapshot(array $values, array $descriptors, array $catalogs): array
@@ -1413,7 +1498,8 @@ final class AssetSyncService
 
         foreach ($mappings as $mapping) {
             $source = $mapping['source_of_truth'];
-            if (FieldsText::isCustom($mapping['glpi_b_field'])) {
+            if ($mapping['glpi_a_field'] === 'uuid' || $mapping['glpi_b_field'] === 'uuid'
+                || FieldsText::isCustom($mapping['glpi_b_field'])) {
                 continue;
             }
             $localValue = $this->value($asset[$mapping['glpi_a_field']] ?? '');
@@ -1446,6 +1532,7 @@ final class AssetSyncService
         $remoteChanges = [];
         $localChanges = [];
         $conflicts = [];
+        $uuidConflicts = [];
         $targetEntityId = (string) $route['glpi_b_target_entity_id'];
 
         if ($targetEntityId !== '' && $this->value($remoteItem['entities_id'] ?? '') !== $targetEntityId) {
@@ -1453,6 +1540,9 @@ final class AssetSyncService
         }
 
         foreach ($mappings as $mapping) {
+            if ($mapping['glpi_a_field'] === 'uuid' || $mapping['glpi_b_field'] === 'uuid') {
+                continue;
+            }
             $fieldType = $this->mappingFieldType($mapping, $fieldTypes);
             $localValue = $this->mappedValue($asset[$mapping['glpi_a_field']] ?? '', $fieldType);
             $remoteValue = $this->mappedValue($remoteItem[$mapping['glpi_b_field']] ?? '', $fieldType);
@@ -1475,6 +1565,11 @@ final class AssetSyncService
                 continue;
             }
 
+            if (!empty($asset['_uuid_time_uncertain']) || !empty($remoteItem['_uuid_time_uncertain'])) {
+                $uuidConflicts[] = $mapping['glpi_a_field'];
+                continue;
+            }
+
             $newerDateModSource = $this->newerMappingDateModSource($asset, $remoteItem, $mapping, $localCustomDateMods, $remoteCustomDateMods, $remoteDateModTimezone);
 
             if ($newerDateModSource === 'glpi_a') {
@@ -1494,6 +1589,7 @@ final class AssetSyncService
             'remote' => $remoteChanges,
             'local' => $localChanges,
             'conflicts' => $conflicts,
+            'uuid_conflicts' => $uuidConflicts,
         ];
     }
 
@@ -1506,6 +1602,9 @@ final class AssetSyncService
      */
     private function customHistoryNeeds(array $asset, array $remoteItem, array $mappings, array $fieldTypes): array
     {
+        if (!empty($asset['_uuid_time_uncertain']) || !empty($remoteItem['_uuid_time_uncertain'])) {
+            return ['local' => [], 'remote' => []];
+        }
         $localKeys = [];
         $remoteKeys = [];
 

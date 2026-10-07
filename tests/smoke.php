@@ -211,6 +211,12 @@ final class FakeDB
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return [['session_timezone' => $this->guessTimezone()]];
         }
+        if (str_starts_with($sql, "SELECT GET_LOCK(CONCAT('as20:'")) {
+            return [['acquired' => 1]];
+        }
+        if (str_starts_with($sql, "SELECT RELEASE_LOCK(CONCAT('as20:'")) {
+            return [['released' => 1]];
+        }
         if ($sql === "SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired") {
             $acquired = $this->runLockHeld ? 0 : $this->runLockResult;
             if ($acquired === 1) {
@@ -229,7 +235,7 @@ final class FakeDB
             $next = new DateTimeZone($match[1]);
             foreach ($this->tables as &$rows) {
                 foreach ($rows as &$row) {
-                    foreach (['date_creation', 'date_mod', 'last_sync_at', 'last_payload_date', 'blocked_at', 'payload_date', 'available_at', 'started_at', 'finished_at'] as $field) {
+                    foreach (['date_creation', 'date_mod', 'last_sync_at', 'last_payload_date', 'blocked_at', 'payload_date', 'available_at', 'started_at', 'finished_at', 'next_attempt', 'lease_until'] as $field) {
                         if (is_string($row[$field] ?? null) && preg_match('/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/', $row[$field])) {
                             $row[$field] = (new DateTimeImmutable($row[$field], $previous))->setTimezone($next)->format('Y-m-d H:i:s');
                         }
@@ -259,6 +265,18 @@ final class FakeDB
         }
 
         $quoted = "'((?:''|[^'])*)'";
+        if (preg_match('/^INSERT IGNORE INTO `glpi_plugin_assetsync20_uuidoperations` .* VALUES \(' . $quoted . ',(\d+),NOW\(\),NOW\(\)\)$/', $sql, $match)) {
+            $table = \GlpiPlugin\Assetsync20\AssetUuidOperation::TABLE;
+            $type = str_replace("''", "'", $match[1]);
+            $id = (int) $match[2];
+            $this->affectedRows = 0;
+            if ($this->firstRow($table, ['itemtype' => $type, 'items_id' => $id]) === null) {
+                $this->insert($table, ['itemtype' => $type, 'items_id' => $id, 'generated_value' => null, 'status' => 'pending',
+                    'attempts' => 0, 'claim_token' => null, 'lease_until' => null, 'next_attempt' => null, 'state_json' => null]);
+                $this->affectedRows = 1;
+            }
+            return true;
+        }
         if (preg_match('/^INSERT INTO `glpi_plugin_assetsync20_syncqueue` .* VALUES \(' . $quoted . ', (\d+), ' . $quoted . ', 1, NOW\(\), NOW\(\)\) ON DUPLICATE KEY UPDATE /', $sql, $match)) {
             return $this->notifyQueue(str_replace("''", "'", $match[1]), (int) $match[2], str_replace("''", "'", $match[3]), true);
         }
@@ -386,6 +404,9 @@ final class FakeDB
         }
         if (isset($query['ORDER'])) {
             $order = $query['ORDER'];
+            if (is_array($order)) {
+                $order = end($order);
+            }
             if ($order instanceof \Glpi\DBAL\QueryExpression) {
                 if ($order->expression !== 'CAST(glpi_b_connection_id AS BINARY) ASC') {
                     throw new RuntimeException('Unexpected SQL order: ' . $order->expression);
@@ -474,6 +495,20 @@ final class FakeDB
     private function rowMatches(array $row, array $where): bool
     {
         foreach ($where as $field => $expected) {
+            if (is_int($field) && is_array($expected)) {
+                if (!$this->rowMatches($row, $expected)) {
+                    return false;
+                }
+                continue;
+            }
+            if ($field === 'OR') {
+                $matched = false;
+                foreach ($expected as $key => $value) {
+                    $matched = $matched || $this->rowMatches($row, [$key => $value]);
+                }
+                if (!$matched) { return false; }
+                continue;
+            }
             if ($field === 'NOT') {
                 if ($this->rowMatches($row, $expected)) {
                     return false;
@@ -481,6 +516,16 @@ final class FakeDB
                 continue;
             }
             if ($expected instanceof \Glpi\DBAL\QueryExpression) {
+                if (str_contains($expected->expression, 'UNIX_TIMESTAMP(`lease_until`)')) {
+                    $lease = isset($row['lease_until']) ? (new DateTimeImmutable($row['lease_until'], new DateTimeZone($this->guessTimezone())))->getTimestamp() : null;
+                    $next = isset($row['next_attempt']) ? (new DateTimeImmutable($row['next_attempt'], new DateTimeZone($this->guessTimezone())))->getTimestamp() : null;
+                    if ($expected->expression === 'UNIX_TIMESTAMP(`lease_until`) > UNIX_TIMESTAMP()') {
+                        if ($lease === null || $lease <= time()) { return false; }
+                    } elseif (($lease !== null && $lease > time()) || (str_contains($expected->expression, '`next_attempt`') && $next !== null && $next > time())) {
+                        return false;
+                    }
+                    continue;
+                }
                 if (preg_match('/^UNIX_TIMESTAMP\(`(started_at|payload_date)`\) = (\d+)$/', $expected->expression, $matches)) {
                     $value = $row[$matches[1]] ?? null;
                     if ($value === null || (new DateTimeImmutable((string) $value, new DateTimeZone($this->guessTimezone())))->getTimestamp() !== (int) $matches[2]) {
@@ -988,6 +1033,7 @@ final class FakeGlpiBClient
         return [
             'success' => true,
             'message' => 'updated',
+            'item' => $this->records[$key][$itemsId],
             'transient' => false,
         ];
     }
@@ -1455,7 +1501,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.8',
+    'version' => '0.1.9',
 ];
 
 foreach ($expectations as $key => $expected) {

@@ -30,8 +30,11 @@ final class EntitySyncRoute
     /**
      * @return list<array{id:string,name:string,glpi_b_connection_id:string,glpi_a_source_entity_id:string,glpi_a_source_entity_name:string,glpi_b_target_entity_id:string,glpi_b_target_entity_name:string,asset_types:list<string>,include_child_entities:bool,active:bool}>
      */
-    public static function loadAll(): array
+    public static function loadAll(bool $fresh = false): array
     {
+        if ($fresh) {
+            self::invalidateRunCache();
+        }
         if (isset(self::$runCache['routes'])) {
             $savedRoutes = self::$runCache['routes'];
         } else {

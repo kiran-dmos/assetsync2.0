@@ -100,4 +100,40 @@ uiCheck(str_contains($html, 'Update denied') && $before === Config::$values['plu
 Session::$canUpdate = true;
 $html = renderMappingPage(['mapping_form_complete' => '1', 'mapping_row_count' => '0']);
 uiCheck(str_contains($html, 'Field mappings saved.') && FieldMapping::load('ui', 'Computer') === [], 'Complete deliberate remove-all succeeds.');
+
+Search::$nativeOptions = [815 => ['name' => 'UUID', 'table' => 'glpi_computers', 'field' => 'uuid',
+    'uid' => 'Computer.uuid', 'datatype' => 'string']];
+$reserved = ['glpi_a_field_key' => '815', 'glpi_b_field_key' => '991', 'glpi_b_field_id' => '991',
+    'glpi_b_field_uid' => 'Computer.uuid', 'glpi_b_field_label' => 'Old <UUID>', 'source_of_truth' => 'both'];
+Config::$values['plugin:assetsync20']['field_mappings'] = json_encode(['ui' => ['Computer' => [
+    '815' => array_diff_key($reserved, ['glpi_a_field_key' => true]),
+    'name' => array_diff_key($row, ['glpi_a_field_key' => true]),
+]]], JSON_THROW_ON_ERROR);
+$before = Config::$values['plugin:assetsync20']['field_mappings'];
+$html = renderMappingPage();
+uiCheck(str_contains($html, 'Reserved mapping conflict:') && str_contains($html, FieldMapping::UUID_MAPPING_CONFLICT), 'Retained UUID mapping has an explicit visible conflict.');
+uiCheck(str_contains($html, 'type="hidden" name="field_mappings[0][glpi_a_field_key]" value="815"')
+    && str_contains($html, 'type="hidden" name="field_mappings[0][glpi_b_field_key]" value="991"')
+    && str_contains($html, 'name="field_mappings[0][source_of_truth]" value="both"'), 'Reserved form retains original endpoint aliases and authority.');
+uiCheck(!str_contains($html, 'name="field_mappings[0][glpi_a_field_key]" required')
+    && str_contains($html, 'value="uuid" disabled'), 'Reserved row is read-only except removal and native UUID is disabled for new rows.');
+uiCheck(str_contains($html, 'Old &lt;UUID&gt;') && $before === Config::$values['plugin:assetsync20']['field_mappings'], 'Rendering escapes retained labels and does not rewrite configuration.');
+$changedOrdinary = $row;
+$changedOrdinary['source_of_truth'] = 'glpi_b';
+$html = renderMappingPage(['mapping_form_complete' => '1', 'mapping_row_count' => '2',
+    'field_mappings' => [$reserved, $changedOrdinary]]);
+$stored = json_decode(Config::$values['plugin:assetsync20']['field_mappings'], true)['ui']['Computer'];
+uiCheck(str_contains($html, 'Field mappings saved.') && $stored['version'] === 2
+    && $stored['rows'][0] == $reserved && $stored['rows'][1]['source_of_truth'] === 'glpi_b', 'Unrelated page save migrates to v2 without changing reserved row identities or authority.');
+uiCheck(str_contains($html, 'Reserved mapping conflict:'), 'Reserved conflict remains visible after successful unrelated save.');
+$before = Config::$values['plugin:assetsync20']['field_mappings'];
+$tampered = $reserved;
+$tampered['source_of_truth'] = 'glpi_a';
+$html = renderMappingPage(['mapping_form_complete' => '1', 'mapping_row_count' => '2',
+    'field_mappings' => [$tampered, $changedOrdinary]]);
+uiCheck(str_contains($html, 'New or altered native UUID mappings are not allowed')
+    && !str_contains($html, 'Field mappings saved.') && $before === Config::$values['plugin:assetsync20']['field_mappings'], 'Tampering with readonly UUID authority is rejected without clearing mappings.');
+$html = renderMappingPage($complete + ['field_mappings' => [$changedOrdinary]]);
+uiCheck(str_contains($html, 'Field mappings saved.') && count(FieldMapping::load('ui', 'Computer')) === 1, 'Explicit reserved row removal succeeds.');
+
 echo 'Mapping UI tests passed (' . $uiChecks . " checks).\n";

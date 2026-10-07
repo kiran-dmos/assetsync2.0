@@ -197,9 +197,22 @@ $renderSelect = static function (array $catalog, string $key, string $name, stri
         echo '<small class="assetsync-mapping-error">' . $html($selected['reason'] ?? 'Saved field is unavailable; reselection is required.') . '</small>';
     }
 };
-$renderRow = static function (array $row, string $index) use ($fields, $glpiBFields, $sourceOptions, $html, $scalar, $renderSelect): void {
+$renderRow = static function (array $row, string $index) use ($fields, $glpiBFields, $sourceOptions, $selectedItemtype, $html, $scalar, $renderSelect): void {
     $prefix = 'field_mappings[' . $index . ']';
     echo '<tr class="assetsync-mapping-row">';
+    if (FieldMapping::isReservedUuidRow($selectedItemtype, $row, $glpiBFields)) {
+        // Carry unchanged identities, not rediscovered aliases. Save verifies them against stored rows.
+        $raw = $row['_raw'] ?? $row;
+        echo '<td><code>' . $html($scalar($raw['glpi_a_field_key'] ?? '')) . '</code>';
+        echo '<small class="assetsync-mapping-error">Reserved mapping conflict: ' . $html(FieldMapping::UUID_MAPPING_CONFLICT) . '</small>';
+        foreach (['glpi_a_field_key', 'glpi_b_field_key', 'glpi_b_field_id', 'glpi_b_field_uid', 'glpi_b_field_label', 'source_of_truth'] as $key) {
+            echo '<input type="hidden" name="' . $html($prefix . '[' . $key . ']') . '" value="' . $html($scalar($raw[$key] ?? '')) . '">';
+        }
+        echo '</td><td><code>' . $html($scalar($raw['glpi_b_field_key'] ?? '')) . '</code></td>';
+        echo '<td>' . $html($scalar($raw['source_of_truth'] ?? '')) . '</td>';
+        echo '<td class="assetsync-mapping-remove"><button type="button" class="btn btn-sm btn-ghost-secondary" data-remove-row title="Remove mapping" aria-label="Remove mapping"><i class="ti ti-trash" aria-hidden="true"></i></button></td></tr>';
+        return;
+    }
     echo '<td>';
     $renderSelect($fields, $scalar($row['glpi_a_field_key'] ?? ''), $prefix . '[glpi_a_field_key]', 'GLPI A');
     echo '</td><td>';

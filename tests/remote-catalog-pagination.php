@@ -21,6 +21,9 @@ namespace GlpiPlugin\Assetsync20 {
         if (isset($step['input'])) {
             \catalogCheck(json_decode($curl->options[CURLOPT_POSTFIELDS], true)['input'] === $step['input'], 'Only the expected mapped field may be written.');
         }
+        foreach ($step['query'] ?? [] as $key => $value) {
+            \catalogCheck(($query[$key] ?? null) === $value, 'Expected exact query filter: ' . $key);
+        }
         \CatalogCurl::$methods[] = $curl->options[CURLOPT_CUSTOMREQUEST];
         $curl->status = $step['status'];
         ($curl->options[CURLOPT_HEADERFUNCTION])($curl, 'HTTP/1.1 ' . $step['status'] . "\r\n");
