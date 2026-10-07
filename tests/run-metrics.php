@@ -138,6 +138,7 @@ namespace {
     runMetricsCheck($summary['examined'] === 1 && $summary['enqueued'] === 0 && (float) $summary['scan_ms'] >= 1.0 && $summary['scan_stop_reason'] === 'visits_complete', 'A full queue batch must still report bounded backfill progress.');
 
     $remote = new class {
+        public function nativeMappingContext(...$arguments): array { return (new FakeGlpiBClient())->nativeMappingContext(...$arguments); }
         public function searchBySerial(array $connection, string $itemtype, string $serial): array
         {
             return $serial === 'RETRY'

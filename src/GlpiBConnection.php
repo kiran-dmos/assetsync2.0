@@ -434,10 +434,19 @@ final class GlpiBConnection
                 ];
             }
 
+            $id = self::createdItemId($response['body']);
+            try {
+                $item = self::verifyNativeWrite($connection, $itemtype, $id, $input, $sessionToken);
+            } catch (RemoteRequestFailure $error) {
+                return $error->result + ['id' => $id];
+            } catch (\RuntimeException $error) {
+                return ['success' => false, 'message' => $error->getMessage(), 'transient' => false, 'id' => $id];
+            }
             return [
                 'success'   => true,
                 'message'   => 'GLPI B asset created.',
-                'id'        => self::createdItemId($response['body']),
+                'id'        => $id,
+                'item'      => $item,
                 'transient' => false,
             ];
         });
@@ -488,6 +497,7 @@ final class GlpiBConnection
                 ];
             }
 
+            self::verifyNativeWrite($connection, $itemtype, $itemsId, $input, $sessionToken);
             return [
                 'success'   => true,
                 'message'   => 'GLPI B asset updated.',
@@ -496,61 +506,205 @@ final class GlpiBConnection
         });
     }
 
+    private static function verifyNativeWrite(array $connection, string $itemtype, int $id, array $input, string $sessionToken): array
+    {
+        $result = self::request('GET', self::apiUrl($connection['base_url'], rawurlencode($itemtype) . '/' . $id), [
+            'App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken,
+        ]);
+        if (!$result['success']) {
+            throw new RemoteRequestFailure($result);
+        }
+        if ((int) ($result['body']['id'] ?? 0) !== $id || $id <= 0) {
+            throw new \RuntimeException('GLPI B native write could not be verified.');
+        }
+        $definitions = NativeField::definitions($itemtype);
+        foreach ($input as $field => $value) {
+            $type = $definitions[$field]['type'] ?? 'int';
+            $persisted = $result['body'][$field] ?? null;
+            $matches = $type === 'dropdown'
+                ? NativeField::referenceId($persisted) === NativeField::referenceId($value)
+                : FieldsText::normalizeReadValue($type, $persisted) === FieldsText::normalizeReadValue($type, $value);
+            if (!array_key_exists($field, $result['body']) || !$matches) {
+                throw new \RuntimeException('GLPI B did not persist native field: ' . $field);
+            }
+        }
+        return $result['body'];
+    }
+
+    /** Fresh metadata and complete reference catalogs for one asset operation. */
+    public static function nativeMappingContext(array $connection, string $itemtype, array $keys, int $entityId): array
+    {
+        if ($keys === []) {
+            return ['success' => true, 'fields' => [], 'catalogs' => []];
+        }
+        return self::withSession($connection, static function (string $token) use ($connection, $itemtype, $keys, $entityId): array {
+            $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $token];
+            $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+            if (!$options['success']) {
+                return $options;
+            }
+            $fields = [];
+            $catalogs = [];
+            $path = [$entityId];
+            foreach (array_unique($keys) as $key) {
+                $descriptor = NativeField::resolve($itemtype, $key, $options['body']);
+                $fields[$key] = $descriptor;
+                $relation = $descriptor['relation'];
+                if ($relation === '' || isset($catalogs[$descriptor['field']])) {
+                    continue;
+                }
+                $rows = [];
+                foreach (self::remoteCollectionRows($connection, $headers, $relation) as $row) {
+                    if (isset($row['entities_id']) && count($path) === 1) {
+                        $path = self::remoteEntityPath($connection, $headers, $entityId);
+                    }
+                    if (NativeField::permitted($row, $descriptor, $path, false)) {
+                        $rows[] = $row;
+                    }
+                }
+                $catalogs[$descriptor['field']] = $rows;
+            }
+            return ['success' => true, 'fields' => $fields, 'catalogs' => $catalogs, 'entity_path' => $path];
+        });
+    }
+
+    public static function nativeStateCatalog(array $connection, string $itemtype, array $rows, mixed $sourceId, array $labels, array $entityPath): array
+    {
+        return self::withSession($connection, static function (string $token) use ($connection, $itemtype, $rows, $sourceId, $labels, $entityPath): array {
+            $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $token];
+            $sourceId = NativeField::referenceId($sourceId);
+            $permitted = [];
+            $descriptor = NativeField::definitions($itemtype)['states_id'];
+            foreach ($rows as $row) {
+                $id = NativeField::referenceId($row['id'] ?? null);
+                if ($id !== $sourceId && !in_array(FieldsText::dropdownLabel($row), $labels, true)) {
+                    continue;
+                }
+                $detail = self::request('GET', self::apiUrl($connection['base_url'], 'State/' . $id), $headers);
+                if (!$detail['success']) {
+                    return $detail;
+                }
+                if ((int) ($detail['body']['id'] ?? 0) !== $id || FieldsText::dropdownLabel($detail['body']) !== FieldsText::dropdownLabel($row)) {
+                    throw new \RuntimeException('GLPI B State changed during reference validation.');
+                }
+                if (NativeField::permitted($detail['body'], $descriptor, $entityPath)) {
+                    $permitted[] = $detail['body'];
+                }
+            }
+            return ['success' => true, 'rows' => $permitted];
+        });
+    }
+
+    private static function remoteEntityPath(array $connection, array $headers, int $entityId): array
+    {
+        $path = [$entityId];
+        while ($entityId > 0) {
+            $entity = self::request('GET', self::apiUrl($connection['base_url'], 'Entity/' . $entityId), $headers);
+            if (!$entity['success']) {
+                throw new RemoteRequestFailure($entity);
+            }
+            if (NativeField::referenceId($entity['body']['id'] ?? null) !== $entityId || !isset($entity['body']['entities_id'])) {
+                throw new \RuntimeException('GLPI B entity ancestry is unavailable.');
+            }
+            $entityId = NativeField::referenceId($entity['body']['entities_id']);
+            if (in_array($entityId, $path, true) || count($path) >= 100) {
+                throw new \RuntimeException('Invalid GLPI B entity ancestry.');
+            }
+            $path[] = $entityId;
+        }
+        return $path;
+    }
+
     /** Read and optionally write mapped Fields-plugin values through child-row REST endpoints. */
-    public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false): array
+    public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false, bool $dryRun = false, ?int $targetEntityId = null, array $preparedMetadata = []): array
     {
         $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
         if ($keys === []) {
             return ['success' => true, 'item' => [], 'history_option_ids' => [], 'history_refs' => []];
         }
 
-        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes, $allowReadonly): array {
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $itemsId, $keys, $changes, $expectedTypes, $allowReadonly, $dryRun, $targetEntityId, $preparedMetadata): array {
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
-            $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
-            if (!$options['success']) {
-                return $options;
+            $options = ['body' => []];
+            if (array_diff($keys, array_keys($preparedMetadata)) !== []) {
+                $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+                if (!$options['success']) {
+                    return $options;
+                }
             }
 
             $containers = [];
+            $definitions = [];
             $historyOptionIds = [];
             $historyRefs = [];
+            $dropdownCatalogs = [];
+            $dropdownEntityPath = null;
+            $storedChanges = [];
+            $resolvedMetadata = [];
             foreach ($keys as $key) {
-                $metadata = null;
-                foreach ($options['body'] as $optionId => $option) {
+                $metadata = $preparedMetadata[$key] ?? null;
+                foreach ($metadata === null ? $options['body'] : [] as $optionId => $option) {
                     if (!is_array($option)) {
                         continue;
                     }
 
-                    if (FieldsText::key($itemtype, $option) !== $key) {
+                    if (FieldsText::remoteKey($itemtype, $option) !== $key) {
                         continue;
                     }
-
-                    $candidate = FieldsText::metadataFromOption($itemtype, $option, $optionId);
-                    if ($candidate['key'] === $key) {
-                        $metadata = $candidate;
-                        break;
+                    $fieldId = NativeField::referenceId($option['pfields_fields_id'] ?? null);
+                    if ($fieldId <= 0) {
+                        throw new \RuntimeException('The mapped remote Fields-plugin field is missing its field id metadata: ' . $key);
                     }
+                    if (!isset($definitions[$fieldId])) {
+                        $definition = self::request('GET', self::apiUrl($connection['base_url'], 'PluginFieldsField/' . $fieldId), $headers);
+                        if (!$definition['success']) {
+                            $definition['message'] = 'Cannot read GLPI B Fields field configuration (PluginFieldsField). ' . $definition['message'];
+                            return $definition;
+                        }
+                        $definitions[$fieldId] = $definition['body'];
+                    }
+                    $metadata = FieldsText::remoteMetadataFromOption($itemtype, $option, $optionId, $definitions[$fieldId]);
+                    break;
                 }
                 if ($metadata === null) {
                     throw new \RuntimeException('The mapped remote Fields-plugin field is unavailable: ' . $key);
                 }
-                if ($metadata['field_id'] <= 0) {
-                    throw new \RuntimeException('The mapped remote Fields-plugin field is missing its field id metadata: ' . $key);
-                }
-                $definition = self::request('GET', self::apiUrl($connection['base_url'], 'PluginFieldsField/' . $metadata['field_id']), $headers);
-                if (!$definition['success']) {
-                    $definition['message'] = 'Cannot read GLPI B Fields field configuration (PluginFieldsField). Verify that the API account has configuration-read permission for the Fields plugin. ' . $definition['message'];
-                    return $definition;
-                }
-                $metadata = FieldsText::metadataWithDefinition($metadata, $definition['body']);
                 $expectedType = (string) ($expectedTypes[$key] ?? 'text');
-                if ($metadata['type'] !== $expectedType) {
+                if (!NativeField::compatible($metadata['type'], $expectedType)) {
                     $foundType = $metadata['type'] !== '' ? $metadata['type'] : 'unsupported';
                     throw new \RuntimeException('The remote Fields-plugin definition is not an active ' . $expectedType . ' field: ' . $key . ' (found ' . $foundType . ').');
                 }
                 if (array_key_exists($key, $changes) && !$allowReadonly && !$metadata['writable']) {
                     throw new \RuntimeException('The remote Fields-plugin field is read-only: ' . $key);
                 }
+                if ($metadata['type'] === 'dropdown') {
+                    $catalog = $metadata['dropdown_class'];
+                    $dropdownCatalogs[$catalog] ??= $metadata['dropdown_catalog'] ?? self::remoteDropdownRows($connection, $headers, $metadata);
+                    $metadata['dropdown_catalog'] = $dropdownCatalogs[$catalog];
+                    $metadata['dropdown_rows'] = $dropdownCatalogs[$catalog];
+                    if (array_filter($metadata['dropdown_rows'], static fn (array $row): bool => isset($row['entities_id'])) !== []) {
+                        if ($dropdownEntityPath === null) {
+                            $entityId = $targetEntityId;
+                            if ($entityId === null) {
+                                $parent = self::request('GET', self::apiUrl($connection['base_url'], rawurlencode($itemtype) . '/' . $itemsId), $headers);
+                                if (!$parent['success']) {
+                                    return $parent;
+                                }
+                                if ((int) ($parent['body']['id'] ?? 0) !== $itemsId || !isset($parent['body']['entities_id'])) {
+                                    throw new \RuntimeException('Cannot establish the remote dropdown entity scope.');
+                                }
+                                $entityId = (int) $parent['body']['entities_id'];
+                            }
+                            $dropdownEntityPath = self::remoteEntityPath($connection, $headers, $entityId);
+                        }
+                        $metadata['dropdown_rows'] = array_values(array_filter($metadata['dropdown_rows'],
+                            static fn (array $row): bool => NativeField::permitted($row, ['relation' => $catalog, 'itemtype' => $itemtype], $dropdownEntityPath)));
+                    }
+                }
+                if (array_key_exists($key, $changes)) {
+                    $storedChanges[$key] = self::customWriteValue($connection, $headers, $metadata, $changes[$key]);
+                }
+                $resolvedMetadata[$key] = $metadata;
                 if ($metadata['search_option_id'] > 0) {
                     $historyOptionIds[$key] = (string) $metadata['search_option_id'];
                 }
@@ -569,20 +723,28 @@ final class GlpiBConnection
 
             $values = [];
             foreach ($containers as $class => $container) {
-                if ($itemsId <= 0) {
+                if ($itemsId <= 0 && !$dryRun) {
                     continue; // Validate before creating a native asset.
                 }
                 $writing = array_intersect_key($changes, $container['fields']) !== [];
-                self::assertCustomContainerAccess($itemtype, $itemsId, $container['id'], $writing, static function (string $endpoint) use ($connection, $headers): array {
+                self::assertCustomContainerAccess($itemtype, $itemsId, $container['id'], $writing, static function (string $endpoint) use ($connection, $headers, $container): array {
                     $result = self::request('GET', self::apiUrl($connection['base_url'], $endpoint), $headers);
                     if (!$result['success']) {
                         $result['message'] = 'Cannot establish GLPI B Fields container permission. Verify the API account\'s Fields configuration/profile-read and asset/entity access. ' . $result['message'];
                         throw new RemoteRequestFailure($result);
                     }
+                    if ($endpoint === 'PluginFieldsContainer/' . $container['id']) {
+                        foreach ($container['fields'] as $fieldInfo) {
+                            FieldsText::validateRemoteContainer($fieldInfo['metadata'], $result['body']);
+                        }
+                    }
                     return $result['body'];
                 }, static function (string $endpoint) use ($connection, $headers): array {
                     return self::remoteCollectionRows($connection, $headers, $endpoint);
-                });
+                }, $targetEntityId);
+                if ($dryRun) {
+                    continue;
+                }
                 $endpoint = rawurlencode($itemtype) . '/' . $itemsId . '/' . rawurlencode($class);
                 $response = self::request('GET', self::apiUrlWithQuery($connection['base_url'], $endpoint, ['range' => '0-1']), $headers);
                 if (!$response['success']) {
@@ -602,7 +764,7 @@ final class GlpiBConnection
                     $type = $fieldInfo['type'];
                     $values[$key] = $row === [] ? FieldsText::missingValue($type) : self::customReadValue($connection, $headers, $fieldInfo['metadata'], $row[$column] ?? null);
                     if (array_key_exists($key, $changes)) {
-                        $input[$column] = self::customWriteValue($connection, $headers, $fieldInfo['metadata'], $changes[$key]);
+                        $input[$column] = $storedChanges[$key];
                     }
                 }
                 if ($input === []) {
@@ -637,7 +799,7 @@ final class GlpiBConnection
                 }
             }
 
-            return ['success' => true, 'item' => $values, 'history_option_ids' => $historyOptionIds, 'history_refs' => $historyRefs];
+            return ['success' => true, 'item' => $values, 'history_option_ids' => $historyOptionIds, 'history_refs' => $historyRefs, 'metadata' => $resolvedMetadata];
         });
     }
 
@@ -653,13 +815,13 @@ final class GlpiBConnection
             return FieldsText::normalizeReadValue($type, $value);
         }
 
-        $id = self::cleanRemoteId($value);
+        $id = NativeField::referenceId($value);
         if ($id <= 0) {
             return '';
         }
 
         return self::remoteDropdownLabelForId(
-            self::remoteDropdownRows($connection, $headers, $metadata),
+            $metadata['dropdown_rows'] ?? self::remoteDropdownRows($connection, $headers, $metadata),
             $id,
             (string) ($metadata['key'] ?? 'unknown')
         );
@@ -683,7 +845,7 @@ final class GlpiBConnection
         }
 
         return self::remoteDropdownIdForLabel(
-            self::remoteDropdownRows($connection, $headers, $metadata),
+            $metadata['dropdown_rows'] ?? self::remoteDropdownRows($connection, $headers, $metadata),
             $label,
             (string) ($metadata['key'] ?? 'unknown')
         );
@@ -887,7 +1049,7 @@ final class GlpiBConnection
     }
 
     /** Mirror Fields' profile and container entity checks before accessing a generated child row. */
-    private static function assertCustomContainerAccess(string $itemtype, int $itemsId, int $containerId, bool $writing, callable $read, ?callable $readCollection = null): void
+    private static function assertCustomContainerAccess(string $itemtype, int $itemsId, int $containerId, bool $writing, callable $read, ?callable $readCollection = null, ?int $targetEntityId = null): void
     {
         $profile = $read('getActiveProfile')['active_profile'] ?? [];
         $profileId = (int) ($profile['id'] ?? 0);
@@ -916,7 +1078,9 @@ final class GlpiBConnection
         if ($right < 1 || ($writing && $right <= 1)) {
             throw new \RuntimeException('GLPI B Fields container permission denied or unavailable for the active API profile. Grant the required container ' . ($writing ? 'write' : 'read') . ' right in the Fields plugin profile settings.');
         }
-        $asset = $read(rawurlencode($itemtype) . '/' . $itemsId);
+        $asset = $itemsId <= 0 && $targetEntityId !== null
+            ? ['id' => $itemsId, 'entities_id' => $targetEntityId]
+            : $read(rawurlencode($itemtype) . '/' . $itemsId);
         if ((int) ($asset['id'] ?? 0) !== $itemsId || !isset($asset['entities_id']) || !empty($asset['is_deleted'])) {
             throw new \RuntimeException('Cannot establish GLPI B Fields container permission: parent asset is unavailable.');
         }
@@ -1051,67 +1215,7 @@ final class GlpiBConnection
      */
     private static function fieldsFromSearchOptions(array $options, string $itemtype = 'Computer'): array
     {
-        $fields = [];
-        $seenKeys = [];
-
-        foreach ($options as $optionId => $option) {
-            if (!is_array($option) || !isset($option['name']) || !is_scalar($option['name'])) {
-                continue;
-            }
-
-            $label = trim(strip_tags((string) $option['name']));
-            if ($label === '') {
-                continue;
-            }
-
-            $id = self::searchOptionId($optionId, $option);
-            $customKey = FieldsText::key($itemtype, $option);
-            if ($customKey !== '') {
-                try {
-                    FieldsText::validate($option);
-                } catch (\RuntimeException) {
-                    continue;
-                }
-
-                if (isset($seenKeys[$customKey])) {
-                    continue;
-                }
-
-                $seenKeys[$customKey] = true;
-                $fields[] = [
-                    'key' => $customKey,
-                    'id' => $id,
-                    'uid' => $customKey,
-                    'label' => $label,
-                ];
-                continue;
-            }
-
-            if (self::hasRawFieldsPluginMetadata($option)) {
-                continue;
-            }
-
-            if ($id === '' && self::isHeaderOnlySearchOption($option)) {
-                continue;
-            }
-
-            $uid = isset($option['uid']) && is_scalar($option['uid']) ? trim((string) $option['uid']) : '';
-            $key = $uid !== '' ? $uid : $id;
-
-            if ($key === '' || isset($seenKeys[$key])) {
-                continue;
-            }
-
-            $seenKeys[$key] = true;
-            $fields[] = [
-                'key'   => $key,
-                'id'    => $id,
-                'uid'   => $uid,
-                'label' => $label,
-            ];
-        }
-
-        return $fields;
+        return FieldMapping::discoverFields($itemtype, $options, true);
     }
 
     /**
@@ -1126,40 +1230,11 @@ final class GlpiBConnection
                 continue;
             }
 
-            foreach (['pfields_type', 'pfields_fields_id', 'plugin_fields_containers_id', 'is_multiple', 'multiple'] as $metadataKey) {
-                if (!array_key_exists($metadataKey, $option) && array_key_exists($metadataKey, $rawOptions[$optionId])) {
-                    $option[$metadataKey] = $rawOptions[$optionId][$metadataKey];
-                }
-            }
-
-            $options[$optionId] = $option;
+            // Raw table/column/join metadata is authoritative; enriched options supply missing UIDs/linkfields.
+            $options[$optionId] = array_replace($option, $rawOptions[$optionId]);
         }
 
         return $options;
-    }
-
-    /**
-     * @param array<string,mixed> $option
-     */
-    private static function hasRawFieldsPluginMetadata(array $option): bool
-    {
-        return isset($option['pfields_type'])
-            && is_scalar($option['pfields_type'])
-            && trim((string) $option['pfields_type']) !== '';
-    }
-
-    /**
-     * @param array<string,mixed> $option
-     */
-    private static function isHeaderOnlySearchOption(array $option): bool
-    {
-        foreach (['field', 'table', 'datatype', 'uid'] as $fieldName) {
-            if (isset($option[$fieldName]) && is_scalar($option[$fieldName]) && trim((string) $option[$fieldName]) !== '') {
-                return false;
-            }
-        }
-
-        return true;
     }
 
     /**

@@ -36,7 +36,7 @@ function notificationSetup(): array
     GlpiBConnection::save(['id' => 'a', 'active' => true]);
     EntitySyncRoute::save(['id' => 'route', 'glpi_b_connection_id' => 'a',
         'glpi_a_source_entity_id' => '1', 'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
-    FieldMapping::save('a', 'Computer', ['name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']]);
+    \saveTestMappings('a', 'Computer', ['name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']]);
     notificationCheck(FieldMapping::syncMappings('a', 'Computer') === [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a']], 'Fixture must independently prove its native mapping.');
     $GLOBALS['DB']->insert('glpi_entities', ['id' => 1, 'entities_id' => 0]);
     $GLOBALS['DB']->insert('glpi_computers', ['id' => 101, 'entities_id' => 1, 'is_deleted' => 0,
@@ -197,6 +197,7 @@ notificationCheck($service->processQueue(1) === 1 && count($remote->requests) ==
 $client = new class($remote) {
     public ?Closure $duringRead = null;
     public function __construct(public FakeGlpiBClient $delegate) {}
+    public function nativeMappingContext(...$arguments): array { return $this->delegate->nativeMappingContext(...$arguments); }
     public function getItem(array $connection, string $type, int $id, bool $timezone = true): array
     {
         if ($this->duringRead !== null) { ($this->duringRead)(); }
@@ -227,6 +228,7 @@ foreach ([503, 403] as $status) {
     $remote = new class($status) {
         public int $calls = 0;
         public function __construct(private int $status) {}
+        public function nativeMappingContext(...$arguments): array { return (new FakeGlpiBClient())->nativeMappingContext(...$arguments); }
         public function getItem(array $connection, string $type, int $id, bool $timezone): array
         {
             $this->calls++;

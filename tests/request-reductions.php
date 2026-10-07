@@ -56,7 +56,7 @@ function reductionSetup(string $mode = 'linked', array $changed = [0], string $s
         $remote->customHistoryOptionIds[$key] = (string) (8001 + $index);
     }
     PluginFieldsComputerdmosasset::$rows[101] = $localRow;
-    FieldMapping::save('reduction', 'Computer', $mappings, $remoteFields);
+    \saveTestMappings('reduction', 'Computer', $mappings, $remoteFields);
     reductionCheck(FieldMapping::syncMappings('reduction', 'Computer')[0] === ['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a'], 'Fixture native mapping must resolve through the real local search-option ID.');
     if ($mode !== 'create') {
         $remote->records['reduction:Computer'][201] = ['id' => 201, 'entities_id' => 100, 'is_deleted' => 0,
@@ -74,7 +74,8 @@ function reductionSetup(string $mode = 'linked', array $changed = [0], string $s
 
 function reductionCustomCalls(FakeGlpiBClient $remote): array
 {
-    return array_values(array_filter($remote->requests, static fn (array $request): bool => $request['method'] === 'customTextValues'));
+    return array_values(array_filter($remote->requests, static fn (array $request): bool => $request['method'] === 'customTextValues'
+        && (empty($request['dry_run']) || $request['items_id'] === 0)));
 }
 
 function reductionStatus(): string
@@ -87,7 +88,7 @@ foreach (['linked', 'matched'] as $mode) {
     $remote->readonlyCustomKeys[$keys[0]] = true;
     reductionCheck($service->processQueue(1) === 1 && reductionStatus() === 'done', 'Existing assets must complete without zero-item validation.');
     $methods = array_column($remote->requests, 'method');
-    $expected = ['getItem', 'customTextValues', 'updateItem', 'customTextValues'];
+    $expected = ['getItem', 'customTextValues', 'customTextValues', 'updateItem', 'customTextValues'];
     reductionCheck($methods === ($mode === 'matched' ? ['searchBySerial', ...$expected] : $expected), 'Linked/matched ordering must fully read custom maps before native/custom updates.');
     $itemRead = array_values(array_filter($remote->requests, static fn ($request) => $request['method'] === 'getItem'))[0];
     reductionCheck(!$itemRead['needs_date_mod_timezone'], 'Linked/matched A-owned mappings must not require timezone permission.');
@@ -109,9 +110,10 @@ reductionCheck(count(reductionCustomCalls($remote)) === 1 && reductionCustomCall
 
 [$service, $remote, $keys] = reductionSetup('create');
 $service->processQueue(1);
-reductionCheck(array_column($remote->requests, 'method') === ['searchBySerial', 'customTextValues', 'createItem', 'customTextValues', 'customTextValues'], 'Creation must validate only after a zero-match search and immediately before native create.');
+reductionCheck(array_column($remote->requests, 'method') === ['searchBySerial', 'customTextValues', 'createItem', 'customTextValues', 'customTextValues', 'customTextValues'], 'Creation must validate only after a zero-match search and immediately before native create.');
 $custom = reductionCustomCalls($remote);
-reductionCheck($custom[0]['items_id'] === 0 && $custom[0]['keys'] === $keys && $custom[0]['changes'] === [] && $custom[0]['expected_types'] === array_fill_keys($keys, 'text'), 'Creation validation must still include all configured custom maps.');
+reductionCheck($custom[0]['items_id'] === 0 && $custom[0]['keys'] === $keys && $custom[0]['changes'] === array_combine($keys, ['Local 0', 'Local 1', 'Local 2', 'Local 3'])
+    && $custom[0]['dry_run'] && $custom[0]['expected_types'] === array_fill_keys($keys, 'text'), 'Creation validation must resolve all configured custom destination values before POST.');
 reductionCheck($custom[1]['items_id'] === 1000 && $custom[1]['keys'] === $keys && $custom[2]['keys'] === $keys && $custom[2]['allow_readonly'] && reductionStatus() === 'done', 'Missing custom rows after native creation must retain full initial read and all changed writes.');
 reductionCheck($remote->customRecords['reduction:Computer'][1000] === array_combine($keys, ['Local 0', 'Local 1', 'Local 2', 'Local 3']), 'All new custom values must persist after creation.');
 
@@ -129,7 +131,9 @@ foreach (['linked', 'matched', 'create'] as $mode) {
     $service->processQueue(1);
     reductionCheck(reductionStatus() === 'blocked' && !array_intersect(['createItem', 'updateItem'], array_column($remote->requests, 'method')), 'Invalid unchanged mappings must still block before any native create/update.');
     $custom = reductionCustomCalls($remote);
-    reductionCheck(count($custom) === 1 && $custom[0]['keys'] === $keys && $custom[0]['changes'] === [] && $custom[0]['items_id'] === ($mode === 'create' ? 0 : 201), 'All-map validation must remain on the correct creation/existing read path.');
+    reductionCheck(count($custom) === 1 && $custom[0]['keys'] === $keys
+        && ($mode === 'create' ? $custom[0]['dry_run'] : $custom[0]['changes'] === [])
+        && $custom[0]['items_id'] === ($mode === 'create' ? 0 : 201), 'All-map validation must remain on the correct creation/existing read path.');
 }
 
 [$service, $remote, $keys] = reductionSetup('linked', [0], 'both');
@@ -144,8 +148,8 @@ reductionCheck($remote->requests[0]['needs_date_mod_timezone'], 'Custom Both map
 
 [$service, $remote] = reductionSetup();
 $nativeBoth = FieldMapping::load('reduction', 'Computer');
-$nativeBoth[1]['source_of_truth'] = 'both';
-FieldMapping::save('reduction', 'Computer', $nativeBoth);
+$nativeBoth[0]['source_of_truth'] = 'both';
+\saveTestMappings('reduction', 'Computer', $nativeBoth);
 $service->processQueue(1);
 reductionCheck($remote->requests[0]['needs_date_mod_timezone'], 'Native Both mappings must retain named timezone lookup.');
 

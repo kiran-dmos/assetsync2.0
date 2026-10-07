@@ -232,6 +232,72 @@ final class FieldsText
         ];
     }
 
+    /** Remote generated classes must never be resolved through the local plugin installation. */
+    public static function remoteKey(string $itemtype, array $option): string
+    {
+        $table = self::nestedScalar($option, ['joinparams', 'beforejoin', 'table']);
+        if ($table === '') {
+            $table = (string) ($option['table'] ?? '');
+        }
+        if (self::typeFromMetadata($option) === 'dropdown' && self::dropdownDefinitionNameFromTable($table) !== '') {
+            $class = self::rowClassFromOptionUid($option);
+            if ($class !== '') {
+                $table = 'glpi_plugin_fields_' . strtolower(substr($class, strlen('PluginFields'))) . 's';
+            }
+        }
+        if (!preg_match('/^glpi_plugin_fields_(' . strtolower($itemtype) . '[a-z0-9_]*)s$/D', $table, $match)) {
+            return '';
+        }
+        $class = 'PluginFields' . ucfirst($match[1]);
+        $column = self::columnFromOption($option);
+        if (!preg_match('/^[a-z][a-z0-9_]*$/D', $column)) {
+            return '';
+        }
+        $key = $itemtype . '.' . $class . '.' . $column;
+        $uid = (string) ($option['uid'] ?? '');
+        $dropdownUid = $itemtype . '.' . $class . '.' . self::dropdownClass(self::dropdownDefinitionName($column)) . '.' . ($option['field'] ?? '');
+        if ($uid !== '' && $uid !== $key && !(self::typeFromMetadata($option) === 'dropdown' && $uid === $dropdownUid)) {
+            throw new \RuntimeException('Remote Fields UID does not match its table and column: ' . $uid);
+        }
+        return $key;
+    }
+
+    public static function remoteMetadataFromOption(string $itemtype, array $option, mixed $optionId, array $definition, ?array $container = null): array
+    {
+        $key = self::remoteKey($itemtype, $option);
+        $class = explode('.', $key)[1] ?? '';
+        $column = self::columnFromOption($option);
+        if ($key === '' || (int) ($definition['id'] ?? 0) !== self::positiveInt($option['pfields_fields_id'] ?? 0)) {
+            throw new \RuntimeException('Remote Fields definition identity does not match: ' . $key);
+        }
+        $type = self::validate($option);
+        $metadata = [
+            'key' => $key, 'itemtype' => $itemtype, 'class' => $class,
+            'table' => 'glpi_plugin_fields_' . strtolower(substr($class, strlen('PluginFields'))) . 's',
+            'field' => $column, 'type' => $type,
+            'definition_name' => $type === 'dropdown' ? self::dropdownDefinitionName($column) : $column,
+            'search_option_id' => self::positiveInt($option['id'] ?? $optionId),
+        ];
+        $metadata = self::metadataWithDefinition($metadata, $definition);
+        if ($container !== null) {
+            self::validateRemoteContainer($metadata, $container);
+        }
+        return $metadata;
+    }
+
+    public static function validateRemoteContainer(array $metadata, array $container): void
+    {
+        $name = (string) ($container['name'] ?? '');
+        $itemtype = $metadata['itemtype'];
+        $class = 'PluginFields' . ucfirst(strtolower($itemtype . preg_replace('/s$/', '', $name)));
+        $itemtypes = json_decode((string) ($container['itemtypes'] ?? ''), true);
+        if (!preg_match('/^[a-z][a-z0-9_]*$/D', $name) || $metadata['class'] !== $class
+            || empty($container['is_active']) || !is_array($itemtypes) || !in_array($itemtype, $itemtypes, true)
+            || (int) ($container['id'] ?? 0) !== $metadata['container_id']) {
+            throw new \RuntimeException('Remote Fields definition/container identity does not match: ' . $metadata['key']);
+        }
+    }
+
     public static function metadataWithDefinition(array $metadata, array $definition): array
     {
         $type = self::typeFromMetadata($definition);
@@ -343,6 +409,7 @@ final class FieldsText
                 continue;
             }
             $field = $metadata[$key];
+            $field['items_id'] = $itemsId;
             $row = new $field['class']();
             $found = $row->getFromDBByCrit(['items_id' => $itemsId, 'itemtype' => $itemtype]);
             if (!$found) {
@@ -357,26 +424,15 @@ final class FieldsText
 
     public static function updateLocal(string $itemtype, int $itemsId, array $values, bool $allowReadonly = false): bool
     {
-        foreach ($values as $key => $value) {
-            $metadata = null;
-            foreach (self::localOptions($itemtype) as $optionId => $option) {
-                if (self::key($itemtype, $option) === $key) {
-                    $metadata = self::metadataFromOption($itemtype, $option, $optionId);
-                    $definition = new \PluginFieldsField();
-                    if (!$definition->getFromDB((int) $metadata['field_id'])) {
-                        return false;
-                    }
-                    $metadata = self::metadataWithDefinition($metadata, $definition->fields);
-                    break;
-                }
-            }
-            if ($metadata === null || (!$allowReadonly && !$metadata['writable'])) {
-                return false;
-            }
-            $value = self::normalizeValue($metadata['type'], $value);
-            $storedValue = $metadata['type'] === self::TYPE_DROPDOWN
-                ? self::localDropdownIdForLabel($metadata, $value)
-                : $value;
+        try {
+            $preparedValues = self::prepareLocalWrite($itemtype, $itemsId, $values, $allowReadonly);
+        } catch (\UnexpectedValueException) {
+            return false;
+        }
+        foreach ($preparedValues as $key => $prepared) {
+            $metadata = $prepared['metadata'];
+            $value = $prepared['value'];
+            $storedValue = $prepared['stored'];
             $row = new $metadata['class']();
             $input = ['items_id' => $itemsId, 'itemtype' => $itemtype,
                 'plugin_fields_containers_id' => $metadata['container_id'],
@@ -397,8 +453,36 @@ final class FieldsText
                 return false;
             }
         }
-
         return true;
+    }
+
+    public static function prepareLocalWrite(string $itemtype, int $itemsId, array $values, bool $allowReadonly = false): array
+    {
+        $prepared = [];
+        foreach ($values as $key => $value) {
+            $metadata = null;
+            foreach (self::localOptions($itemtype) as $optionId => $option) {
+                if (self::key($itemtype, $option) === $key) {
+                    $metadata = self::metadataFromOption($itemtype, $option, $optionId);
+                    $definition = new \PluginFieldsField();
+                    if (!$definition->getFromDB((int) $metadata['field_id'])) {
+                        throw new \UnexpectedValueException('The local Fields definition is unavailable: ' . $key);
+                    }
+                    $metadata = self::metadataWithDefinition($metadata, $definition->fields);
+                    break;
+                }
+            }
+            if ($metadata === null || (!$allowReadonly && !$metadata['writable'])) {
+                throw new \UnexpectedValueException('The local Fields field is unavailable or read-only: ' . $key);
+            }
+            $value = self::normalizeValue($metadata['type'], $value);
+            $metadata['items_id'] = $itemsId;
+            $storedValue = $metadata['type'] === self::TYPE_DROPDOWN
+                ? self::localDropdownIdForLabel($metadata, $value)
+                : $value;
+            $prepared[$key] = ['metadata' => $metadata, 'value' => $value, 'stored' => $storedValue];
+        }
+        return $prepared;
     }
 
     public static function readValue(array $metadata, $value)
@@ -530,7 +614,7 @@ final class FieldsText
 
     private static function localDropdownLabelForId(array $metadata, $value): string
     {
-        $id = self::positiveInt($value);
+        $id = NativeField::referenceId($value);
         if ($id <= 0) {
             return '';
         }
@@ -560,6 +644,9 @@ final class FieldsText
             if (!is_array($row) || self::dropdownLabel($row) !== $label) {
                 continue;
             }
+            if (!self::localDropdownPermitted($metadata, $row)) {
+                continue;
+            }
 
             $id = self::positiveInt($row['id'] ?? 0);
             if ($id > 0) {
@@ -584,17 +671,43 @@ final class FieldsText
         if ($class !== '' && class_exists($class)) {
             $dropdown = new $class();
             if (method_exists($dropdown, 'getFromDB') && $dropdown->getFromDB($id)) {
-                return is_array($dropdown->fields ?? null) ? $dropdown->fields : [];
+                return is_array($dropdown->fields ?? null) && self::localDropdownPermitted($metadata, $dropdown->fields) ? $dropdown->fields : [];
             }
         }
 
         foreach (self::localDropdownRows($metadata) as $row) {
             if (is_array($row) && (int) ($row['id'] ?? 0) === $id) {
-                return $row;
+                return self::localDropdownPermitted($metadata, $row) ? $row : [];
             }
         }
 
         return [];
+    }
+
+    private static function localDropdownPermitted(array $metadata, array $row): bool
+    {
+        $class = $metadata['dropdown_class'];
+        if (!class_exists($class)) {
+            throw new \RuntimeException('The local dropdown class is unavailable: ' . $class);
+        }
+        $dropdown = new $class();
+        $id = NativeField::referenceId($row['id'] ?? null);
+        if (!$dropdown->getFromDB($id) || self::dropdownLabel($row) !== self::dropdownLabel($dropdown->fields)) {
+            throw new \RuntimeException('The local dropdown option changed during validation.');
+        }
+        if (method_exists($dropdown, 'can') && !$dropdown->can($id, defined('READ') ? READ : 1)) {
+            return false;
+        }
+        $path = [0];
+        if (isset($dropdown->fields['entities_id'])) {
+            $itemtype = $metadata['itemtype'];
+            $asset = new $itemtype();
+            if (!$asset->getFromDB((int) ($metadata['items_id'] ?? 0)) || !isset($asset->fields['entities_id'])) {
+                throw new \RuntimeException('Cannot establish the local dropdown entity scope.');
+            }
+            $path = NativeField::localEntityPath((int) $asset->fields['entities_id']);
+        }
+        return NativeField::permitted($dropdown->fields, ['relation' => $class, 'itemtype' => $metadata['itemtype']], $path);
     }
 
     private static function localDropdownRows(array $metadata): array
@@ -674,6 +787,11 @@ final class FieldsText
         }
 
         if (is_string($value) && preg_match('/^-?\d+$/D', $value) === 1) {
+            $digits = ltrim(ltrim($value, '-'), '0');
+            $canonical = ($digits !== '' && str_starts_with($value, '-') ? '-' : '') . ($digits === '' ? '0' : $digits);
+            if (filter_var($canonical, FILTER_VALIDATE_INT) === false) {
+                throw new \RuntimeException('Unsupported Fields-plugin number value. Integer is out of range.');
+            }
             return (int) $value;
         }
 

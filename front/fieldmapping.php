@@ -49,61 +49,39 @@ if ($selectedConnection !== null) {
     }
 }
 
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save'])) {
-    if (class_exists('Session') && method_exists('Session', 'checkRight')) {
+$savedMappings = [];
+$posted = $_SERVER['REQUEST_METHOD'] === 'POST';
+try {
+    $savedMappings = $selectedConnectionId !== '' ? FieldMapping::load($selectedConnectionId, $selectedItemtype) : [];
+    if ($posted) {
         Session::checkRight('config', defined('UPDATE') ? UPDATE : 2);
-    }
-
-    if ($selectedConnection === null) {
-        $message = 'Select a GLPI B connection before saving field mappings.';
-        $messageClass = 'warning';
-    } elseif (!$glpiBFieldsLoaded) {
-        $message = 'Field mappings were not saved because GLPI B fields could not be loaded: '
-            . ($glpiBFieldsMessage ?? 'Unknown error.');
-        $messageClass = 'warning';
-    } else {
         $postedMappings = $_POST['field_mappings'] ?? [];
-        FieldMapping::save(
-            $selectedConnectionId,
-            $selectedItemtype,
-            is_array($postedMappings) ? $postedMappings : [],
-            $glpiBFields
-        );
+        if (!is_array($postedMappings)) {
+            throw new RuntimeException('Invalid mapping rows. Nothing was saved.');
+        }
+        $savedMappings = array_values($postedMappings);
+        if ($selectedConnection === null) {
+            throw new RuntimeException('Select a GLPI B connection before saving field mappings.');
+        }
+        if (!$glpiBFieldsLoaded) {
+            throw new RuntimeException('GLPI B fields could not be loaded: ' . ($glpiBFieldsMessage ?? 'Unknown error.'));
+        }
+        if (($_POST['mapping_form_complete'] ?? '') !== '1'
+            || (int) ($_POST['mapping_row_count'] ?? -1) !== count($savedMappings)) {
+            throw new RuntimeException('Incomplete mapping form. Nothing was saved.');
+        }
+        FieldMapping::save($selectedConnectionId, $selectedItemtype, $savedMappings, $glpiBFields);
+        $savedMappings = FieldMapping::load($selectedConnectionId, $selectedItemtype);
         $message = 'Field mappings saved.';
         $messageClass = 'success';
+    } elseif ($selectedConnection !== null && !$glpiBFieldsLoaded) {
+        throw new RuntimeException('GLPI B fields could not be loaded: ' . ($glpiBFieldsMessage ?? 'Unknown error.'));
     }
-} elseif ($selectedConnection !== null && !$glpiBFieldsLoaded) {
-    $message = 'GLPI B fields could not be loaded: ' . ($glpiBFieldsMessage ?? 'Unknown error.');
+} catch (Throwable $error) {
+    $message = $error->getMessage();
     $messageClass = 'warning';
 }
-
-$savedMappings = $selectedConnectionId !== '' ? FieldMapping::load($selectedConnectionId, $selectedItemtype) : [];
 $fields = FieldMapping::fieldsFor($selectedItemtype);
-$displayGlpiBFields = $glpiBFields;
-$displayGlpiBFieldKeys = [];
-
-foreach ($displayGlpiBFields as $glpiBField) {
-    $displayGlpiBFieldKeys[$glpiBField['key']] = true;
-}
-
-foreach ($savedMappings as $savedMapping) {
-    $savedGlpiBFieldKey = $savedMapping['glpi_b_field_key'] ?? '';
-
-    if ($savedGlpiBFieldKey === '' || isset($displayGlpiBFieldKeys[$savedGlpiBFieldKey])) {
-        continue;
-    }
-
-    $savedGlpiBFieldLabel = $savedMapping['glpi_b_field_label'] !== ''
-        ? $savedMapping['glpi_b_field_label']
-        : $savedGlpiBFieldKey;
-    $displayGlpiBFields[] = [
-        'key'   => $savedGlpiBFieldKey,
-        'id'    => $savedMapping['glpi_b_field_id'] ?? '',
-        'uid'   => $savedMapping['glpi_b_field_uid'] ?? '',
-        'label' => $savedGlpiBFieldLabel,
-    ];
-    $displayGlpiBFieldKeys[$savedGlpiBFieldKey] = true;
-}
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
     Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
@@ -112,22 +90,8 @@ if (class_exists('Html') && method_exists('Html', 'header')) {
 $html = static function (string $value): string {
     return htmlspecialchars($value, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 };
-
-$fieldOptionLabel = static function (array $field): string {
-    $label = (string) ($field['label'] ?? '');
-    $uid = (string) ($field['uid'] ?? '');
-    $id = (string) ($field['id'] ?? '');
-
-    if ($uid !== '') {
-        return $label . ' (' . $uid . ')';
-    }
-
-    if ($id !== '') {
-        return $label . ' (#' . $id . ')';
-    }
-
-    return $label;
-};
+$stylesheet = dirname(Menu::fieldMappingUrl(), 2) . '/css/assetsync20.css?v=' . hash_file('sha256', __DIR__ . '/../public/css/assetsync20.css');
+echo '<link rel="stylesheet" href="' . $html($stylesheet) . '">';
 
 echo '<div class="assetsync-page assetsync-mapping">';
 echo '<h2>Field Mapping</h2>';
@@ -201,71 +165,112 @@ if ($selectedConnectionId === '' || $selectedConnection === null) {
     return;
 }
 
-echo '<form method="post" action="' . $html(Menu::fieldMappingUrl()) . '">';
+$scalar = static fn ($value): string => is_scalar($value) ? (string) $value : '[invalid value]';
+$renderSelect = static function (array $catalog, string $key, string $name, string $side) use ($html): void {
+    try {
+        $selected = FieldMapping::selectedField($catalog, $key);
+    } catch (RuntimeException) {
+        $selected = null;
+    }
+    $selectedKey = $selected['key'] ?? $key;
+    echo '<select aria-label="' . $html($side . ' field') . '" name="' . $html($name) . '" required>';
+    echo '<option value="">Select a field</option>';
+    if ($key !== '' && $selected === null) {
+        echo '<option value="' . $html($key) . '" selected>Unavailable: ' . $html($key) . '</option>';
+    }
+    foreach (['Native', 'Custom'] as $group) {
+        echo '<optgroup label="' . $group . '">';
+        foreach ($catalog as $field) {
+            if ($field['group'] !== $group) {
+                continue;
+            }
+            $isSelected = $field['key'] === $selectedKey;
+            $reason = $field['supported'] ? '' : ' - Unsupported: ' . $field['reason'];
+            echo '<option value="' . $html($field['key']) . '"' . ($isSelected ? ' selected' : '')
+                . (!$field['supported'] && !$isSelected ? ' disabled' : '') . '>'
+                . $html($field['label'] . ' (' . $field['key'] . ')' . $reason) . '</option>';
+        }
+        echo '</optgroup>';
+    }
+    echo '</select>';
+    if ($key !== '' && ($selected === null || !$selected['supported'])) {
+        echo '<small class="assetsync-mapping-error">' . $html($selected['reason'] ?? 'Saved field is unavailable; reselection is required.') . '</small>';
+    }
+};
+$renderRow = static function (array $row, string $index) use ($fields, $glpiBFields, $sourceOptions, $html, $scalar, $renderSelect): void {
+    $prefix = 'field_mappings[' . $index . ']';
+    echo '<tr class="assetsync-mapping-row">';
+    echo '<td>';
+    $renderSelect($fields, $scalar($row['glpi_a_field_key'] ?? ''), $prefix . '[glpi_a_field_key]', 'GLPI A');
+    echo '</td><td>';
+    // A legacy search ID is resolved only by B metadata, never by A's search options.
+    $bKey = $scalar($row['glpi_b_field_key'] ?? '');
+    if (!empty($row['_legacy']) && $bKey !== '' && ctype_digit($bKey) && !empty($row['glpi_b_field_uid'])) {
+        $bKey = $scalar($row['glpi_b_field_uid']);
+    }
+    $renderSelect($glpiBFields, $bKey, $prefix . '[glpi_b_field_key]', 'GLPI B');
+    echo '</td><td><select aria-label="Source of truth" name="' . $html($prefix . '[source_of_truth]') . '" required>';
+    $source = $scalar($row['source_of_truth'] ?? 'glpi_a');
+    if (!isset($sourceOptions[$source])) {
+        echo '<option value="' . $html($source) . '" selected>Invalid: ' . $html($source) . '</option>';
+    }
+    foreach ($sourceOptions as $value => $label) {
+        echo '<option value="' . $value . '"' . ($source === $value ? ' selected' : '') . '>' . $html($label) . '</option>';
+    }
+    echo '</select></td><td class="assetsync-mapping-remove"><button type="button" class="btn btn-sm btn-ghost-secondary" data-remove-row title="Remove mapping" aria-label="Remove mapping"><i class="ti ti-trash" aria-hidden="true"></i></button></td>';
+    echo '</tr>';
+};
+if (array_filter($savedMappings, static fn ($row) => is_array($row) && !empty($row['_legacy']))) {
+    echo '<p class="warning">Legacy mappings have not been acknowledged under the current validation rules.</p>';
+}
+echo '<form id="assetsync-mapping-form" method="post" action="' . $html(Menu::fieldMappingUrl()) . '">';
 echo '<input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">';
 echo '<input type="hidden" name="itemtype" value="' . $html($selectedItemtype) . '">';
-echo '<div class="assetsync-table-scroll">';
-echo '<table class="tab_cadre_fixe assetsync-mapping-table">';
-echo '<tr><th colspan="4">' . $html($assetTypes[$selectedItemtype]) . ' fields</th></tr>';
-echo '<tr>';
-echo '<th>GLPI A field</th>';
-echo '<th>GLPI A key</th>';
-echo '<th>GLPI B field</th>';
-echo '<th>Source of truth</th>';
-echo '</tr>';
-
-foreach ($fields as $field) {
-    $fieldKey = $field['key'];
-    $savedMapping = $savedMappings[$fieldKey] ?? [
-        'glpi_b_field_key' => '',
-        'source_of_truth'  => 'glpi_a',
-    ];
-    $savedGlpiBFieldKey = $savedMapping['glpi_b_field_key'] ?? '';
-    $savedSource = $savedMapping['source_of_truth'] ?? 'glpi_a';
-
-    echo '<tr>';
-    echo '<td>' . $html($field['label']) . '</td>';
-    echo '<td><code>' . $html($fieldKey) . '</code></td>';
-    echo '<td><select name="field_mappings[' . $html($fieldKey) . '][glpi_b_field_key]"'
-        . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>';
-    echo '<option value="">Do not map</option>';
-
-    foreach ($displayGlpiBFields as $glpiBField) {
-        $glpiBFieldKey = $glpiBField['key'];
-        $selected = $glpiBFieldKey === $savedGlpiBFieldKey ? ' selected' : '';
-        echo '<option value="' . $html($glpiBFieldKey) . '"' . $selected . '>'
-            . $html($fieldOptionLabel($glpiBField)) . '</option>';
-    }
-
-    echo '</select></td>';
-    echo '<td><select name="field_mappings[' . $html($fieldKey) . '][source_of_truth]"'
-        . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>';
-
-    foreach ($sourceOptions as $sourceValue => $sourceLabel) {
-        $selected = $sourceValue === $savedSource ? ' selected' : '';
-        echo '<option value="' . $html($sourceValue) . '"' . $selected . '>' . $html($sourceLabel) . '</option>';
-    }
-
-    echo '</select></td>';
-    echo '</tr>';
+echo '<div class="assetsync-table-scroll"><table class="tab_cadre_fixe assetsync-mapping-table">';
+echo '<colgroup><col><col><col class="assetsync-authority-col"><col class="assetsync-remove-col"></colgroup>';
+echo '<thead><tr><th>GLPI A field</th><th>GLPI B field</th><th>Source of truth</th><th><span class="visually-hidden">Actions</span></th></tr></thead>';
+echo '<tbody id="assetsync-mapping-rows">';
+foreach ($savedMappings as $index => $row) {
+    $renderRow(is_array($row) ? $row : ['glpi_a_field_key' => '[invalid row]'], (string) $index);
 }
-
-echo '<tr>';
-echo '<td colspan="4" class="center">';
-
+echo '</tbody></table></div>';
+echo '<template id="assetsync-mapping-template">';
+$renderRow([], '__index__');
+echo '</template>';
+echo '<div class="assetsync-mapping-actions"><button type="button" class="btn btn-secondary" id="assetsync-add-mapping"><i class="ti ti-plus" aria-hidden="true"></i> Add mapping</button>';
+echo '<button type="submit" name="save" value="1" class="submit"' . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>Save</button></div>';
+echo '<input type="hidden" name="mapping_row_count" value="' . count($savedMappings) . '">';
+echo '<input type="hidden" name="mapping_form_complete" value="1">';
 if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
-    echo '<input type="hidden" name="_glpi_csrf_token" value="'
-        . $html(Session::getNewCSRFToken()) . '">';
+    echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">';
 }
-
-echo '<button type="submit" name="save" value="1" class="submit"'
-    . (!$glpiBFieldsLoaded ? ' disabled' : '') . '>Save</button>';
-echo '</td>';
-echo '</tr>';
-echo '</table>';
-echo '</div>';
-echo '</form>';
-echo '</div>';
+echo '</form></div>';
+?>
+<script>
+(() => {
+    const form = document.getElementById('assetsync-mapping-form');
+    const rows = document.getElementById('assetsync-mapping-rows');
+    const template = document.getElementById('assetsync-mapping-template');
+    let nextIndex = rows.children.length;
+    document.getElementById('assetsync-add-mapping').addEventListener('click', () => {
+        const fragment = template.content.cloneNode(true);
+        fragment.querySelectorAll('[name]').forEach(input => {
+            input.name = input.name.replace('__index__', String(nextIndex));
+        });
+        nextIndex++;
+        rows.appendChild(fragment);
+        rows.lastElementChild.querySelector('select').focus();
+    });
+    rows.addEventListener('click', event => {
+        const button = event.target.closest('[data-remove-row]');
+        if (button) button.closest('tr').remove();
+    });
+    form.addEventListener('submit', () => {
+        form.elements.mapping_row_count.value = String(rows.children.length);
+    });
+})();
+</script>
+<?php
 
 if (class_exists('Html') && method_exists('Html', 'footer')) {
     Html::footer();

@@ -196,7 +196,7 @@ namespace {
     $grant['body'] = '[{"id":1001,"profiles_id":4,"plugin_fields_containers_id":1,"right":4}]';
     $responses = [
         'getActiveProfile' => ['active_profile' => ['id' => 4, 'computer' => 3]],
-        'PluginFieldsContainer/1' => ['id' => 1, 'is_active' => 1, 'itemtypes' => '["Computer"]', 'entities_id' => 0, 'is_recursive' => 0],
+        'PluginFieldsContainer/1' => ['id' => 1, 'name' => 'dmosassets', 'is_active' => 1, 'itemtypes' => '["Computer"]', 'entities_id' => 0, 'is_recursive' => 0],
         'Computer/2' => ['id' => 2, 'entities_id' => 0],
     ];
     $guard = new ReflectionMethod(GlpiBConnection::class, 'assertCustomContainerAccess');
@@ -260,20 +260,20 @@ namespace {
     $dropdownVerified = catalogStep('PluginFieldsComputerdmosasset/10', $dropdownChild);
     $dropdownFirst = catalogPage(0, 1000, 1001, 'PluginFieldsDepartmentfieldDropdown');
     $dropdownLast = catalogPage(1000, 1, 1001, 'PluginFieldsDepartmentfieldDropdown');
-    $prefix = [$init, $dropdownOptions, $dropdownDefinition, $active, $container, $profile, $grant, $asset, $dropdownRow];
-    catalogStart([...$prefix, $dropdownFirst, $dropdownLast, $dropdownPut, $dropdownVerified, $dropdownFirst, $dropdownLast, $kill]);
+    $prefix = [$init, $dropdownOptions, $dropdownDefinition];
+    catalogStart([...$prefix, $dropdownFirst, $dropdownLast, $active, $container, $profile, $grant, $asset, $dropdownRow, $dropdownPut, $dropdownVerified, $kill]);
     $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1001'], [$dropdownKey => 'dropdown']]);
     catalogCheck($result['success'] && $result['item'][$dropdownKey] === 'Label 1001', 'Page-two dropdown destination must be written and read back through fresh complete catalogs.');
-    catalogFinish(16);
+    catalogFinish(14);
     $duplicate['path'] = 'PluginFieldsDepartmentfieldDropdown';
     catalogStart([...$prefix, $dropdownFirst, $duplicate, $kill]);
     $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1'], [$dropdownKey => 'dropdown']]);
     catalogCheck(!$result['success'] && !$result['transient'] && str_contains($result['message'], 'duplicated') && !in_array('PUT', CatalogCurl::$methods, true), 'A cross-page duplicate must block before the actual dropdown write.');
-    catalogFinish(12);
+    catalogFinish(6);
     catalogStart([...$prefix, $dropdownFirst, catalogStep('PluginFieldsDepartmentfieldDropdown', [], 503), $kill]);
     $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1'], [$dropdownKey => 'dropdown']]);
     catalogCheck(!$result['success'] && $result['transient'] && $result['status_code'] === 503 && !in_array('PUT', CatalogCurl::$methods, true), 'A matching first-page label must not authorize a write when a later dropdown page fails; transient status must survive.');
-    catalogFinish(12, 1);
+    catalogFinish(6, 1);
 
     foreach (['transport', '429', '503', '403', 'moving', 'shrunk', 'malformed', 'cap'] as $failure) {
         $failed = match ($failure) {
@@ -348,7 +348,7 @@ namespace {
         catalogStart([...$prefix, $dropdownFirst, catalogStep('PluginFieldsDepartmentfieldDropdown', $status === 0 ? false : [], $status), $kill]);
         $result = $call->invoke(new AssetSyncService(), 'customTextValues', [$connection, 'Computer', 2, [$dropdownKey], [$dropdownKey => 'Label 1'], [$dropdownKey => 'dropdown']]);
         catalogCheck(!$result['success'] && $result['transient'] === ($status !== 403) && $result['status_code'] === $status && $result['cause'] === ($status === 0 ? 'transport' : 'http') && $result['executed'] && !in_array('PUT', CatalogCurl::$methods, true), 'Later dropdown failures must retain status/cause/execution and prevent writes even after a first-page match.');
-        catalogFinish(12, 1);
+        catalogFinish(6, 1);
     }
 
     // Same-container changes share a write; missing child rows still use one POST/readback.
@@ -381,6 +381,7 @@ namespace {
     $otherDefinition = catalogStep('PluginFieldsField/2', ['id' => 2, 'name' => 'notesfield', 'type' => 'text', 'is_active' => 1, 'plugin_fields_containers_id' => 2]);
     $otherContainer = $responses['PluginFieldsContainer/1'];
     $otherContainer['id'] = 2;
+    $otherContainer['name'] = 'otherassets';
     $otherGrant = catalogPage(0, 1, 1, 'PluginFieldsContainer/2/PluginFieldsProfile');
     $otherGrant['body'] = '[{"id":2,"profiles_id":4,"plugin_fields_containers_id":2,"right":4}]';
     $otherRow = ['id' => 20, 'items_id' => 2, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => 2, 'notesfield' => 'old notes'];
@@ -435,7 +436,7 @@ namespace {
         GlpiBConnection::save($connection + ['active' => true]);
         EntitySyncRoute::save(['id' => 'both-timezone', 'glpi_b_connection_id' => 'catalog',
             'glpi_a_source_entity_id' => '1', 'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
-        FieldMapping::save('catalog', 'Computer', [1 => ['glpi_b_field_key' => 'name', 'source_of_truth' => $status === null ? 'glpi_a' : 'both']]);
+        \saveTestMappings('catalog', 'Computer', [1 => ['glpi_b_field_key' => 'name', 'source_of_truth' => $status === null ? 'glpi_a' : 'both']]);
         $GLOBALS['DB']->insert('glpi_entities', ['id' => 1, 'entities_id' => 0]);
         $GLOBALS['DB']->insert('glpi_computers', ['id' => 101, 'entities_id' => 1, 'is_deleted' => 0,
             'serial' => 'BOTH-TIMEZONE', 'name' => 'Local Both value', 'date_mod' => '2026-10-01 00:00:00']);
@@ -443,17 +444,20 @@ namespace {
             'route_id' => 'both-timezone', 'remote_items_id' => 12, 'status' => AssetSyncLink::STATUS_SYNCED]);
         $service = new AssetSyncService();
         catalogCheck($service->queueAssetIfNeeded('Computer', 101, 'catalog'), 'Timezone fixture must enqueue.');
+        $nativeOptions = catalogStep('listSearchOptions/Computer', [
+            1 => ['field' => 'name', 'table' => 'glpi_computers', 'datatype' => 'itemlink', 'uid' => 'Computer.name'],
+        ]);
         if ($status === null) {
-            catalogStart([$init, catalogStep('Computer/12', ['id' => 12, 'name' => 'Local Both value',
+            catalogStart([$init, $nativeOptions, $kill, $init, catalogStep('Computer/12', ['id' => 12, 'name' => 'Local Both value',
                 'serial' => 'BOTH-TIMEZONE', 'entities_id' => 100, 'date_mod' => '2026-10-01 00:00:00']), $kill]);
             catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'done',
                 'A one-way job must complete using item data alone, even when getFullSession would return403; any unexpected timezone GET fails this strict transport.');
-            catalogFinish(3);
+            catalogFinish(6);
         } else {
-            catalogStart([$init, catalogStep('getFullSession', [], $status), $kill]);
+            catalogStart([$init, $nativeOptions, $kill, $init, catalogStep('getFullSession', [], $status), $kill]);
             catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'retry'
                 && !in_array('PUT', CatalogCurl::$methods, true), 'A Both timezone 429/503 must retry without mutation and still kill the session.');
-            catalogFinish(3, 1);
+            catalogFinish(6, 1);
         }
     }
 

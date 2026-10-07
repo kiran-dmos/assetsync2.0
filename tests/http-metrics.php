@@ -158,14 +158,14 @@ namespace {
 
     httpStart([$init, $options, httpStep('search/Computer', ['totalcount' => 0, 'data' => []]), $kill,
         $init, $timezone, httpStep('Computer/12', ['id' => 12, 'name' => 'private-payload']), $kill,
-        $init, httpStep('Computer', ['id' => 13], 201), $kill]);
+        $init, httpStep('Computer', ['id' => 13], 201), httpStep('Computer/13', ['id' => 13, 'name' => 'private-payload']), $kill]);
     httpMetricsCheck(httpCall('a', 'searchBySerial', ['Computer', 'private-serial'])['success'], 'Serial search must succeed.');
     httpMetricsCheck(httpCall('b', 'getItem', ['Computer', 12])['success'], 'Item loading must succeed.');
     httpMetricsCheck(httpCall('a', 'createItem', ['Computer', ['name' => 'private-payload']])['success'], 'Item creation must succeed.');
     httpMetricsCheck(httpCall('a', 'updateItem', ['Computer', 13, []])['success'] && httpCall('b', 'customTextValues', ['Computer', 12, []])['success'], 'No-op operations must remain successful without HTTP.');
     $metrics = GlpiBConnection::finishHttpMetrics();
-    httpMetricsCheck($metrics === ['a' => ['requests' => 7, 'errors' => 0, 'latency_ms' => 35.0], 'b' => ['requests' => 4, 'errors' => 0, 'latency_ms' => 20.0]], 'Operations must include init, optional timezone, work and kill calls under the correct connection.');
-    httpMetricsCheck(HttpMetricsCurl::$executions === 11 && HttpMetricsCurl::$closed === 11 && HttpMetricsCurl::$steps === [], 'Per-connection totals must reconcile with actual executions.');
+    httpMetricsCheck($metrics === ['a' => ['requests' => 8, 'errors' => 0, 'latency_ms' => 40.0], 'b' => ['requests' => 4, 'errors' => 0, 'latency_ms' => 20.0]], 'Operations must include init, optional timezone, work, readback and kill calls under the correct connection.');
+    httpMetricsCheck(HttpMetricsCurl::$executions === 12 && HttpMetricsCurl::$closed === 12 && HttpMetricsCurl::$steps === [], 'Per-connection totals must reconcile with actual executions.');
 
     $oneWayItem = ['id' => 12, 'name' => 'One-way item', 'date_mod' => '2026-10-05 12:00:00'];
     httpStart([$init, httpStep('Computer/12', $oneWayItem), $kill]);

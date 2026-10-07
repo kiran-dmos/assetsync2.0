@@ -57,23 +57,28 @@ final class FieldMapping
     /**
      * @return list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}>
      */
-    public static function syncMappings(string $connectionId, string $itemtype): array
+    public static function syncMappings(string $connectionId, string $itemtype, ?array $asset = null): array
     {
         $itemtype = self::validItemtype($itemtype);
         $mappings = [];
 
         foreach (self::load($connectionId, $itemtype) as $mapping) {
+            if (!isset(self::sourceOptions()[$mapping['source_of_truth']])) {
+                throw new \RuntimeException('Invalid saved mapping authority: ' . $mapping['glpi_a_field_key']);
+            }
             $glpiAField = self::safeLocalSyncField($itemtype, $mapping['glpi_a_field_key']);
-            $glpiBField = self::safeRemoteSyncField($mapping);
+            $glpiBField = self::safeRemoteSyncField($itemtype, $mapping);
 
             if ($glpiAField === '' || $glpiBField === '') {
-                if (FieldsText::isCustom($glpiBField)) {
-                    throw new \RuntimeException('The local field for the custom mapping could not be resolved: ' . $mapping['glpi_a_field_key']);
-                }
-                continue;
+                throw new \RuntimeException('The mapping is incomplete or unavailable: ' . $mapping['glpi_a_field_key']);
             }
 
-            self::validateCustomMapping($itemtype, $glpiAField, $glpiBField);
+            if (($mapping['_legacy'] ?? false) && (
+                (!FieldsText::isCustom($glpiAField) && !in_array($glpiAField, ['name', 'serial', 'otherserial', 'comment'], true))
+                || (!FieldsText::isCustom($glpiBField) && !in_array($glpiBField, ['name', 'serial', 'otherserial', 'comment'], true))
+            )) {
+                throw new \RuntimeException('Legacy mapping requires explicit save and reselection before use: ' . $mapping['glpi_a_field_key']);
+            }
 
             $mappings[] = [
                 'glpi_a_field'    => $glpiAField,
@@ -82,6 +87,8 @@ final class FieldMapping
             ];
         }
 
+        self::validateOwnership($connectionId, $itemtype, $mappings, $asset);
+        self::expectedCustomTypes($itemtype, $mappings);
         return $mappings;
     }
 
@@ -98,19 +105,15 @@ final class FieldMapping
         foreach ($mappings as $mapping) {
             $glpiAField = $mapping['glpi_a_field'];
             $glpiBField = $mapping['glpi_b_field'];
-            $localType = FieldsText::isCustom($glpiAField) ? ($localTypes[$glpiAField] ?? '') : 'text';
-
-            if (FieldsText::isCustom($glpiAField) && !FieldsText::isCustom($glpiBField)
-                && !in_array($localType, ['text', 'textarea'], true)) {
-                throw new \RuntimeException('The mapped local Fields-plugin field requires a compatible remote Fields-plugin ' . ($localType !== '' ? $localType : 'scalar') . ' field: ' . $glpiAField);
+            if (!FieldsText::isCustom($glpiAField)) {
+                $localTypes[$glpiAField] ??= NativeField::local($itemtype, $glpiAField)['type'];
             }
-
-            if ($localType === 'dropdown' && (!FieldsText::isCustom($glpiBField) || !FieldsText::isDropdownKey($glpiBField))) {
-                throw new \RuntimeException('The mapped local Fields-plugin dropdown field requires a compatible remote Fields-plugin dropdown field: ' . $glpiAField);
-            }
-
-            if (FieldsText::isCustom($glpiBField) && FieldsText::isDropdownKey($glpiBField) && $localType !== 'dropdown') {
-                throw new \RuntimeException('The mapped remote Fields-plugin dropdown field requires a compatible local Fields-plugin dropdown field: ' . $glpiBField);
+            $localType = $localTypes[$glpiAField] ?? '';
+            $remoteType = FieldsText::isCustom($glpiBField)
+                ? (FieldsText::isDropdownKey($glpiBField) ? 'dropdown' : '')
+                : (NativeField::definitions($itemtype)[$glpiBField]['type'] ?? '');
+            if ($remoteType !== '' && !NativeField::compatible($localType, $remoteType)) {
+                throw new \RuntimeException('The mapping requires compatible endpoint types: ' . $glpiAField . ' (' . $localType . ') -> ' . $glpiBField . ' (' . $remoteType . ').');
             }
 
             if (!FieldsText::isCustom($glpiBField)) {
@@ -141,16 +144,11 @@ final class FieldMapping
             $itemtype = 'Computer';
         }
 
-        $nativeFields = self::nativeFieldsFor($itemtype);
-        if ($nativeFields !== []) {
-            return $nativeFields;
-        }
-
-        return self::fallbackFieldsFor($itemtype);
+        return self::nativeFieldsFor($itemtype);
     }
 
     /**
-     * @return array<string,array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}>
+     * @return list<array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string,_legacy:bool}>
      */
     public static function load(string $connectionId, string $itemtype): array
     {
@@ -159,32 +157,78 @@ final class FieldMapping
         $allMappings = self::loadAll();
         $savedMappings = [];
 
-        if (isset($allMappings[$connectionId]) && is_array($allMappings[$connectionId])) {
+        if (array_key_exists($connectionId, $allMappings) && !is_array($allMappings[$connectionId])) {
+            throw new \RuntimeException('Malformed saved connection mappings.');
+        }
+        if (isset($allMappings[$connectionId])) {
             $connectionMappings = $allMappings[$connectionId];
 
-            if (isset($connectionMappings[$itemtype]) && is_array($connectionMappings[$itemtype])) {
+            if (array_key_exists($itemtype, $connectionMappings)) {
+                if (!is_array($connectionMappings[$itemtype])) {
+                    throw new \RuntimeException('Malformed saved asset mappings.');
+                }
                 $savedMappings = $connectionMappings[$itemtype];
             }
         }
 
-        return self::cleanMappings($itemtype, $savedMappings, [], true);
+        return self::rowsFromScope($savedMappings);
     }
 
     /**
-     * @param array<string,mixed> $fieldMappings
-     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
+     * @param array<array-key,mixed> $fieldMappings Indexed rows (legacy keyed callers are accepted).
+     * @param list<array<string,mixed>> $glpiBFields Current independent B discovery, not POST data.
      */
     public static function save(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields = []): void
     {
         self::invalidateRunCache();
         $connectionId = trim($connectionId);
         if ($connectionId === '') {
-            return;
+            throw new \RuntimeException('Select a connection before saving mappings.');
         }
 
         $itemtype = self::validItemtype($itemtype);
         $allMappings = self::loadAll();
-        $allMappings[$connectionId][$itemtype] = self::cleanMappings($itemtype, $fieldMappings, $glpiBFields, false);
+        $rowInput = array_is_list($fieldMappings);
+        foreach ($fieldMappings as $value) {
+            if (is_array($value) && array_key_exists('glpi_a_field_key', $value)) {
+                $rowInput = true;
+            }
+        }
+        $rows = self::rowsFromScope($rowInput ? ['version' => 2, 'rows' => $fieldMappings] : $fieldMappings);
+        $savedRows = [];
+        $runtimeRows = [];
+        $localTypes = [];
+        foreach ($rows as $index => $row) {
+            try {
+                if (!isset(self::sourceOptions()[$row['source_of_truth']])) {
+                    throw new \RuntimeException('Invalid source of truth.');
+                }
+                $a = self::safeLocalSyncField($itemtype, $row['glpi_a_field_key']);
+                $remote = self::selectedField($glpiBFields, $row['glpi_b_field_key']);
+                if ($remote === null || !($remote['supported'] ?? false)) {
+                    throw new \RuntimeException('GLPI B field unavailable or unsupported: ' . $row['glpi_b_field_key'] . '. ' . ($remote['reason'] ?? 'Reload current field metadata.'));
+                }
+                $b = (string) $remote['key'];
+                $localTypes[$a] ??= FieldsText::isCustom($a)
+                    ? (FieldsText::customTypes($itemtype, [$a])[$a] ?? '')
+                    : NativeField::local($itemtype, $a)['type'];
+                $localType = $localTypes[$a];
+                if ($localType === '' || !NativeField::compatible($localType, (string) ($remote['type'] ?? ''))) {
+                    throw new \RuntimeException('The selected fields have incompatible types.');
+                }
+                $savedRows[] = [
+                    'glpi_a_field_key' => $a,
+                    'glpi_b_field_key' => $b,
+                    'source_of_truth' => $row['source_of_truth'],
+                    'glpi_b_field_label' => (string) ($remote['label'] ?? $b),
+                ];
+                $runtimeRows[] = ['glpi_a_field' => $a, 'glpi_b_field' => $b, 'source_of_truth' => $row['source_of_truth']];
+            } catch (\RuntimeException $error) {
+                throw new \RuntimeException('Mapping row ' . ($index + 1) . ': ' . $error->getMessage(), 0, $error);
+            }
+        }
+        self::validateOwnership($connectionId, $itemtype, $runtimeRows);
+        $allMappings[$connectionId][$itemtype] = ['version' => 2, 'rows' => $savedRows];
 
         try {
             if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
@@ -250,10 +294,14 @@ final class FieldMapping
             return [];
         }
 
-        $decoded = json_decode($savedJson, true);
+        try {
+            $decoded = json_decode($savedJson, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $error) {
+            throw new \RuntimeException('Invalid saved field mapping configuration: invalid JSON.', 0, $error);
+        }
 
         if (!is_array($decoded)) {
-            return [];
+            throw new \RuntimeException('Invalid saved field mapping configuration.');
         }
         if (self::$runCache !== null) {
             self::$runCache['mappings'] = $decoded;
@@ -261,131 +309,178 @@ final class FieldMapping
         return $decoded;
     }
 
-    /**
-     * @param array<string,mixed> $fieldMappings
-     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
-     * @return array<string,array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}>
-     */
-    private static function cleanMappings(
-        string $itemtype,
-        array $fieldMappings,
-        array $glpiBFields,
-        bool $keepRowsWithoutGlpiB
-    ): array {
-        $validSources = array_keys(self::sourceOptions());
-        $validGlpiAFields = [];
-        $glpiBFieldsByKey = self::glpiBFieldsByKey($glpiBFields);
-
-        foreach (self::fieldsFor($itemtype) as $field) {
-            $validGlpiAFields[$field['key']] = true;
+    /** Return rows without repairing or discarding saved data. Never writes configuration. */
+    private static function rowsFromScope(array $scope): array
+    {
+        $legacy = !array_key_exists('version', $scope);
+        if (!$legacy && ($scope['version'] !== 2 || !isset($scope['rows']) || !is_array($scope['rows'])
+            || array_diff(array_keys($scope), ['version', 'rows']) !== [])) {
+            throw new \RuntimeException('Unsupported or malformed saved mapping version.');
         }
-
-        $cleanMappings = [];
-        $customOptions = FieldsText::localOptions($itemtype);
-
-        foreach ($fieldMappings as $fieldKey => $mapping) {
-            $fieldKey = (string) $fieldKey;
-
-            foreach ($customOptions as $optionId => $option) {
-                if ((string) $optionId === $fieldKey) {
-                    $fieldKey = FieldsText::key($itemtype, $option);
-                    break;
-                }
+        $rows = [];
+        foreach ($legacy ? $scope : $scope['rows'] as $key => $value) {
+            $record = is_array($value) ? $value : ['source_of_truth' => $value];
+            $row = [];
+            foreach (['glpi_a_field_key', 'glpi_b_field_key', 'glpi_b_field_id', 'glpi_b_field_uid', 'glpi_b_field_label', 'source_of_truth'] as $field) {
+                $raw = $record[$field] ?? ($field === 'glpi_a_field_key' && $legacy ? $key : '');
+                $row[$field] = is_scalar($raw) ? trim((string) $raw) : '[invalid value]';
             }
-
-            $savedCustomMapping = $keepRowsWithoutGlpiB && (FieldsText::isCustom($fieldKey)
-                || (is_array($mapping) && FieldsText::isCustom((string) ($mapping['glpi_b_field_uid'] ?? $mapping['glpi_b_field_key'] ?? ''))));
-            if (!isset($validGlpiAFields[$fieldKey]) && !$savedCustomMapping) {
-                continue;
-            }
-
-            $record = self::mappingRecord($fieldKey, $mapping, $validSources);
-            if ($record === null) {
-                continue;
-            }
-
-            $glpiBFieldKey = $record['glpi_b_field_key'];
-
-            if ($glpiBFieldKey === '' && !$keepRowsWithoutGlpiB) {
-                continue;
-            }
-
-            if ($glpiBFieldKey !== '' && isset($glpiBFieldsByKey[$glpiBFieldKey])) {
-                $glpiBField = $glpiBFieldsByKey[$glpiBFieldKey];
-                $record['glpi_b_field_id'] = $glpiBField['id'];
-                $record['glpi_b_field_uid'] = $glpiBField['uid'];
-                $record['glpi_b_field_label'] = $glpiBField['label'];
-            } elseif ($glpiBFieldKey !== '' && $glpiBFieldsByKey !== []) {
-                continue;
-            }
-
-            $cleanMappings[$fieldKey] = $record;
+            $row['_legacy'] = $legacy;
+            $rows[] = $row;
         }
-
-        return $cleanMappings;
+        return $rows;
     }
 
-    /**
-     * @param mixed $mapping
-     * @param list<string> $validSources
-     * @return array{glpi_a_field_key:string,glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string,source_of_truth:string}|null
-     */
-    private static function mappingRecord(string $fieldKey, $mapping, array $validSources): ?array
+    /** Resolve discovery aliases, never labels, and reject ambiguous search metadata. */
+    public static function selectedField(array $fields, string $key): ?array
     {
-        if (is_array($mapping)) {
-            $source = (string) ($mapping['source_of_truth'] ?? '');
-            $glpiBFieldKey = (string) ($mapping['glpi_b_field_key'] ?? '');
-            $glpiBFieldId = (string) ($mapping['glpi_b_field_id'] ?? '');
-            $glpiBFieldUid = (string) ($mapping['glpi_b_field_uid'] ?? '');
-            $glpiBFieldLabel = (string) ($mapping['glpi_b_field_label'] ?? '');
-        } else {
-            $source = (string) $mapping;
-            $glpiBFieldKey = '';
-            $glpiBFieldId = '';
-            $glpiBFieldUid = '';
-            $glpiBFieldLabel = '';
-        }
-
-        $source = trim($source);
-        if (!in_array($source, $validSources, true)) {
+        if ($key === '') {
             return null;
         }
+        $matches = [];
+        foreach ($fields as $field) {
+            $aliases = [$field['key'], (string) ($field['id'] ?? ''), (string) ($field['uid'] ?? '')];
+            if (in_array($key, $aliases, true)) {
+                $matches[$field['key']] = $field;
+            }
+        }
+        if (count($matches) > 1) {
+            throw new \RuntimeException('Ambiguous field identity: ' . $key);
+        }
+        return $matches === [] ? null : reset($matches);
+    }
 
-        return [
-            'glpi_a_field_key'   => $fieldKey,
-            'glpi_b_field_key'   => trim($glpiBFieldKey),
-            'glpi_b_field_id'    => trim($glpiBFieldId),
-            'glpi_b_field_uid'   => trim($glpiBFieldUid),
-            'glpi_b_field_label' => trim(strip_tags($glpiBFieldLabel)),
-            'source_of_truth'    => $source,
-        ];
+    /** Local and remote discovery share presentation, but resolve custom identities independently. */
+    public static function discoverFields(string $itemtype, array $options, bool $remote = false): array
+    {
+        $fields = [];
+        foreach ($options as $id => $option) {
+            if (!is_array($option) || !isset($option['name']) || !is_scalar($option['name'])
+                || self::isHeaderOnlySearchOption($option)) {
+                continue;
+            }
+            $custom = str_starts_with((string) ($option['table'] ?? ''), 'glpi_plugin_fields_');
+            $uid = (string) ($option['uid'] ?? '');
+            $field = [
+                'key' => $uid !== '' ? $uid : (string) $id,
+                'id' => (string) ($option['id'] ?? $id),
+                'uid' => $uid,
+                'label' => trim(strip_tags((string) $option['name'])),
+                'group' => $custom ? 'Custom' : 'Native',
+                'supported' => false,
+                'type' => '',
+                'reason' => '',
+            ];
+            try {
+                if ($custom) {
+                    $key = $remote ? FieldsText::remoteKey($itemtype, $option) : FieldsText::key($itemtype, $option);
+                    if ($key === '') {
+                        throw new \RuntimeException('Custom field identity is unavailable.');
+                    }
+                    $field['key'] = $key;
+                    $field['uid'] = $key;
+                    $field['type'] = FieldsText::validate($option);
+                } else {
+                    $descriptor = NativeField::fromOption($itemtype, $option);
+                    $field['key'] = $descriptor['field'];
+                    $field['uid'] = $descriptor['uid'];
+                    $field['type'] = $descriptor['type'];
+                }
+                $field['supported'] = true;
+            } catch (\RuntimeException $error) {
+                $field['reason'] = $error->getMessage();
+            }
+            // Repeated keys cannot safely pick a search-option winner.
+            if (isset($fields[$field['key']])) {
+                $field['supported'] = false;
+                $field['reason'] = 'Ambiguous duplicate metadata for this field.';
+            }
+            $fields[$field['key']] = $field;
+        }
+        return array_values($fields);
     }
 
     /**
-     * @param list<array{key:string,id:string,uid:string,label:string}> $glpiBFields
-     * @return array<string,array{key:string,id:string,uid:string,label:string}>
+     * Exclusive destinations and exclusive inbound A endpoints rule out chains and cycles.
+     * A-authority fanout is the only allowed repeated endpoint within a mapping scope.
+     * Runtime additionally checks connections whose routes resolve for this asset.
+     * Save has no asset and checks only its scope, without remote requests or route-overlap guesses.
      */
-    private static function glpiBFieldsByKey(array $glpiBFields): array
+    public static function validateOwnership(string $connectionId, string $itemtype, array $mappings, ?array $asset = null): void
     {
-        $fieldsByKey = [];
-
-        foreach ($glpiBFields as $field) {
-            $key = trim((string) ($field['key'] ?? ''));
-            $label = trim(strip_tags((string) ($field['label'] ?? '')));
-
-            if ($key === '' || $label === '') {
-                continue;
+        $aOwners = [];
+        $bOwners = [];
+        foreach ($mappings as $row) {
+            $a = $row['glpi_a_field'];
+            $b = $row['glpi_b_field'];
+            if (isset($bOwners[$b])) {
+                throw new \RuntimeException('Duplicate or shared GLPI B destination: ' . $b);
             }
-
-            $fieldsByKey[$key] = [
-                'key'   => $key,
-                'id'    => trim((string) ($field['id'] ?? '')),
-                'uid'   => trim((string) ($field['uid'] ?? '')),
-                'label' => $label,
-            ];
+            $bOwners[$b] = true;
+            $aOwners[$a][] = $row['source_of_truth'];
+        }
+        foreach ($aOwners as $a => $authorities) {
+            if (count($authorities) > 1 && array_filter($authorities, static fn ($source) => $source !== 'glpi_a')) {
+                throw new \RuntimeException('GLPI B/Both requires exclusive GLPI A ownership: ' . $a);
+            }
+        }
+        if ($asset === null) {
+            return;
         }
 
-        return $fieldsByKey;
+        $routeMatches = EntitySyncRoute::matchAsset($itemtype, (string) ($asset['entities_id'] ?? ''));
+        $matchingConnections = array_fill_keys(array_column($routeMatches['matches'], 'glpi_b_connection_id'), true);
+        if (!isset($matchingConnections[$connectionId])) {
+            return;
+        }
+
+        $connections = GlpiBConnection::loadAll();
+        $current = null;
+        foreach ($connections as $connection) {
+            if ($connection['id'] === $connectionId) {
+                $current = $connection;
+                break;
+            }
+        }
+        if ($current === null || !$current['active']) {
+            return;
+        }
+        $endpoint = self::canonicalApiEndpoint($current['base_url']);
+        foreach ($connections as $connection) {
+            if ($connection['id'] === $connectionId || !$connection['active']
+                || !isset($matchingConnections[$connection['id']])) {
+                continue;
+            }
+            if ($endpoint !== '' && $endpoint === self::canonicalApiEndpoint($connection['base_url'])) {
+                throw new \RuntimeException('Connections matching this asset refer to the same GLPI B API endpoint: ' . $connectionId . ' and ' . $connection['id'] . '. Keep overlapping mappings in one connection.');
+            }
+            if ($aOwners === []) {
+                continue;
+            }
+            $otherRows = self::load($connection['id'], $itemtype);
+            foreach ($otherRows as $row) {
+                $a = self::safeLocalSyncField($itemtype, $row['glpi_a_field_key']);
+                if (isset($aOwners[$a]) && ($row['source_of_truth'] !== 'glpi_a'
+                    || array_filter($aOwners[$a], static fn ($source) => $source !== 'glpi_a'))) {
+                    throw new \RuntimeException('GLPI A endpoint has inbound ownership across active connections matching this asset: ' . $a . ' (' . $connection['id'] . ').');
+                }
+            }
+        }
+    }
+
+    public static function canonicalApiEndpoint(string $url): string
+    {
+        $parts = parse_url(trim($url));
+        if (!is_array($parts) || empty($parts['host']) || empty($parts['scheme'])) {
+            return '';
+        }
+        $scheme = strtolower($parts['scheme']);
+        $port = $parts['port'] ?? ($scheme === 'https' ? 443 : 80);
+        $path = rtrim($parts['path'] ?? '', '/');
+        if (str_ends_with($path, '/apirest.php')) {
+            $path = substr($path, 0, -strlen('/apirest.php'));
+        }
+        return $scheme . '://' . strtolower($parts['host']) . ':' . $port . $path;
     }
 
     private static function validItemtype(string $itemtype): string
@@ -412,42 +507,10 @@ final class FieldMapping
             return [];
         }
 
-        $fields = [];
-
-        foreach ($options as $optionId => $option) {
-            if (!is_array($option) || !isset($option['name']) || !is_scalar($option['name'])) {
-                continue;
-            }
-            if (str_starts_with((string) ($option['table'] ?? ''), 'glpi_plugin_fields_')) {
-                continue;
-            }
-
-            $fieldKey = (string) $optionId;
-            $hasFieldKey = is_int($optionId) || ctype_digit($fieldKey);
-            $label = trim(strip_tags((string) $option['name']));
-            if ($label === '' || (!$hasFieldKey && self::isHeaderOnlySearchOption($option))) {
-                continue;
-            }
-
-            $fields[] = [
-                'key'   => $fieldKey,
-                'label' => $label,
-            ];
+        foreach (FieldsText::localOptions($itemtype) as $id => $option) {
+            $options[$id] = $option;
         }
-
-        foreach (FieldsText::localOptions($itemtype) as $option) {
-            $key = FieldsText::key($itemtype, $option);
-            if ($key !== '') {
-                try {
-                    FieldsText::validate($option);
-                } catch (\RuntimeException) {
-                    continue;
-                }
-                $fields[] = ['key' => $key, 'label' => (string) $option['name']];
-            }
-        }
-
-        return $fields;
+        return self::discoverFields($itemtype, $options);
     }
 
     /**
@@ -463,31 +526,11 @@ final class FieldMapping
 
         return true;
     }
-
-    /**
-     * @return list<array{key:string,label:string}>
-     */
-    private static function fallbackFieldsFor(string $itemtype): array
-    {
-        $fields = [
-            ['key' => 'name', 'label' => 'Name'],
-            ['key' => 'serial', 'label' => 'Serial number'],
-            ['key' => 'otherserial', 'label' => 'Inventory number'],
-            ['key' => 'locations_id', 'label' => 'Location'],
-            ['key' => 'states_id', 'label' => 'Status'],
-            ['key' => 'manufacturers_id', 'label' => 'Manufacturer'],
-            ['key' => 'comment', 'label' => 'Comments'],
-        ];
-
-        if ($itemtype === 'Computer') {
-            $fields[] = ['key' => 'computermodels_id', 'label' => 'Model'];
-        }
-
-        return $fields;
-    }
-
     private static function safeLocalSyncField(string $itemtype, string $fieldKey): string
     {
+        if ($fieldKey === '') {
+            throw new \RuntimeException('The GLPI A field is missing.');
+        }
         foreach (FieldsText::localOptions($itemtype) as $optionId => $option) {
             $key = FieldsText::key($itemtype, $option);
             if ($fieldKey === (string) $optionId || $fieldKey === $key) {
@@ -499,142 +542,40 @@ final class FieldMapping
             throw new \RuntimeException('The mapped local Fields-plugin field is unavailable: ' . $fieldKey);
         }
 
-        $directField = self::safeSyncFieldName($fieldKey);
-        if ($directField !== '') {
-            return $directField;
-        }
-
-        if (!class_exists('\Search') || !method_exists('\Search', 'getOptions')) {
-            return '';
-        }
-
-        try {
-            $options = \Search::getOptions($itemtype);
-        } catch (\Throwable) {
-            return '';
-        }
-
-        if (!is_array($options)) {
-            return '';
-        }
-
-        $itemTable = self::itemTable($itemtype);
-
-        foreach ($options as $optionId => $option) {
-            if (!is_array($option) || !self::searchOptionMatches($fieldKey, $optionId, $option)) {
-                continue;
-            }
-
-            $optionTable = isset($option['table']) && is_scalar($option['table']) ? trim((string) $option['table']) : '';
-            if ($optionTable !== '' && $itemTable !== '' && $optionTable !== $itemTable) {
-                continue;
-            }
-
-            $field = isset($option['field']) && is_scalar($option['field']) ? trim((string) $option['field']) : '';
-            $safeField = self::safeSyncFieldName($field);
-            if ($safeField !== '') {
-                return $safeField;
-            }
-        }
-
-        return '';
-    }
-
-    private static function validateCustomMapping(string $itemtype, string $glpiAField, string $glpiBField): void
-    {
-        self::expectedCustomTypes($itemtype, [[
-            'glpi_a_field' => $glpiAField,
-            'glpi_b_field' => $glpiBField,
-            'source_of_truth' => 'glpi_a',
-        ]]);
+        return NativeField::local($itemtype, $fieldKey)['field'];
     }
 
     /**
      * @param array{glpi_b_field_key:string,glpi_b_field_id:string,glpi_b_field_uid:string,glpi_b_field_label:string} $mapping
      */
-    private static function safeRemoteSyncField(array $mapping): string
+    private static function safeRemoteSyncField(string $itemtype, array $mapping): string
     {
+        $matches = [];
         foreach (['glpi_b_field_key', 'glpi_b_field_uid'] as $fieldName) {
             $key = (string) ($mapping[$fieldName] ?? '');
             if (FieldsText::isCustom($key)) {
-                return $key;
+                $matches[$key] = true;
             }
         }
 
         foreach (['glpi_b_field_key', 'glpi_b_field_uid'] as $fieldName) {
-            $safeField = self::safeSyncFieldName((string) ($mapping[$fieldName] ?? ''));
-            if ($safeField !== '') {
-                return $safeField;
+            $key = (string) ($mapping[$fieldName] ?? '');
+            foreach (NativeField::definitions($itemtype) as $field => $descriptor) {
+                $aliases = [$field, $itemtype . '.' . $field];
+                if ($descriptor['relation'] !== '') {
+                    $aliases[] = $itemtype . '.' . $descriptor['relation'] . '.name';
+                    $aliases[] = $itemtype . '.' . $descriptor['relation'] . '.completename';
+                }
+                if (in_array($key, $aliases, true)) {
+                    $matches[$field] = true;
+                }
             }
         }
-
-        return self::safeSyncFieldFromLabel((string) ($mapping['glpi_b_field_label'] ?? ''));
-    }
-
-    private static function safeSyncFieldName(string $fieldKey): string
-    {
-        $fieldKey = trim($fieldKey);
-        if ($fieldKey === '') {
-            return '';
+        if (count($matches) === 1) {
+            return (string) array_key_first($matches);
         }
-
-        foreach (array_keys(self::safeSyncFields()) as $fieldName) {
-            if ($fieldKey === $fieldName || str_ends_with($fieldKey, '.' . $fieldName)) {
-                return $fieldName;
-            }
-        }
-
-        return '';
+        $key = (string) ($mapping['glpi_b_field_key'] ?? '');
+        throw new \RuntimeException('Unsupported or ambiguous remote native mapping; reselect the field: ' . $key);
     }
 
-    private static function safeSyncFieldFromLabel(string $label): string
-    {
-        $label = strtolower(trim(strip_tags($label)));
-        $labels = [
-            'name'             => 'name',
-            'serial number'    => 'serial',
-            'serial'           => 'serial',
-            'inventory number' => 'otherserial',
-            'asset tag'        => 'otherserial',
-            'comments'         => 'comment',
-            'comment'          => 'comment',
-        ];
-
-        return $labels[$label] ?? '';
-    }
-
-    /**
-     * @return array<string,true>
-     */
-    private static function safeSyncFields(): array
-    {
-        return [
-            'name'        => true,
-            'serial'      => true,
-            'otherserial' => true,
-            'comment'     => true,
-        ];
-    }
-
-    /**
-     * @param int|string $optionId
-     * @param array<string,mixed> $option
-     */
-    private static function searchOptionMatches(string $fieldKey, $optionId, array $option): bool
-    {
-        $optionId = (string) $optionId;
-        $id = isset($option['id']) && is_scalar($option['id']) ? trim((string) $option['id']) : $optionId;
-        $uid = isset($option['uid']) && is_scalar($option['uid']) ? trim((string) $option['uid']) : '';
-
-        return $fieldKey === $id || ($uid !== '' && $fieldKey === $uid);
-    }
-
-    private static function itemTable(string $itemtype): string
-    {
-        if (class_exists($itemtype) && method_exists($itemtype, 'getTable')) {
-            return (string) $itemtype::getTable();
-        }
-
-        return '';
-    }
 }

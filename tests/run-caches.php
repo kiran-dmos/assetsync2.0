@@ -164,7 +164,10 @@ foreach ($configOwners as $key => $owner) {
         } else {
             Config::$values['plugin:assetsync20'][$key] = $json;
         }
-        if ($owner === BillingFieldConfig::class && $json !== null && $json !== '[]') {
+        if ($owner === FieldMapping::class && in_array($json, ['null', 'false', '{"broken"'], true)) {
+            cacheError(static fn () => cacheRead($owner), 'Invalid saved field mapping');
+            cacheError(static fn () => cacheRead($owner), 'Invalid saved field mapping');
+        } elseif ($owner === BillingFieldConfig::class && $json !== null && $json !== '[]') {
             cacheError(static fn () => cacheRead($owner), 'invalid JSON');
             cacheError(static fn () => cacheRead($owner), 'invalid JSON');
         } else {
@@ -217,8 +220,8 @@ Config::$values['plugin:assetsync20']['entity_sync_routes'] = json_encode($route
 EntitySyncRoute::save(['id' => 'route', 'name' => 'Saved', 'glpi_a_source_entity_name' => 'Source']);
 cacheCheck(EntitySyncRoute::find('external') !== null && EntitySyncRoute::find('route')['name'] === 'Saved', 'Route save must merge fresh rows and reload after writing.');
 Config::$values['plugin:assetsync20']['field_mappings'] = '{"external":{"Monitor":{"name":{"glpi_b_field_key":"Monitor.name","source_of_truth":"glpi_b"}}}}';
-FieldMapping::save('cache', 'Computer', ['name' => ['glpi_b_field_key' => 'Computer.name', 'source_of_truth' => 'glpi_b']]);
-cacheCheck(FieldMapping::load('cache', 'Computer')['name']['source_of_truth'] === 'glpi_b' && FieldMapping::load('external', 'Monitor') !== [], 'Mapping save must preserve fresh other mappings and reload its write.');
+\saveTestMappings('cache', 'Computer', ['name' => ['glpi_b_field_key' => 'Computer.name', 'source_of_truth' => 'glpi_b']]);
+cacheCheck(FieldMapping::load('cache', 'Computer')[0]['source_of_truth'] === 'glpi_b' && FieldMapping::load('external', 'Monitor') !== [], 'Mapping save must preserve fresh other mappings and reload its write.');
 unset(Config::$values['plugin:assetsync20']['billing_fields']);
 cacheError(static fn () => BillingFieldConfig::save([]), 'Confirm that you want to stop legacy billing');
 BillingFieldConfig::save([], true);
@@ -250,7 +253,7 @@ foreach ($configOwners as $key => $owner) {
         match ($owner) {
             GlpiBConnection::class => GlpiBConnection::save(['id' => 'cache', 'name' => 'Failed']),
             EntitySyncRoute::class => EntitySyncRoute::save(['id' => 'route', 'glpi_a_source_entity_name' => 'Source']),
-            FieldMapping::class => FieldMapping::save('cache', 'Computer', []),
+            FieldMapping::class => \saveTestMappings('cache', 'Computer', []),
             BillingFieldConfig::class => BillingFieldConfig::save([], true),
         };
     }, 'write failed');

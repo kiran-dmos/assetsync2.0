@@ -395,12 +395,12 @@ SQL;
         return self::updateStatus($job, self::STATUS_BLOCKED, null, $message, $remoteItemsId);
     }
 
-    public static function retry(array $job, string $message): bool
+    public static function retry(array $job, string $message, ?int $remoteItemsId = null): bool
     {
         $backoffSeconds = self::backoffSeconds((int) ($job['attempts'] ?? 1));
         $availableAt = new \Glpi\DBAL\QueryExpression('DATE_ADD(NOW(), INTERVAL ' . $backoffSeconds . ' SECOND)');
 
-        return self::updateStatus($job, self::STATUS_RETRY, $availableAt, $message, null);
+        return self::updateStatus($job, self::STATUS_RETRY, $availableAt, $message, $remoteItemsId);
     }
 
     public static function owns(array $job): bool

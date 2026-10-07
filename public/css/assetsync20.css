@@ -60,6 +60,15 @@
     min-width: 0;
 }
 
+.assetsync-mapping .assetsync-table-scroll { position: relative; max-width: 100%; }
+.assetsync-mapping .assetsync-mapping-table th,
+.assetsync-mapping .assetsync-mapping-table td { display: table-cell; vertical-align: top; padding: 8px; }
+.assetsync-mapping-table th:nth-child(3) { width: 130px; }
+.assetsync-mapping-table th:nth-child(4) { width: 48px; }
+.assetsync-mapping-error { display: block; overflow-wrap: anywhere; color: var(--tblr-danger, #b42318); }
+.assetsync-mapping-remove button { width: 32px; height: 32px; }
+.assetsync-mapping-actions { display: flex; gap: 12px; margin: 12px 0; }
+
 .assetsync-billing table.assetsync-workflow {
     max-width: 840px;
 }

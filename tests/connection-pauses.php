@@ -37,6 +37,7 @@ namespace {
         public array $failures = [];
         public FakeGlpiBClient $client;
         public function __construct() { $this->client = new FakeGlpiBClient(); }
+        public function nativeMappingContext(...$arguments): array { return $this->client->nativeMappingContext(...$arguments); }
         public function getItem(array $connection, string $type, int $id, bool $timezone = true): array
         {
             $this->reads[] = $connection['id'];
@@ -74,7 +75,7 @@ namespace {
             GlpiBConnection::save(['id' => $connection, 'active' => true]);
             EntitySyncRoute::save(['id' => 'route-' . $connection, 'glpi_b_connection_id' => $connection,
                 'glpi_a_source_entity_id' => (string) $entity, 'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
-            FieldMapping::save($connection, 'Computer', ['name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']]);
+            \saveTestMappings($connection, 'Computer', ['name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']]);
             for ($index = 1; $index <= $count; $index++) {
                 $id = ($connection === 'a' ? 100 : 200) + $index;
                 $GLOBALS['DB']->insert('glpi_computers', ['id' => $id, 'entities_id' => $entity, 'is_deleted' => 0,

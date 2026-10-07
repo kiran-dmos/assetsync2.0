@@ -311,7 +311,7 @@ final class AssetSyncService
         }
 
         try {
-            $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+            $mappings = FieldMapping::syncMappings($connectionId, $itemtype, $asset);
             $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
             $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, $customTypes);
             $asset = $prepared['asset'];
@@ -519,7 +519,7 @@ final class AssetSyncService
         }
 
         try {
-            $mappings = FieldMapping::syncMappings($connectionId, $itemtype);
+            $mappings = FieldMapping::syncMappings($connectionId, $itemtype, $asset);
             $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
             $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, $customTypes);
             $asset = $prepared['asset'];
@@ -549,10 +549,57 @@ final class AssetSyncService
             $this->recordJobOutcome('skipped', AssetSyncQueue::finish($job, 'Asset payload is unchanged.'));
             return;
         }
-        $remoteItemsId = $link !== null ? (int) ($link['remote_items_id'] ?? 0) : (int) ($job['remote_items_id'] ?? 0);
+        $nativeKeys = array_values(array_filter(array_column($mappings, 'glpi_b_field'), static fn (string $key): bool => !FieldsText::isCustom($key)));
+        $nativeContext = $this->callRemote('nativeMappingContext', [$connection, $itemtype, $nativeKeys, (int) $route['glpi_b_target_entity_id']]);
+        if (!$this->remoteSucceeded($nativeContext)) {
+            $this->handleRemoteFailure($job, $route['id'], $nativeContext, $attempts, $link['remote_items_id'] ?? null);
+            return;
+        }
+        try {
+            $localDescriptors = [];
+            $localCatalogs = [];
+            $remoteDescriptors = [];
+            $localTypes = FieldsText::customTypes($itemtype, array_column($mappings, 'glpi_a_field'));
+            foreach ($mappings as &$mapping) {
+                $a = $mapping['glpi_a_field'];
+                $b = $mapping['glpi_b_field'];
+                if (!FieldsText::isCustom($a)) {
+                    $localDescriptors[$a] ??= NativeField::local($itemtype, $a);
+                    $localTypes[$a] = $localDescriptors[$a]['type'];
+                    if ($localDescriptors[$a]['relation'] !== '' && !isset($localCatalogs[$a])) {
+                        $localCatalogs[$a] = NativeField::localCatalog($localDescriptors[$a], (int) $asset['entities_id'], [NativeField::referenceId($asset[$a] ?? null)]);
+                    }
+                }
+                if (!FieldsText::isCustom($b)) {
+                    $descriptor = $nativeContext['fields'][$b] ?? null;
+                    if (!is_array($descriptor) || !NativeField::compatible($localTypes[$a], $descriptor['type'])) {
+                        throw new \RuntimeException('The mapped endpoints have incompatible or unavailable metadata: ' . $a . ' -> ' . $b);
+                    }
+                    $mapping['glpi_b_field'] = $descriptor['field'];
+                    $remoteDescriptors[$descriptor['field']] = $descriptor;
+                }
+                $mapping['value_type'] = $localTypes[$a];
+            }
+            unset($mapping);
+            $comparisonAsset = $this->nativeSnapshot($asset, $localDescriptors, $localCatalogs);
+            $stateLabels = [];
+            foreach ($mappings as $mapping) {
+                if ($mapping['glpi_b_field'] === 'states_id' && $mapping['source_of_truth'] !== 'glpi_b') {
+                    $stateLabels[] = $comparisonAsset[$mapping['glpi_a_field']] ?? '';
+                }
+            }
+        } catch (\RuntimeException $error) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $link['remote_items_id'] ?? null);
+            return;
+        }
+        $remoteItemsId = (int) ($link['remote_items_id'] ?? 0);
+        if ($remoteItemsId <= 0) {
+            $remoteItemsId = (int) ($job['remote_items_id'] ?? 0);
+        }
         $remoteItem = null;
         $remoteDateModTimezone = '';
         $createdRemote = false;
+        $customMetadata = [];
 
         if ($remoteItemsId > 0) {
             $remoteResult = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId, $needsDateModTimezone]);
@@ -604,16 +651,49 @@ final class AssetSyncService
                 $remoteItem = is_array($remoteResult['item'] ?? null) ? $remoteResult['item'] : [];
                 $remoteDateModTimezone = $this->dateModTimezone($remoteResult[self::DATE_MOD_TIMEZONE_KEY] ?? '');
             } else {
+                if (isset($remoteDescriptors['states_id'])) {
+                    $states = $this->callRemote('nativeStateCatalog', [$connection, $itemtype, $nativeContext['catalogs']['states_id'], 0, $stateLabels, $nativeContext['entity_path']]);
+                    if (!$this->remoteSucceeded($states)) {
+                        $this->handleRemoteFailure($job, $route['id'], $states, $attempts, null);
+                        return;
+                    }
+                    $nativeContext['catalogs']['states_id'] = $states['rows'];
+                }
+                try {
+                    $createInput = $this->nativeWriteValues($this->createInput($comparisonAsset, $route, $mappings), $remoteDescriptors, $nativeContext['catalogs']);
+                    $createCustom = [];
+                    foreach ($mappings as $mapping) {
+                        if (FieldsText::isCustom($mapping['glpi_b_field']) && $mapping['source_of_truth'] !== 'glpi_b') {
+                            $value = $comparisonAsset[$mapping['glpi_a_field']] ?? '';
+                            if ($mapping['source_of_truth'] === 'glpi_a' || !$this->isBlank($this->value($value))) {
+                                $createCustom[$mapping['glpi_b_field']] = FieldsText::normalizeValue($mapping['value_type'], $value);
+                            }
+                        }
+                    }
+                } catch (\RuntimeException $error) {
+                    $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage());
+                    return;
+                }
                 if ($customKeys !== []) {
-                    $validation = $this->callRemote('customTextValues', [$connection, $itemtype, 0, $customKeys, [], $customTypes]);
+                    $validation = $this->callRemote('customTextValues', [$connection, $itemtype, 0, $customKeys, $createCustom, $customTypes, true, true, (int) $route['glpi_b_target_entity_id']]);
                     if (!$this->remoteSucceeded($validation)) {
                         $this->handleRemoteFailure($job, $route['id'], $validation, $attempts, null);
                         return;
                     }
+                    $customMetadata = $validation['metadata'] ?? [];
                 }
-                $createResult = $this->callRemote('createItem', [$connection, $itemtype, $this->createInput($asset, $route, $mappings)]);
+                $createResult = $this->callRemote('createItem', [$connection, $itemtype, $createInput]);
+                if ((int) ($createResult['id'] ?? 0) > 0 && AssetSyncQueue::owns($job)) {
+                    // A later readback or custom write can fail after the native POST succeeded.
+                    if (!AssetSyncLink::saveStatus($itemtype, $itemsId, $connectionId, $route['id'],
+                        AssetSyncLink::STATUS_BLOCKED_REMOTE_ERROR, 'Remote asset created; synchronization is not yet verified.', (int) $createResult['id'])) {
+                        $this->handleRemoteFailure($job, $route['id'], ['success' => false, 'transient' => true,
+                            'message' => 'Could not retain the created remote asset link.'], $attempts, (int) $createResult['id']);
+                        return;
+                    }
+                }
                 if (!$this->remoteSucceeded($createResult)) {
-                    $this->handleRemoteFailure($job, $route['id'], $createResult, $attempts, null);
+                    $this->handleRemoteFailure($job, $route['id'], $createResult, $attempts, !empty($createResult['id']) ? (int) $createResult['id'] : null);
                     return;
                 }
 
@@ -623,7 +703,7 @@ final class AssetSyncService
                     return;
                 }
 
-                $remoteItem = $this->createInput($asset, $route, $mappings);
+                $remoteItem = $createResult['item'] ?? $createInput;
                 $remoteItem['id'] = $remoteItemsId;
                 $createdRemote = true;
             }
@@ -633,21 +713,32 @@ final class AssetSyncService
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_MISSING_REMOTE, 'The linked GLPI B asset is deleted.', $remoteItemsId);
             return;
         }
+        if (!$createdRemote && isset($remoteDescriptors['states_id'])) {
+            $states = $this->callRemote('nativeStateCatalog', [$connection, $itemtype, $nativeContext['catalogs']['states_id'],
+                $remoteItem['states_id'] ?? null, $stateLabels, $nativeContext['entity_path']]);
+            if (!$this->remoteSucceeded($states)) {
+                $this->handleRemoteFailure($job, $route['id'], $states, $attempts, $remoteItemsId);
+                return;
+            }
+            $nativeContext['catalogs']['states_id'] = $states['rows'];
+        }
 
         if ($customKeys !== []) {
-            $customResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, [], $customTypes]);
+            $customResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, $customKeys, [], $customTypes, false, false, null, $customMetadata]);
             if (!$this->remoteSucceeded($customResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $customResult, $attempts, $remoteItemsId);
                 return;
             }
             $remoteItem = array_merge($remoteItem ?? [], $customResult['item']);
+            $customMetadata = $customResult['metadata'] ?? [];
         }
         // Native creation already applied its mappings; custom rows are written separately.
         $comparisonMappings = $createdRemote ? array_values(array_filter($mappings, static fn (array $mapping): bool => FieldsText::isCustom($mapping['glpi_b_field']) || FieldsText::isCustom($mapping['glpi_a_field']))) : $mappings;
         $localCustomDateMods = [];
         $remoteCustomDateMods = [];
         try {
-            $customHistoryNeeds = $this->customHistoryNeeds($asset, $remoteItem ?? [], $comparisonMappings, $customTypes);
+            $comparisonRemote = $this->nativeSnapshot($remoteItem ?? [], $remoteDescriptors, $nativeContext['catalogs']);
+            $customHistoryNeeds = $this->customHistoryNeeds($comparisonAsset, $comparisonRemote, $comparisonMappings, $customTypes);
             if ($customHistoryNeeds['local'] !== []) {
                 $localCustomDateMods = $this->localCustomHistoryDates($itemtype, $itemsId, $customHistoryNeeds['local']);
             }
@@ -663,7 +754,8 @@ final class AssetSyncService
                     ? $remoteHistoryTimezone
                     : '';
             }
-            $changes = $this->existingChanges($asset, $remoteItem ?? [], $route, $comparisonMappings, $customTypes, $localCustomDateMods, $remoteCustomDateMods, $remoteDateModTimezone);
+            $changes = $this->existingChanges($comparisonAsset, $comparisonRemote, $route, $comparisonMappings, $customTypes, $localCustomDateMods, $remoteCustomDateMods, $remoteDateModTimezone);
+            $changes['local'] = $this->nativeWriteValues($changes['local'], $localDescriptors, $localCatalogs, (int) $asset['entities_id']);
         } catch (\Throwable $error) {
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
             return;
@@ -699,14 +791,37 @@ final class AssetSyncService
             if ($mapping['source_of_truth'] === 'glpi_a' && array_key_exists($localKey, $billingValues)) {
                 $remoteKey = $mapping['glpi_b_field'];
                 unset($changes['remote'][$remoteKey]);
-                if (($remoteItem[$remoteKey] ?? null) !== $billingValues[$localKey]) {
-                    $changes['remote'][$remoteKey] = $billingValues[$localKey];
+                try {
+                    $value = FieldsText::normalizeValue($mapping['value_type'], $billingValues[$localKey]);
+                } catch (\RuntimeException $error) {
+                    $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
+                    return;
+                }
+                if (($comparisonRemote[$remoteKey] ?? null) !== $value) {
+                    $changes['remote'][$remoteKey] = $value;
                 }
             }
         }
 
+        try {
+            $changes['remote'] = $this->nativeWriteValues($changes['remote'], $remoteDescriptors, $nativeContext['catalogs']);
+            FieldsText::prepareLocalWrite($itemtype, $itemsId, array_filter($changes['local'], static fn (string $key): bool => FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY), true);
+            if ($changes['local'] !== []) {
+                $this->assertLocalNativeAccess($itemtype, $itemsId, (int) $asset['entities_id']);
+            }
+        } catch (\RuntimeException $error) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, $error->getMessage(), $remoteItemsId);
+            return;
+        }
         $nativeChanges = array_filter($changes['remote'], static fn (string $key): bool => !FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
         $customChanges = array_diff_key($changes['remote'], $nativeChanges);
+        if ($customChanges !== []) {
+            $validation = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, array_keys($customChanges), $customChanges, $customTypes, true, true, (int) $route['glpi_b_target_entity_id'], $customMetadata]);
+            if (!$this->remoteSucceeded($validation)) {
+                $this->handleRemoteFailure($job, $route['id'], $validation, $attempts, $remoteItemsId);
+                return;
+            }
+        }
         if ($nativeChanges !== []) {
             $updateResult = $this->callRemote('updateItem', [$connection, $itemtype, $remoteItemsId, $nativeChanges]);
             if (!$this->remoteSucceeded($updateResult)) {
@@ -716,7 +831,7 @@ final class AssetSyncService
         }
 
         if ($customChanges !== []) {
-            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, array_keys($customChanges), $customChanges, $customTypes, true]);
+            $updateResult = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, array_keys($customChanges), $customChanges, $customTypes, true, false, (int) $route['glpi_b_target_entity_id'], $customMetadata]);
             if (!$this->remoteSucceeded($updateResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;
@@ -787,6 +902,9 @@ final class AssetSyncService
                 'value' => $this->value($asset[$mapping['glpi_a_field']] ?? ''),
             ];
         }
+        usort($payload['fields'], static fn (array $left, array $right): int =>
+            [$left['a'], $left['b'], $left['source']] <=> [$right['a'], $right['b'], $right['source']]
+        );
 
         return hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR));
     }
@@ -1187,9 +1305,64 @@ final class AssetSyncService
             return false;
         }
 
+        $this->assertLocalNativeAccess($itemtype, $itemsId);
         $input = array_merge(['id' => $itemsId], $fields);
+        if (!$item->update($input) || !$item->getFromDB($itemsId)) {
+            return false;
+        }
+        foreach ($fields as $key => $value) {
+            $descriptor = NativeField::local($itemtype, $key);
+            $persisted = $item->fields[$key] ?? null;
+            $matches = $descriptor['type'] === 'dropdown'
+                ? NativeField::referenceId($persisted) === NativeField::referenceId($value)
+                : FieldsText::normalizeReadValue($descriptor['type'], $persisted) === FieldsText::normalizeReadValue($descriptor['type'], $value);
+            if (!array_key_exists($key, $item->fields) || !$matches) {
+                throw new \RuntimeException('GLPI A did not persist native field: ' . $key);
+            }
+        }
+        return true;
+    }
 
-        return (bool) $item->update($input);
+    private function assertLocalNativeAccess(string $itemtype, int $itemsId, ?int $expectedEntity = null): void
+    {
+        $item = new $itemtype();
+        if (!$item->getFromDB($itemsId) || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
+            || ($expectedEntity !== null && (int) ($item->fields['entities_id'] ?? -1) !== $expectedEntity)) {
+            throw new \RuntimeException('GLPI A asset is missing, deleted, or changed entity scope.');
+        }
+        $cron = class_exists('Session') && method_exists('Session', 'isCron') && \Session::isCron();
+        if (!$cron && (!method_exists($item, 'can') || !$item->can($itemsId, defined('UPDATE') ? UPDATE : 2))) {
+            throw new \RuntimeException('GLPI A asset update permission denied.');
+        }
+    }
+
+    private function nativeSnapshot(array $values, array $descriptors, array $catalogs): array
+    {
+        foreach ($descriptors as $key => $descriptor) {
+            if (!array_key_exists($key, $values)) {
+                throw new \RuntimeException('Mapped native field is missing from asset: ' . $key);
+            }
+            $values[$key] = $descriptor['type'] === 'dropdown'
+                ? NativeField::labelForId($catalogs[$key], $values[$key])
+                : FieldsText::normalizeReadValue($descriptor['type'], $values[$key]);
+        }
+        return $values;
+    }
+
+    private function nativeWriteValues(array $values, array $descriptors, array $catalogs, ?int $localEntityId = null): array
+    {
+        foreach ($values as $key => $value) {
+            if (!isset($descriptors[$key])) {
+                continue;
+            }
+            if ($descriptors[$key]['type'] === 'dropdown' && $localEntityId !== null) {
+                $catalogs[$key] = NativeField::localCatalog($descriptors[$key], $localEntityId, [], [FieldsText::normalizeValue('dropdown', $value)]);
+            }
+            $values[$key] = $descriptors[$key]['type'] === 'dropdown'
+                ? NativeField::idForLabel($catalogs[$key], $value)
+                : FieldsText::normalizeValue($descriptors[$key]['type'], $value);
+        }
+        return $values;
     }
 
     /**
@@ -1686,6 +1859,9 @@ final class AssetSyncService
      */
     private function mappingFieldType(array $mapping, array $fieldTypes): string
     {
+        if (isset($mapping['value_type'])) {
+            return $mapping['value_type'];
+        }
         foreach (['glpi_b_field', 'glpi_a_field'] as $fieldName) {
             $key = $mapping[$fieldName] ?? '';
             if (isset($fieldTypes[$key])) {
@@ -1756,7 +1932,7 @@ final class AssetSyncService
         $this->pauseConnection((string) $job['glpi_b_connection_id'], $remoteResult);
 
         if (!empty($remoteResult['transient'])) {
-            $retried = AssetSyncQueue::retry($job, $message);
+            $retried = AssetSyncQueue::retry($job, $message, $remoteItemsId);
             $this->recordJobOutcome('retried', $retried);
             return;
         }

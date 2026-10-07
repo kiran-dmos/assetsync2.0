@@ -110,11 +110,11 @@ deadlineFinish(1, 0, 4000.0, [2000]);
 
 // Cleanup failures/exceptions do not replay or undo the primary mutation result.
 foreach ([httpStep('killSession', [], 503), httpStep('killSession', false, 0) + ['errno' => 7], httpStep('killSession', [], 200, 5, true)] as $cleanup) {
-    httpStart([$init, httpStep('Computer/12'), $cleanup]);
+    httpStart([$init, httpStep('Computer/12'), httpStep('Computer/12', ['id' => 12, 'name' => 'Changed']), $cleanup]);
     $result = deadlineCall('updateItem', ['Computer', 12, ['name' => 'Changed']], 5_000_000_000);
     deadlineCheck($result['success'] && !empty($result['cleanup_failure']['executed']), 'Successful PUT must remain successful, with observable cleanup failure.');
     deadlineCheck(count(array_filter(HttpMetricsCurl::$trace, static fn (array $entry): bool => $entry['options'][CURLOPT_CUSTOMREQUEST] === 'PUT')) === 1, 'Mutations must never be automatically replayed.');
-    deadlineFinish(3, 1, 15.0, [4000, 3995, 1000]);
+    deadlineFinish(4, 1, 20.0, [4000, 3995, 3990, 1000]);
 }
 
 // Each failure wrapper must preserve the executed request's status and cause.

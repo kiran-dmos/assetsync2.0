@@ -802,7 +802,7 @@ Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
         'source_of_truth' => 'glpi_a',
     ],
 ]]]);
-expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible remote Fields-plugin dropdown field', 'Dropdown-to-text mappings must be rejected clearly');
+expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible endpoint types', 'Dropdown-to-text mappings must be rejected clearly');
 PluginFieldsContainer::$options = [
     884776 => fieldOption(1, 'DMOS Asset - Name', 'namefield', 'text'),
     884783 => $dropdownOption,
@@ -815,7 +815,7 @@ Config::$values['field_mappings'] = json_encode(['test' => ['Computer' => [
         'source_of_truth' => 'glpi_a',
     ],
 ]]]);
-expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible local Fields-plugin dropdown field', 'Text-to-dropdown mappings must be rejected clearly');
+expectRuntime(static fn (): array => FieldMapping::syncMappings('test', 'Computer'), 'compatible endpoint types', 'Text-to-dropdown mappings must be rejected clearly');
 $fieldsFromSearchOptions = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'fieldsFromSearchOptions');
 $fieldsFromSearchOptions->setAccessible(true);
 $searchOptionsWithRawMetadata = new ReflectionMethod(\GlpiPlugin\Assetsync20\GlpiBConnection::class, 'searchOptionsWithRawMetadata');
@@ -826,6 +826,7 @@ check($remoteFields === [[
     'id' => '884783',
     'uid' => $dropdownKeyA,
     'label' => 'DMOS Asset - Department',
+    'group' => 'Custom', 'supported' => true, 'type' => 'dropdown', 'reason' => '',
 ]], 'GLPI B field discovery must expose Fields-plugin dropdowns with stable generated FK identifiers');
 $restDropdownKey = 'Computer.PluginFieldsComputerdmosasset.plugin_fields_companyfielddropdowns_id';
 $restDropdownOption = [
@@ -841,6 +842,7 @@ check($restRemoteFields === [[
     'id' => '76680',
     'uid' => $restDropdownKey,
     'label' => 'DMOS Asset - Company',
+    'group' => 'Custom', 'supported' => true, 'type' => 'dropdown', 'reason' => '',
 ]], 'GLPI B REST dropdown discovery must convert joined display options to stable generated FK identifiers');
 $restTextKey = 'Computer.PluginFieldsComputerdmosasset.namefield';
 $restTextareaKey = 'Computer.PluginFieldsComputerdmosasset.shareduseremailfield';
@@ -868,12 +870,14 @@ check($restScalarFields === [
         'id' => '76666',
         'uid' => $restTextKey,
         'label' => 'DMOS Asset - Name',
+        'group' => 'Custom', 'supported' => true, 'type' => 'text', 'reason' => '',
     ],
     [
         'key' => $restTextareaKey,
         'id' => '76678',
         'uid' => $restTextareaKey,
         'label' => 'DMOS Asset - Shared User Email',
+        'group' => 'Custom', 'supported' => true, 'type' => 'textarea', 'reason' => '',
     ],
 ], 'GLPI B raw REST discovery must expose Fields-plugin text and textarea fields');
 $mergedSearchOptions = $searchOptionsWithRawMetadata->invoke(null, [
@@ -941,20 +945,11 @@ $mergedSearchOptions = $searchOptionsWithRawMetadata->invoke(null, [
     ],
 ]);
 $mergedRemoteFields = $fieldsFromSearchOptions->invoke(null, $mergedSearchOptions, 'Computer');
-check($mergedRemoteFields === [
-    [
-        'key' => 'Computer.name',
-        'id' => '1',
-        'uid' => 'Computer.name',
-        'label' => 'Name',
-    ],
-    [
-        'key' => $restTextKey,
-        'id' => '76666',
-        'uid' => $restTextKey,
-        'label' => 'DMOS Asset - Name',
-    ],
-], 'GLPI B discovery must merge raw Fields metadata while preserving native UID keys and blocking unsupported Fields options');
+$supportedMerged = array_values(array_filter($mergedRemoteFields, static fn (array $field): bool => $field['supported']));
+check(array_column($supportedMerged, 'key') === ['name', $restTextKey]
+    && count($mergedRemoteFields) > count($supportedMerged)
+    && !in_array('', array_column(array_filter($mergedRemoteFields, static fn (array $field): bool => !$field['supported']), 'reason'), true),
+    'Discovery must keep unsupported fields visible with reasons, while exposing only validated stable identities as supported');
 $multiDropdownOption = dropdownFieldOption(8, 'DMOS Asset - Department', 'departmentfield', 1);
 expectRuntime(static fn (): string => FieldsText::validate($multiDropdownOption), 'multi-select dropdown fields are not supported', 'Multi-select Fields dropdowns must block clearly');
 $itemDropdownOption = fieldOption(8, 'DMOS Asset - Assigned User', 'assigneduserfield', 'dropdown-User');
@@ -976,7 +971,7 @@ try {
     FieldMapping::syncMappings('test', 'Computer');
     throw new LogicException('Custom yesno was allowed to target a native text field');
 } catch (RuntimeException $error) {
-    check(str_contains($error->getMessage(), 'compatible remote Fields-plugin yesno'), 'Custom yesno/native type mismatch must be explicit');
+    check(str_contains($error->getMessage(), 'compatible endpoint types'), 'Custom yesno/native type mismatch must be explicit');
 }
 try {
     FieldsText::normalizeValue('yesno', 'maybe');

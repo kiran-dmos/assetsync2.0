@@ -585,8 +585,12 @@ final class FakeDB
 
 class Computer
 {
+    public static bool $allowUpdate = true;
+    public static bool $ignoreUpdate = false;
     /** @var array<string,mixed> */
     public array $fields = [];
+
+    public function can($id, $right): bool { return self::$allowUpdate && $this->getFromDB($id); }
 
     public static function getTable(): string
     {
@@ -613,6 +617,7 @@ class Computer
     public function update(array $input): bool
     {
         global $DB;
+        if (self::$ignoreUpdate) { return true; }
 
         $id = (int) ($input['id'] ?? 0);
         unset($input['id']);
@@ -627,13 +632,10 @@ class Computer
 
 class Search
 {
+    public static array $nativeOptions = [];
     public static function getOptions($itemtype): array
     {
-        if (PluginFieldsContainer::$options === []) {
-            return [];
-        }
-
-        return [
+        return self::$nativeOptions + [
             1 => ['name' => 'Name', 'field' => 'name', 'table' => 'glpi_computers', 'uid' => 'Computer.name'],
             5 => ['name' => 'Serial number', 'field' => 'serial', 'table' => 'glpi_computers', 'uid' => 'Computer.serial'],
             6 => ['name' => 'Inventory number', 'field' => 'otherserial', 'table' => 'glpi_computers', 'uid' => 'Computer.otherserial'],
@@ -869,6 +871,9 @@ class PluginFieldsStatusfieldDropdown
 
 final class FakeGlpiBClient
 {
+    public array $nativeOptions = [];
+    public array $nativeCatalogs = [];
+    public ?array $createFailure = null;
     public array $unavailableCustomKeys = [];
     public string $dateModTimezone = 'UTC';
     /** @var array<string,array<int,array<string,mixed>>> */
@@ -944,14 +949,19 @@ final class FakeGlpiBClient
         $this->requests[] = ['method' => 'createItem', 'input' => $input];
         $id = $this->nextId++;
         $record = $input;
+        $record += ['name' => '', 'comment' => '', 'serial' => '', 'otherserial' => ''];
         $record['id'] = $id;
         $record['date_mod'] = $record['date_mod'] ?? '2026-01-01 00:00:00';
         $this->records[$this->key($connection, $itemtype)][$id] = $record;
+        if ($this->createFailure !== null) {
+            return $this->createFailure + ['id' => $id];
+        }
 
         return [
             'success' => true,
             'message' => 'created',
             'id' => $id,
+            'item' => $record,
             'transient' => false,
         ];
     }
@@ -989,10 +999,24 @@ final class FakeGlpiBClient
      * @param array<string,string> $expectedTypes
      * @return array{success:bool,message:string,item:array<string,mixed>,history_option_ids:array<string,string>,history_refs:array<string,array{option_id:string,itemtype_link:string}>,transient:bool}
      */
-    public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false): array
+    public function nativeMappingContext(array $connection, string $itemtype, array $keys, int $entityId): array
+    {
+        $fields = [];
+        foreach ($keys as $key) {
+            $fields[$key] = \GlpiPlugin\Assetsync20\NativeField::resolve($itemtype, $key, $this->nativeOptions + [
+                1 => ['field' => 'name', 'table' => 'glpi_computers', 'uid' => 'Computer.name'],
+                5 => ['field' => 'serial', 'table' => 'glpi_computers', 'uid' => 'Computer.serial'],
+                6 => ['field' => 'otherserial', 'table' => 'glpi_computers', 'uid' => 'Computer.otherserial'],
+                16 => ['field' => 'comment', 'table' => 'glpi_computers', 'uid' => 'Computer.comment'],
+            ]);
+        }
+        return ['success' => true, 'fields' => $fields, 'catalogs' => $this->nativeCatalogs];
+    }
+
+    public function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false, bool $dryRun = false, ?int $targetEntityId = null): array
     {
         $this->requests[] = ['method' => 'customTextValues', 'items_id' => $itemsId, 'keys' => $keys,
-            'changes' => $changes, 'expected_types' => $expectedTypes, 'allow_readonly' => $allowReadonly];
+            'changes' => $changes, 'expected_types' => $expectedTypes, 'allow_readonly' => $allowReadonly, 'dry_run' => $dryRun];
         if ($this->customRequestResult !== null) {
             $result = ($this->customRequestResult)($itemsId, $keys, $changes, $expectedTypes, $allowReadonly);
             if ($result !== null) {
@@ -1001,6 +1025,14 @@ final class FakeGlpiBClient
         }
         if (array_intersect($keys, $this->unavailableCustomKeys) !== []) {
             return ['success' => false, 'message' => 'Mapped remote field unavailable.', 'transient' => false];
+        }
+        if ($dryRun) {
+            foreach ($changes as $key => $value) {
+                if (($expectedTypes[$key] ?? '') === 'dropdown') {
+                    $this->dropdownIdForLabel($key, (string) $value);
+                }
+            }
+            return ['success' => true, 'item' => []];
         }
         $recordKey = $this->key($connection, $itemtype);
         $values = [];
@@ -1162,6 +1194,48 @@ final class FakeGlpiBClient
     }
 }
 
+/** Supply explicit synthetic discovery to configuration tests that do not use HTTP. */
+function saveTestMappings(string $connection, string $itemtype, array $mappings, array $fields = []): void
+{
+    $types = \GlpiPlugin\Assetsync20\NativeField::definitions($itemtype);
+    $expected = [];
+    foreach ($mappings as $key => $row) {
+        $a = (string) ($row['glpi_a_field_key'] ?? $key);
+        $b = (string) ($row['glpi_b_field_key'] ?? '');
+        try {
+            $expected[$b] = \GlpiPlugin\Assetsync20\FieldsText::isCustom($a)
+                ? (\GlpiPlugin\Assetsync20\FieldsText::customTypes($itemtype, [$a])[$a] ?? '')
+                : \GlpiPlugin\Assetsync20\NativeField::local($itemtype, $a)['type'];
+        } catch (RuntimeException) {
+            $expected[$b] = '';
+        }
+    }
+    if ($fields === []) {
+        foreach ($expected as $b => $type) {
+            $fields[] = ['key' => $b, 'uid' => $b, 'id' => '', 'label' => $b, 'type' => $type];
+        }
+    }
+    foreach ($fields as &$field) {
+        $key = $field['key'];
+        foreach ($types as $column => $descriptor) {
+            $aliases = [$column, $itemtype . '.' . $column];
+            if ($descriptor['relation'] !== '') {
+                $aliases[] = $itemtype . '.' . $descriptor['relation'] . '.name';
+            }
+            if (in_array($key, $aliases, true)) {
+                $field['uid'] = $field['uid'] ?? $key;
+                $field['key'] = $column;
+                $field['type'] = $descriptor['type'];
+                break;
+            }
+        }
+        $field['type'] ??= $expected[$key] ?? 'text';
+        $field['supported'] ??= true;
+    }
+    unset($field);
+    \GlpiPlugin\Assetsync20\FieldMapping::save($connection, $itemtype, $mappings, $fields);
+}
+
 function configureCustomNameMapping(string $source, string $customKey, string $remoteOptionId): array
 {
     $remoteFields = [[
@@ -1171,7 +1245,7 @@ function configureCustomNameMapping(string $source, string $customKey, string $r
         'label' => 'DMOS Name',
     ]];
 
-    \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    \saveTestMappings('production', 'Computer', [
         $customKey => [
             'glpi_b_field_key' => $customKey,
             'glpi_b_field_uid' => $customKey,
@@ -1192,7 +1266,7 @@ function configureCustomDropdownMapping(string $source, string $customKey, strin
         'label' => 'DMOS Department',
     ]];
 
-    \GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+    \saveTestMappings('production', 'Computer', [
         $customKey => [
             'glpi_b_field_key' => $customKey,
             'glpi_b_field_uid' => $customKey,
@@ -1588,33 +1662,17 @@ $glpiBFields = $fieldsFromSearchOptions->invoke(null, ['common' => [
 ], 'notes' => [
     'name' => 'Notes',
     'field' => 'comment',
+    'table' => 'glpi_computers',
     'uid' => 'Computer.comment',
 ]]);
 
-if ($glpiBFields !== [
-    [
-        'key' => 'Computer.name',
-        'id' => '1',
-        'uid' => 'Computer.name',
-        'label' => 'Name',
-    ],
-    [
-        'key' => '2',
-        'id' => '2',
-        'uid' => '',
-        'label' => 'Serial number',
-    ],
-    [
-        'key' => 'Computer.comment',
-        'id' => '',
-        'uid' => 'Computer.comment',
-        'label' => 'Notes',
-    ],
-]) {
-    throw new RuntimeException('GLPI B search options were not normalized correctly.');
+if (array_column($glpiBFields, 'key') !== ['name', 'serial', 'comment']
+    || array_column($glpiBFields, 'supported') !== [true, true, true]
+    || array_column($glpiBFields, 'type') !== ['text', 'text', 'textarea']) {
+    throw new RuntimeException('GLPI B search options must expose stable supported native identities.');
 }
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_b',
@@ -1622,42 +1680,34 @@ if ($glpiBFields !== [
     'serial' => [
         'glpi_b_field_key' => '2',
         'source_of_truth' => 'both',
-    ],
-    'invalid_field' => [
-        'glpi_b_field_key' => 'Computer.comment',
-        'source_of_truth' => 'glpi_a',
-    ],
-    'comment' => [
-        'glpi_b_field_key' => 'Computer.comment',
-        'source_of_truth' => 'invalid_source',
-    ],
-    'otherserial' => [
-        'glpi_b_field_key' => 'missing',
-        'source_of_truth' => 'glpi_a',
     ],
 ], $glpiBFields);
 
 $savedMappings = \GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer');
 
-if ($savedMappings !== [
-    'name' => [
-        'glpi_a_field_key' => 'name',
-        'glpi_b_field_key' => 'Computer.name',
-        'glpi_b_field_id' => '1',
-        'glpi_b_field_uid' => 'Computer.name',
-        'glpi_b_field_label' => 'Name',
-        'source_of_truth' => 'glpi_b',
-    ],
-    'serial' => [
-        'glpi_a_field_key' => 'serial',
-        'glpi_b_field_key' => '2',
-        'glpi_b_field_id' => '2',
-        'glpi_b_field_uid' => '',
-        'glpi_b_field_label' => 'Serial number',
-        'source_of_truth' => 'both',
-    ],
-]) {
-    throw new RuntimeException('Field mappings should save valid GLPI A fields, GLPI B fields, and source selections only.');
+foreach ([
+    ['invalid_field' => ['glpi_b_field_key' => 'Computer.comment', 'source_of_truth' => 'glpi_a']],
+    ['comment' => ['glpi_b_field_key' => 'Computer.comment', 'source_of_truth' => 'invalid_source']],
+    ['otherserial' => ['glpi_b_field_key' => 'missing', 'source_of_truth' => 'glpi_a']],
+] as $invalidMappings) {
+    try {
+        \saveTestMappings('production', 'Computer', $invalidMappings, $glpiBFields);
+        throw new LogicException('Invalid mapping must be rejected.');
+    } catch (RuntimeException) {
+        if (\GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer') !== $savedMappings) {
+            throw new LogicException('Rejected save must preserve every existing mapping.');
+        }
+    }
+}
+
+if (array_column($savedMappings, 'glpi_a_field_key') !== ['name', 'serial']
+    || array_column($savedMappings, 'glpi_b_field_key') !== ['name', 'serial']
+    || array_column($savedMappings, 'source_of_truth') !== ['glpi_b', 'both']) {
+    throw new RuntimeException('Mappings should load as ordered rows with stable endpoint identities.');
+}
+$storedRows = json_decode(Config::$values['plugin:assetsync20']['field_mappings'], true)['production']['Computer'];
+if ($storedRows['version'] !== 2 || isset($storedRows['rows'][0]['glpi_b_field_id'])) {
+    throw new RuntimeException('Explicit saves must use v2 rows without stored search IDs.');
 }
 
 Config::setConfigurationValues('plugin:assetsync20', [
@@ -1674,26 +1724,10 @@ Config::setConfigurationValues('plugin:assetsync20', [
 ]);
 
 $legacyMappings = \GlpiPlugin\Assetsync20\FieldMapping::load('production', 'Computer');
-
-if ($legacyMappings !== [
-    'name' => [
-        'glpi_a_field_key' => 'name',
-        'glpi_b_field_key' => '',
-        'glpi_b_field_id' => '',
-        'glpi_b_field_uid' => '',
-        'glpi_b_field_label' => '',
-        'source_of_truth' => 'glpi_b',
-    ],
-    'serial' => [
-        'glpi_a_field_key' => 'serial',
-        'glpi_b_field_key' => '',
-        'glpi_b_field_id' => '',
-        'glpi_b_field_uid' => '',
-        'glpi_b_field_label' => '',
-        'source_of_truth' => 'both',
-    ],
-]) {
-    throw new RuntimeException('Legacy field mappings should load as normalized records.');
+if (array_column($legacyMappings, 'glpi_a_field_key') !== ['name', 'serial', 'invalid_field', 'comment']
+    || array_column($legacyMappings, 'source_of_truth') !== ['glpi_b', 'both', 'glpi_a', 'invalid_source']
+    || array_column($legacyMappings, 'glpi_b_field_key') !== ['', '', '', '']) {
+    throw new RuntimeException('Invalid legacy rows and empty destinations must remain visible without repair.');
 }
 
 $assetTypes = \GlpiPlugin\Assetsync20\FieldMapping::assetTypes();
@@ -1901,7 +1935,7 @@ if (count($exactParentResult['matches']) !== 2) {
     throw new RuntimeException('Exact entity route matching should work for each GLPI B connection.');
 }
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_a',
@@ -1916,10 +1950,6 @@ if (count($exactParentResult['matches']) !== 2) {
     ],
     'comment' => [
         'glpi_b_field_key' => 'Computer.comment',
-        'source_of_truth' => 'glpi_a',
-    ],
-    'locations_id' => [
-        'glpi_b_field_key' => 'Computer.locations_id',
         'source_of_truth' => 'glpi_a',
     ],
 ], [
@@ -2093,7 +2123,7 @@ $productionLink = $linksByConnection['production'];
 $productionRemoteId = (int) $productionLink['remote_items_id'];
 $remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Remote Laptop';
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_b',
@@ -2236,7 +2266,7 @@ if (($secondForcedAsset['name'] ?? '') !== 'Manual Remote 507') {
     throw new RuntimeException('Manual force backfill should pick up the next inbound asset on a later bounded run.');
 }
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_a',
@@ -2301,7 +2331,7 @@ if ($syncService->queueAssetIfNeeded('Computer', 508, 'production', true)) {
 $remoteClient->records['production:Computer'][$productionRemoteId]['name'] = 'Conflicting Remote Laptop';
 $remoteClient->records['production:Computer'][$productionRemoteId]['date_mod'] = '2026-01-02 00:00:00';
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'both',
@@ -2345,7 +2375,7 @@ if (($latestWinsLink['status'] ?? '') !== \GlpiPlugin\Assetsync20\AssetSyncLink:
     throw new RuntimeException('Both source latest-update-wins should sync the link state.');
 }
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_a',
@@ -2883,7 +2913,7 @@ PluginFieldsContainer::$options = [
         'pfields_fields_id' => 28,
     ],
 ];
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_a',
@@ -3044,7 +3074,7 @@ if (
 $hwBillableKey = 'Computer.PluginFieldsComputerdmosasset.hwbillablefieldtwo';
 $hwSavedConfig = Config::$values['plugin:assetsync20']['field_mappings'];
 $hwMappings = json_decode($hwSavedConfig, true);
-$hwMappings['production']['Computer'][$hwBillableKey] = [
+$hwMappings['production']['Computer']['rows'][] = [
     'glpi_a_field_key' => $hwBillableKey,
     'glpi_b_field_key' => $hwBillableKey,
     'glpi_b_field_id' => '884792',
@@ -3144,7 +3174,7 @@ PluginFieldsContainer::$options = [
         'pfields_fields_id' => 32,
     ],
 ];
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     $swsdBillableKey => [
         'glpi_b_field_key' => $swsdBillableKey,
         'source_of_truth' => 'glpi_b',
@@ -3178,7 +3208,7 @@ if (
     throw new RuntimeException('SW/SD Billing output mappings should keep GLPI B authority when configured.');
 }
 
-\GlpiPlugin\Assetsync20\FieldMapping::save('production', 'Computer', [
+\saveTestMappings('production', 'Computer', [
     'name' => [
         'glpi_b_field_key' => 'Computer.name',
         'source_of_truth' => 'glpi_a',
@@ -3334,7 +3364,12 @@ $swsdSavedConfig = Config::$values['plugin:assetsync20']['field_mappings'];
 $swsdConfig = json_decode($swsdSavedConfig, true);
 foreach (['glpi_b', 'both'] as $authority) {
     foreach ([$swsdBillableKey, $swsdStartKey] as $key) {
-        $swsdConfig['production']['Computer'][$key]['source_of_truth'] = $authority;
+        foreach ($swsdConfig['production']['Computer']['rows'] as &$row) {
+            if ($row['glpi_a_field_key'] === $key) {
+                $row['source_of_truth'] = $authority;
+            }
+        }
+        unset($row);
     }
     Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
     // Writable fixtures exercise ordinary inbound authority; readonly is checked separately below.
@@ -3373,7 +3408,12 @@ if ($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey] !==
     throw new RuntimeException('Both must send newer local SWSD output through normal mapping.');
 }
 foreach ([$swsdBillableKey, $swsdStartKey] as $key) {
-    $swsdConfig['production']['Computer'][$key]['source_of_truth'] = 'glpi_b';
+    foreach ($swsdConfig['production']['Computer']['rows'] as &$row) {
+        if ($row['glpi_a_field_key'] === $key) {
+            $row['source_of_truth'] = 'glpi_b';
+        }
+    }
+    unset($row);
 }
 Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
 PluginFieldsField::$definitions[31]['is_readonly'] = 1;
@@ -3388,7 +3428,10 @@ if ($link['status'] !== 'synced' || PluginFieldsComputerdmosasset::$rows[612]['s
 PluginFieldsField::$definitions[31]['is_readonly'] = 0;
 PluginFieldsField::$definitions[32]['is_readonly'] = 0;
 // Unmapped outputs stay local, including a start date that does not exist on B.
-unset($swsdConfig['production']['Computer'][$swsdBillableKey], $swsdConfig['production']['Computer'][$swsdStartKey]);
+$swsdConfig['production']['Computer']['rows'] = array_values(array_filter(
+    $swsdConfig['production']['Computer']['rows'],
+    static fn (array $row): bool => !in_array($row['glpi_a_field_key'], [$swsdBillableKey, $swsdStartKey], true)
+));
 Config::$values['plugin:assetsync20']['field_mappings'] = json_encode($swsdConfig);
 unset($remoteClient->customRecords['production:Computer'][2612][$swsdStartKey]);
 $remoteClient->unavailableCustomKeys = [$swsdStartKey];
