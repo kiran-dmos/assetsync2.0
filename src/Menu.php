@@ -32,6 +32,7 @@ final class Menu
                 'config'        => $page,
                 'billingfields' => self::billingFieldsUrl(),
                 'fieldmapping'  => self::fieldMappingUrl(),
+                'syncactivity'  => self::syncActivityUrl(),
             ],
         ];
     }
@@ -73,6 +74,19 @@ final class Menu
         }
 
         return '/plugins/' . Plugin::KEY . '/front/billingfields.php';
+    }
+
+    public static function syncActivityUrl(): string
+    {
+        if (class_exists('Plugin') && method_exists('Plugin', 'getWebDir')) {
+            try {
+                return \Plugin::getWebDir(Plugin::KEY) . '/front/syncactivity.php';
+            } catch (\Throwable) {
+                // GLPI may not have fully initialized web paths in CLI smoke tests.
+            }
+        }
+
+        return '/plugins/' . Plugin::KEY . '/front/syncactivity.php';
     }
 
     public static function entitySyncRoutesUrl(): string

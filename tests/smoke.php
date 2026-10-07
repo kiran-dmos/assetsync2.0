@@ -1426,6 +1426,10 @@ if (($menu['links']['fieldmapping'] ?? null) !== '/plugins/assetsync20/front/fie
     throw new RuntimeException('Field Mapping menu link is incorrect.');
 }
 
+if (($menu['links']['syncactivity'] ?? null) !== '/plugins/assetsync20/front/syncactivity.php') {
+    throw new RuntimeException('Sync Activity menu link is incorrect.');
+}
+
 if (array_key_exists('entitysyncroutes', $menu['links'] ?? [])) {
     throw new RuntimeException('Entity Sync Routes should not be exposed as a top-level menu link.');
 }
@@ -1445,6 +1449,7 @@ foreach ([
     'Open entity routes',
     'Open field mapping',
     'Open automatic actions',
+    'Open Sync Activity',
     'AssetSyncCron::TASK_NAME',
 ] as $dashboardText) {
     if (!str_contains($dashboard, $dashboardText)) {

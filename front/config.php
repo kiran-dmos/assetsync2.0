@@ -150,6 +150,8 @@ echo '<td class="center"><a class="submit" href="' . $html($glpiFrontUrl('cronta
 echo '</tr>';
 echo '</table>';
 
+echo '<p class="assetsync-actions"><a class="submit" href="' . $html(Menu::syncActivityUrl()) . '">Open Sync Activity</a></p>';
+
 echo '<table class="tab_cadre_fixe">';
 echo '<tr><th colspan="2">Quick setup checklist</th></tr>';
 echo '<tr><td>1. Add a GLPI B connection.</td><td>Use the connection form below.</td></tr>';
