@@ -77,7 +77,8 @@ final class AssetSyncService
             $lockResult = null;
             if ($db !== null && method_exists($db, 'doQuery') && method_exists($db, 'fetchAssoc')) {
                 try {
-                    $result = $db->doQuery("SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired");
+                    $runLockName = $db->quote('assetsync20:run:' . AssetSyncLockName::databaseHash($db));
+                    $result = $db->doQuery('SELECT GET_LOCK(' . $runLockName . ', 0) AS acquired');
                     $lockResult = $result === false ? null : $db->fetchAssoc($result);
                 } catch (\Throwable) {
                 }
@@ -143,7 +144,7 @@ final class AssetSyncService
             FieldsText::endRunCache();
             if ($locked) {
                 try {
-                    $db->doQuery("SELECT RELEASE_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE()))) AS released");
+                    $db->doQuery('SELECT RELEASE_LOCK(' . $runLockName . ') AS released');
                 } catch (\Throwable) {
                     // Lock cleanup must not hide a processing exception or change its result.
                 }

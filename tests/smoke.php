@@ -167,6 +167,7 @@ final class FakeDB
     private array $nextIds = [];
     private int $affectedRows = 0;
     public string $timezone = '';
+    public string $databaseName = 'glpi';
     public array $requests = [];
     public ?Closure $afterRequest = null;
     public ?Closure $afterFirstRow = null;
@@ -211,20 +212,26 @@ final class FakeDB
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return [['session_timezone' => $this->guessTimezone()]];
         }
-        if (str_starts_with($sql, "SELECT GET_LOCK(CONCAT('as20:'")) {
+        if ($sql === 'SELECT DATABASE() AS database_name') {
+            return [['database_name' => $this->databaseName]];
+        }
+        if (preg_match('/\bMD5\s*\(/i', $sql)) {
+            throw new RuntimeException('FUNCTION glpi.MD5 does not exist');
+        }
+        if (str_starts_with($sql, "SELECT GET_LOCK('as20:")) {
             return [['acquired' => 1]];
         }
-        if (str_starts_with($sql, "SELECT RELEASE_LOCK(CONCAT('as20:'")) {
+        if (str_starts_with($sql, "SELECT RELEASE_LOCK('as20:")) {
             return [['released' => 1]];
         }
-        if ($sql === "SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired") {
+        if (preg_match("/^SELECT GET_LOCK\('assetsync20:run:[a-f0-9]{32}', 0\) AS acquired$/", $sql)) {
             $acquired = $this->runLockHeld ? 0 : $this->runLockResult;
             if ($acquired === 1) {
                 $this->runLockHeld = true;
             }
             return [['acquired' => $acquired]];
         }
-        if ($sql === "SELECT RELEASE_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE()))) AS released") {
+        if (preg_match("/^SELECT RELEASE_LOCK\('assetsync20:run:[a-f0-9]{32}'\) AS released$/", $sql)) {
             $released = $this->runLockHeld ? 1 : null;
             $this->runLockHeld = false;
             return [['released' => $released]];

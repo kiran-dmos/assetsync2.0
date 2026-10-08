@@ -148,7 +148,8 @@ final class AssetUuidService
             return $metrics;
         }
         $db = $GLOBALS['DB'];
-        $result = $db->doQuery("SELECT GET_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE())), 0) AS acquired");
+        $runLockName = $db->quote('assetsync20:run:' . AssetSyncLockName::databaseHash($db));
+        $result = $db->doQuery('SELECT GET_LOCK(' . $runLockName . ', 0) AS acquired');
         $lock = $result === false ? null : $db->fetchAssoc($result);
         if (!in_array($lock['acquired'] ?? null, [1, '1'], true)) {
             return $metrics + ['busy' => true];
@@ -176,7 +177,7 @@ final class AssetUuidService
             });
             return $metrics;
         } finally {
-            $db->doQuery("SELECT RELEASE_LOCK(CONCAT('assetsync20:run:', MD5(DATABASE()))) AS released");
+            $db->doQuery('SELECT RELEASE_LOCK(' . $runLockName . ') AS released');
         }
     }
 

@@ -201,7 +201,7 @@ final class AssetUuidOperation
             return $work();
         }
         $db = $GLOBALS['DB'];
-        $name = "CONCAT('as20:', LEFT(MD5(DATABASE()), 8), ':', " . $db->quote(substr($key, 0, 40)) . ')';
+        $name = $db->quote('as20:' . substr(AssetSyncLockName::databaseHash($db), 0, 8) . ':' . substr($key, 0, 40));
         $result = $db->doQuery('SELECT GET_LOCK(' . $name . ', 0) AS acquired');
         $row = $result === false ? null : $db->fetchAssoc($result);
         if (!in_array($row['acquired'] ?? null, [1, '1'], true)) {
