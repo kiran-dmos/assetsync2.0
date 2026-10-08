@@ -83,6 +83,9 @@ final class AssetUuidOperation
         }
         $db = $GLOBALS['DB'];
         $saved = \Config::getConfigurationValues(self::CONTEXT, [self::CURSOR, self::WATERMARK]);
+        if (hrtime(true) >= $deadlineNs) {
+            return 0;
+        }
         $cursor = max(0, (int) ($saved[self::CURSOR] ?? 0));
         $upper = max(0, (int) ($saved[self::WATERMARK] ?? 0));
         if ($upper <= $cursor) {
@@ -92,6 +95,9 @@ final class AssetUuidOperation
             }
         }
         $count = 0;
+        if (hrtime(true) >= $deadlineNs) {
+            return 0;
+        }
         foreach ($db->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
             ['id' => ['>', $cursor]], ['id' => ['<=', $upper]],
         ], 'ORDER' => ['id ASC'], 'LIMIT' => 50]) as $link) {
@@ -119,6 +125,22 @@ final class AssetUuidOperation
         return $count;
     }
 
+    private static function dueCondition(): \Glpi\DBAL\QueryExpression
+    {
+        return new \Glpi\DBAL\QueryExpression('(`next_attempt` IS NULL OR UNIX_TIMESTAMP(`next_attempt`) <= UNIX_TIMESTAMP()) AND (`lease_until` IS NULL OR UNIX_TIMESTAMP(`lease_until`) <= UNIX_TIMESTAMP())');
+    }
+
+    public static function hasDue(): bool
+    {
+        if (!self::available()) {
+            return false;
+        }
+        foreach ($GLOBALS['DB']->request(['SELECT' => ['id'], 'FROM' => self::TABLE, 'WHERE' => [self::dueCondition()], 'LIMIT' => 1]) as $row) {
+            return true;
+        }
+        return false;
+    }
+
     /** One SQL-fenced claim per phase. Expired workers cannot persist or start another write. */
     public static function claim(): ?array
     {
@@ -126,7 +148,7 @@ final class AssetUuidOperation
             return null;
         }
         $db = $GLOBALS['DB'];
-        $due = new \Glpi\DBAL\QueryExpression('(`next_attempt` IS NULL OR UNIX_TIMESTAMP(`next_attempt`) <= UNIX_TIMESTAMP()) AND (`lease_until` IS NULL OR UNIX_TIMESTAMP(`lease_until`) <= UNIX_TIMESTAMP())');
+        $due = self::dueCondition();
         foreach ($db->request(['FROM' => self::TABLE, 'WHERE' => [$due], 'ORDER' => ['next_attempt ASC', 'id ASC'], 'LIMIT' => 1]) as $row) {
             $token = bin2hex(random_bytes(16));
             $fields = ['status' => 'running', 'claim_token' => $token,

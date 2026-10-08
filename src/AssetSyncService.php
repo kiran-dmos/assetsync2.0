@@ -10,6 +10,7 @@ final class AssetSyncService
     private const SCAN_CURSORS_KEY = 'asset_sync_scan_cursors';
     private const SCAN_LAST_VISITED_KEY = 'asset_sync_scan_last_visited';
     private const QUEUE_LAST_VISITED_KEY = 'asset_sync_queue_last_visited';
+    private const NEXT_PRIORITY_KEY = 'asset_sync_next_priority';
     private const MAX_SCAN_CANDIDATES = 50;
     private const MAX_SCAN_VISITS = 10;
     private const MAX_VISIT_CANDIDATES = 5;
@@ -26,6 +27,7 @@ final class AssetSyncService
     private ?int $runDeadlineNs = null;
     private ?int $phaseDeadlineNs = null;
     private ?array $pausedConnections = null;
+    private ?int $scanBudgetNs = null;
 
     /**
      * @param object|string|null $remoteClient
@@ -41,7 +43,7 @@ final class AssetSyncService
     public static function uninstall(): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY, self::QUEUE_LAST_VISITED_KEY]);
+            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY, self::QUEUE_LAST_VISITED_KEY, self::NEXT_PRIORITY_KEY]);
         }
     }
 
@@ -94,27 +96,71 @@ final class AssetSyncService
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
-            $uuidDeadlineNs = $this->runDeadlineNs;
-            $uuidAvailable = AssetUuidOperation::available();
-            if ($uuidAvailable) {
-                // Ordinary work gets the first job; reserve at most eight seconds for one UUID operation.
-                $this->runDeadlineNs -= min(8_000_000_000, max(0, $this->runDeadlineNs - hrtime(true) - 3_000_000_000));
+            $uuidAvailable = false;
+            $uuidDue = false;
+            $uuidOutcome = 'upgrade_required';
+            $this->scanBudgetNs = self::SCAN_SECONDS * 1_000_000_000;
+            $seeded = 0;
+            $bootstrapNs = 0;
+            try {
+                $uuidAvailable = AssetUuidOperation::available();
+                if ($uuidAvailable) {
+                    $uuidOutcome = 'no_participants';
+                    // Bound discovery separately so recursive ordinary scans retain their full allowance.
+                    $bootstrapStarted = hrtime(true);
+                    try {
+                        $seeded = AssetUuidOperation::bootstrap(min($bootstrapStarted + 1_000_000_000,
+                            $this->runDeadlineNs - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS));
+                    } finally {
+                        $bootstrapNs = hrtime(true) - $bootstrapStarted;
+                    }
+                    $uuidDue = AssetUuidOperation::hasDue();
+                }
+            } catch (\Throwable) {
+                // UUID-only storage failures must not prevent valid ordinary mappings.
+                $uuidAvailable = false;
+                $uuidOutcome = 'unknown';
             }
-            // Reserve up to two seconds for scanning when the run has time to spare.
+            $this->runMetrics['uuid'] = ['outcome' => $uuidOutcome,
+                'attempted' => 0, 'seeded' => $seeded, 'bootstrap_ms' => round($bootstrapNs / 1_000_000, 3)];
+            $bothDue = $uuidDue && AssetSyncQueue::dueConnectionIds() !== [];
+            $priority = $bothDue ? (\Config::getConfigurationValues(self::SCAN_CONTEXT, [self::NEXT_PRIORITY_KEY])[self::NEXT_PRIORITY_KEY] ?? 'ordinary') : 'ordinary';
+            $uuidFirst = $uuidDue && (!$bothDue || $priority === 'uuid');
+            // The first class gets one attempt and preserves the remaining local scan allowance.
             $remainingNs = max(0, $this->runDeadlineNs - hrtime(true));
-            $this->phaseDeadlineNs = $this->runDeadlineNs - min(self::SCAN_SECONDS * 1_000_000_000, max(0, $remainingNs - 1_000_000_000));
-            $processed = $this->processQueue(1, $deadline);
+            $this->phaseDeadlineNs = $this->runDeadlineNs - min($this->scanBudgetNs, max(0, $remainingNs - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS));
+            $processed = 0;
+            if (hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS + 1_000_000 <= $this->phaseDeadlineNs) {
+                if ($bothDue) {
+                    \Config::setConfigurationValues(self::SCAN_CONTEXT, [self::NEXT_PRIORITY_KEY => $uuidFirst ? 'ordinary' : 'uuid']);
+                }
+                if ($uuidFirst) {
+                    $this->runUuid($this->phaseDeadlineNs, $seeded);
+                } else {
+                    $processed = $this->processQueue(1, $deadline);
+                }
+            }
             $this->phaseDeadlineNs = $this->runDeadlineNs;
             $enqueued = 0;
-            if (hrtime(true) < $this->runDeadlineNs) {
+            if ($this->scanBudgetNs > 0 && hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS < $this->runDeadlineNs) {
                 $scanStarted = hrtime(true);
                 try {
+                    $this->scanBudgetNs = min($this->scanBudgetNs, $this->runDeadlineNs - $scanStarted - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS);
                     $enqueued = $this->enqueueBackfill($batchSize, $deadline, $forceInboundRecheck);
                 } catch (\Throwable $error) {
                     $this->runMetrics['scan_stop_reason'] = 'error';
                     throw $error;
                 } finally {
-                    $this->runMetrics['scan_ms'] = (hrtime(true) - $scanStarted) / 1_000_000;
+                    $this->runMetrics['scan_ms'] += (hrtime(true) - $scanStarted) / 1_000_000;
+                }
+            }
+            if (!$uuidFirst && $uuidAvailable) {
+                try {
+                    if (AssetUuidOperation::hasDue()) {
+                        $this->runUuid($this->runDeadlineNs, $seeded);
+                    }
+                } catch (\Throwable) {
+                    $this->runMetrics['uuid']['outcome'] = 'unknown';
                 }
             }
             if ($processed < $batchSize && hrtime(true) < $this->runDeadlineNs) {
@@ -123,20 +169,12 @@ final class AssetSyncService
 
             $this->runMetrics['stop_reason'] = hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS + 1_000_000 > $this->runDeadlineNs
                 ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : ($this->pausedConnections !== [] ? 'connections_paused' : 'no_due_jobs'));
-            $this->runDeadlineNs = $uuidDeadlineNs;
-            $this->phaseDeadlineNs = $uuidDeadlineNs;
-            try {
-                $this->runMetrics['uuid'] = $uuidAvailable
-                    ? (new AssetUuidService($this->remoteClient))->run($uuidDeadlineNs, $this->pausedConnections ?? [])
-                    : ['outcome' => 'upgrade_required', 'attempted' => 0];
-            } catch (\Throwable) {
-                $this->runMetrics['uuid'] = ['outcome' => 'unknown'];
-            }
             return $enqueued + $processed;
         } finally {
             $this->runDeadlineNs = null;
             $this->phaseDeadlineNs = null;
             $this->pausedConnections = null;
+            $this->scanBudgetNs = null;
             GlpiBConnection::endRunCache();
             EntitySyncRoute::endRunCache();
             FieldMapping::endRunCache();
@@ -169,6 +207,25 @@ final class AssetSyncService
         }
     }
 
+    private function runUuid(int $deadlineNs, int $seeded): void
+    {
+        $bootstrapMs = $this->runMetrics['uuid']['bootstrap_ms'];
+        $uuidService = new AssetUuidService($this->remoteClient);
+        try {
+            $this->runMetrics['uuid'] = $uuidService->run($deadlineNs, $this->pausedConnections ?? [], false);
+        } catch (\Throwable) {
+            $this->runMetrics['uuid'] = ['outcome' => 'unknown'];
+        }
+        $this->runMetrics['uuid']['seeded'] = $seeded;
+        $this->runMetrics['uuid']['bootstrap_ms'] = $bootstrapMs;
+        if ($uuidService->remoteFailures() !== []) {
+            $this->runMetrics['uuid']['remote_failures'] = $uuidService->remoteFailures();
+        }
+        foreach ($uuidService->remoteFailures() as $failure) {
+            $this->pauseConnection($failure['connection_id'], $failure);
+        }
+    }
+
     public function enqueueBackfill(int $limit = 10, ?int $deadline = null, bool $forceInboundRecheck = false): int
     {
         $previousDeadline = $this->runDeadlineNs;
@@ -194,7 +251,7 @@ final class AssetSyncService
         }
 
         $limit = max(1, $limit);
-        $scanDeadline = ($this->scanClock)() + min(self::SCAN_SECONDS, max(0, $this->runDeadlineNs - hrtime(true)) / 1_000_000_000);
+        $scanDeadline = ($this->scanClock)() + min($this->scanBudgetNs ?? self::SCAN_SECONDS * 1_000_000_000, max(0, $this->runDeadlineNs - hrtime(true))) / 1_000_000_000;
         $connections = $this->activeConnectionsById();
         $cursors = $this->loadScanCursors();
         $pairs = [];
@@ -467,7 +524,18 @@ final class AssetSyncService
      */
     public function processJob(array $job): void
     {
-        AssetUuidOperation::withAssetLock((string) ($job['itemtype'] ?? ''), (int) ($job['items_id'] ?? 0), fn () => $this->processLockedJob($job));
+        GlpiBConnection::beginOrdinaryAttempt($this->phaseDeadlineNs ?? $this->runDeadlineNs);
+        try {
+            AssetUuidOperation::withAssetLock((string) ($job['itemtype'] ?? ''), (int) ($job['items_id'] ?? 0), fn () => $this->processLockedJob($job));
+        } finally {
+            $cleanup = GlpiBConnection::endOrdinaryAttempt();
+            if (isset($cleanup['cleanup_failure'])) {
+                $this->pauseConnection((string) ($job['glpi_b_connection_id'] ?? ''), $cleanup['cleanup_failure']);
+                if ($this->runMetrics !== null) {
+                    $this->runMetrics['session_cleanup_failures'][] = $cleanup['cleanup_failure'];
+                }
+            }
+        }
     }
 
     private function processLockedJob(array $job): void

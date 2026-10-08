@@ -451,16 +451,16 @@ namespace {
             1 => ['field' => 'name', 'table' => 'glpi_computers', 'datatype' => 'itemlink', 'uid' => 'Computer.name'],
         ]);
         if ($status === null) {
-            catalogStart([$init, $nativeOptions, $kill, $init, catalogStep('Computer/12', ['id' => 12, 'name' => 'Local Both value',
+            catalogStart([$init, $nativeOptions, catalogStep('Computer/12', ['id' => 12, 'name' => 'Local Both value',
                 'serial' => 'BOTH-TIMEZONE', 'entities_id' => 100, 'date_mod' => '2026-10-01 00:00:00']), $kill]);
             catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'done',
                 'A one-way job must complete using item data alone, even when getFullSession would return403; any unexpected timezone GET fails this strict transport.');
-            catalogFinish(6);
+            catalogFinish(4);
         } else {
-            catalogStart([$init, $nativeOptions, $kill, $init, catalogStep('getFullSession', [], $status), $kill]);
+            catalogStart([$init, $nativeOptions, catalogStep('getFullSession', [], $status), $kill]);
             catalogCheck($service->processQueue(1) === 1 && $GLOBALS['DB']->tables[AssetSyncQueue::TABLE][0]['status'] === 'retry'
                 && !in_array('PUT', CatalogCurl::$methods, true), 'A Both timezone 429/503 must retry without mutation and still kill the session.');
-            catalogFinish(6, 1);
+            catalogFinish(4, 1);
         }
     }
 

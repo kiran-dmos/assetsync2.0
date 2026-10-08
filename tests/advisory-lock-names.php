@@ -88,8 +88,13 @@ $db->queryResult = static function (string $sql) use (&$depth, &$maximumDepth) {
     return null;
 };
 lockNameCheck((new AssetSyncService())->run(1) === 0, 'Ordinary run completes without SQL MD5 support.');
+lockNameCheck($maximumDepth === 1 && $depth === 0, 'No due UUID work needs only the outer run lock, with balanced cleanup.');
+$db->insert(AssetUuidOperation::TABLE, ['itemtype' => 'Computer', 'items_id' => 123, 'status' => 'pending',
+    'attempts' => 0, 'next_attempt' => null, 'lease_until' => null, 'claim_token' => null, 'state_json' => null]);
+lockNameCheck((new AssetSyncService())->run(1) === 0, 'Due UUID work can run under the ordinary scheduler without changing its return volume.');
 lockNameCheck($maximumDepth === 2 && $depth === 0, 'Ordinary and nested UUID phases acquire the same reentrant global lock and balance releases.');
-lockNameCheck(count(array_unique(lockNameQueries($db, 'GET_LOCK'))) === 1, 'Both run entrypoints use exactly the same global lock literal.');
+$runQueries = array_filter(lockNameQueries($db, 'GET_LOCK'), static fn (string $sql): bool => str_contains($sql, 'assetsync20:run:'));
+lockNameCheck(count(array_unique($runQueries)) === 1, 'Both run entrypoints use exactly the same global lock literal.');
 foreach ($db->sqlQueries as $sql) {
     lockNameCheck(!preg_match('/\bMD5\s*\(/i', $sql), 'No server-side hash is sent during ordinary/UUID work.');
 }

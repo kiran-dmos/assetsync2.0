@@ -7,6 +7,8 @@ namespace GlpiPlugin\Assetsync20;
 /** Reconcile native UUIDs on existing links only. Ordinary mappings never enter this path. */
 final class AssetUuidService
 {
+    private array $remoteFailures = [];
+
     public const OUTCOMES = [
         'upgrade_required' => 'Plugin update required to install UUID operation storage',
         'pending' => 'Waiting for UUID reconciliation', 'running' => 'UUID reconciliation running',
@@ -135,9 +137,16 @@ final class AssetUuidService
         return ['outcome' => 'generate'];
     }
 
-    /** At most one asset, 50 bootstrap links and 16 participants per cron phase. */
-    public function run(int $deadlineNs, array $paused = []): array
+    /** Failure facts remain available even if persisting the UUID outcome throws. */
+    public function remoteFailures(): array
     {
+        return $this->remoteFailures;
+    }
+
+    /** At most one asset, 50 bootstrap links and 16 participants per cron phase. */
+    public function run(int $deadlineNs, array $paused = [], bool $bootstrap = true): array
+    {
+        $this->remoteFailures = [];
         $metrics = ['attempted' => 0, 'seeded' => 0, 'outcome' => 'no_participants'];
         if (!AssetUuidOperation::available()) {
             $metrics['outcome'] = 'upgrade_required';
@@ -155,7 +164,9 @@ final class AssetUuidService
             return $metrics + ['busy' => true];
         }
         try {
-            $metrics['seeded'] = AssetUuidOperation::bootstrap($deadlineNs);
+            if ($bootstrap) {
+                $metrics['seeded'] = AssetUuidOperation::bootstrap($deadlineNs);
+            }
             $claim = AssetUuidOperation::claim();
             if ($claim === null) {
                 return $metrics;
@@ -175,6 +186,9 @@ final class AssetUuidService
                 $metrics['outcome'] = $outcome;
                 AssetUuidOperation::finish($claim, $state, $outcome);
             });
+            if ($this->remoteFailures !== []) {
+                $metrics['remote_failures'] = $this->remoteFailures;
+            }
             return $metrics;
         } finally {
             $db->doQuery('SELECT RELEASE_LOCK(' . $runLockName . ') AS released');
@@ -373,16 +387,27 @@ final class AssetUuidService
         try {
             $args = [$participant['connection'], $type, $participant['id'], $participant['entity'], $writing, $old, $new, $withHistory];
             $result = is_string($this->remote) ? $this->remote::uuidSnapshot(...$args) : $this->remote->uuidSnapshot(...$args);
-            if (empty($result['success']) || isset($result['cleanup_failure'])) {
-                return ['success' => false, 'outcome' => isset(self::OUTCOMES[$result['outcome'] ?? '']) ? $result['outcome'] : 'unknown'];
-            }
-            return $result;
+        } catch (RemoteRequestFailure $failure) {
+            $result = $failure->result;
         } catch (\Throwable) {
-            return ['success' => false, 'outcome' => 'unknown'];
+            $result = ['success' => false, 'outcome' => 'unknown'];
         } finally {
             GlpiBConnection::setHttpDeadline($previousDeadline);
             GlpiBConnection::setHttpMetricsConnection($previousConnection);
         }
+        $failures = empty($result['success']) ? [$result] : [];
+        if (isset($result['cleanup_failure'])) {
+            $failures[] = $result['cleanup_failure'];
+        }
+        foreach ($failures as $failure) {
+            $this->remoteFailures[] = ['connection_id' => $participant['connection']['id'],
+                'status_code' => (int) ($failure['status_code'] ?? 0), 'cause' => (string) ($failure['cause'] ?? ''),
+                'executed' => !empty($failure['executed'])];
+        }
+        if ($failures !== []) {
+            return ['success' => false, 'outcome' => isset(self::OUTCOMES[$result['outcome'] ?? '']) ? $result['outcome'] : 'unknown'];
+        }
+        return $result;
     }
 
     private function localSnapshot(string $type, int $id, bool $writing = false, bool $withHistory = true): array

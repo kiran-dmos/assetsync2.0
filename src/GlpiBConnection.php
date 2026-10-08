@@ -15,6 +15,41 @@ final class GlpiBConnection
     private static ?string $httpMetricsConnection = null;
     private static ?array $runCache = null;
     private static ?int $httpDeadlineNs = null;
+    private static ?array $ordinaryAttempt = null;
+
+    public static function beginOrdinaryAttempt(?int $deadlineNs): void
+    {
+        if (self::$ordinaryAttempt !== null) {
+            throw new \LogicException('An ordinary sync attempt is already active.');
+        }
+        self::$ordinaryAttempt = ['deadline' => $deadlineNs, 'connection' => null, 'token' => '',
+            'search_options' => [], 'field_definitions' => [], 'catalogs' => []];
+    }
+
+    public static function endOrdinaryAttempt(): array
+    {
+        $attempt = self::$ordinaryAttempt;
+        self::$ordinaryAttempt = null;
+        if ($attempt === null || $attempt['token'] === '') {
+            return [];
+        }
+        $connection = $attempt['connection'];
+        $previousDeadline = self::setHttpDeadline($attempt['deadline']);
+        $previousConnection = self::setHttpMetricsConnection((string) ($connection['id'] ?? ''));
+        try {
+            $cleanup = self::request('GET', self::apiUrl($connection['base_url'], 'killSession'), [
+                'App-Token: ' . $connection['app_token'], 'Session-Token: ' . $attempt['token'],
+            ], null, true);
+        } catch (RemoteRequestFailure $failure) {
+            $cleanup = $failure->result;
+        } catch (\Throwable) {
+            $cleanup = ['success' => false, 'status_code' => 0, 'cause' => 'cleanup', 'executed' => false];
+        } finally {
+            self::setHttpDeadline($previousDeadline);
+            self::setHttpMetricsConnection($previousConnection);
+        }
+        return $cleanup['success'] ? [] : ['cleanup_failure' => array_intersect_key($cleanup, array_flip(['status_code', 'cause', 'executed']))];
+    }
 
     public static function setHttpDeadline(?int $deadlineNs): ?int
     {
@@ -293,14 +328,9 @@ final class GlpiBConnection
         }
 
         return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $serial): array {
-            $optionsResponse = self::request(
-                'GET',
-                self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)),
-                [
-                    'App-Token: ' . $connection['app_token'],
-                    'Session-Token: ' . $sessionToken,
-                ]
-            );
+            $optionsResponse = self::searchOptions($connection, [
+                'App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken,
+            ], $itemtype, false);
 
             if (!$optionsResponse['success']) {
                 return self::searchFailure($optionsResponse['message'], $optionsResponse['transient'], $optionsResponse);
@@ -633,7 +663,7 @@ final class GlpiBConnection
         }
         return self::withSession($connection, static function (string $token) use ($connection, $itemtype, $keys, $entityId): array {
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $token];
-            $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+            $options = self::searchOptions($connection, $headers, $itemtype, true);
             if (!$options['success']) {
                 return $options;
             }
@@ -648,7 +678,7 @@ final class GlpiBConnection
                     continue;
                 }
                 $rows = [];
-                foreach (self::remoteCollectionRows($connection, $headers, $relation) as $row) {
+                foreach (self::mappingCatalog($connection, $headers, $relation) as $row) {
                     if (isset($row['entities_id']) && count($path) === 1) {
                         $path = self::remoteEntityPath($connection, $headers, $entityId);
                     }
@@ -721,7 +751,7 @@ final class GlpiBConnection
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
             $options = ['body' => []];
             if (array_diff($keys, array_keys($preparedMetadata)) !== []) {
-                $options = self::request('GET', self::apiUrlWithQuery($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype), ['raw' => 1]), $headers);
+                $options = self::searchOptions($connection, $headers, $itemtype, true);
                 if (!$options['success']) {
                     return $options;
                 }
@@ -750,14 +780,20 @@ final class GlpiBConnection
                         throw new \RuntimeException('The mapped remote Fields-plugin field is missing its field id metadata: ' . $key);
                     }
                     if (!isset($definitions[$fieldId])) {
-                        $definition = self::request('GET', self::apiUrl($connection['base_url'], 'PluginFieldsField/' . $fieldId), $headers);
-                        if (!$definition['success']) {
-                            $definition['message'] = 'Cannot read GLPI B Fields field configuration (PluginFieldsField). ' . $definition['message'];
-                            return $definition;
+                        $definitions[$fieldId] = self::$ordinaryAttempt['field_definitions'][$fieldId] ?? null;
+                        if ($definitions[$fieldId] === null) {
+                            $definition = self::request('GET', self::apiUrl($connection['base_url'], 'PluginFieldsField/' . $fieldId), $headers);
+                            if (!$definition['success']) {
+                                $definition['message'] = 'Cannot read GLPI B Fields field configuration (PluginFieldsField). ' . $definition['message'];
+                                return $definition;
+                            }
+                            $definitions[$fieldId] = $definition['body'];
                         }
-                        $definitions[$fieldId] = $definition['body'];
                     }
                     $metadata = FieldsText::remoteMetadataFromOption($itemtype, $option, $optionId, $definitions[$fieldId]);
+                    if (self::$ordinaryAttempt !== null) {
+                        self::$ordinaryAttempt['field_definitions'][$fieldId] = $definitions[$fieldId];
+                    }
                     break;
                 }
                 if ($metadata === null) {
@@ -958,7 +994,35 @@ final class GlpiBConnection
             throw new \RuntimeException('The remote Fields-plugin dropdown class is unavailable: ' . ($metadata['key'] ?? 'unknown'));
         }
 
-        return self::remoteCollectionRows($connection, $headers, rawurlencode($class));
+        return self::mappingCatalog($connection, $headers, rawurlencode($class));
+    }
+
+    private static function searchOptions(array $connection, array $headers, string $itemtype, bool $raw): array
+    {
+        $key = $itemtype . ':' . (int) $raw;
+        if (isset(self::$ordinaryAttempt['search_options'][$key])) {
+            return self::$ordinaryAttempt['search_options'][$key];
+        }
+        $endpoint = 'listSearchOptions/' . rawurlencode($itemtype);
+        $url = $raw ? self::apiUrlWithQuery($connection['base_url'], $endpoint, ['raw' => 1]) : self::apiUrl($connection['base_url'], $endpoint);
+        $result = self::request('GET', $url, $headers);
+        if (self::$ordinaryAttempt !== null && $result['success'] && !empty($result['json_valid'])) {
+            self::$ordinaryAttempt['search_options'][$key] = $result;
+        }
+        return $result;
+    }
+
+    // Only mapping dropdown catalogs are reusable; permission catalogs always read afresh.
+    private static function mappingCatalog(array $connection, array $headers, string $endpoint): array
+    {
+        if (isset(self::$ordinaryAttempt['catalogs'][$endpoint])) {
+            return self::$ordinaryAttempt['catalogs'][$endpoint];
+        }
+        $rows = self::remoteCollectionRows($connection, $headers, $endpoint);
+        if (self::$ordinaryAttempt !== null) {
+            self::$ordinaryAttempt['catalogs'][$endpoint] = $rows;
+        }
+        return $rows;
     }
 
     /** Return a catalog only after proving every page complete; never expose a partial list. */
@@ -1509,22 +1573,38 @@ final class GlpiBConnection
             ];
         }
 
-        $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
-            'App-Token: ' . $connection['app_token'],
-            'Authorization: user_token ' . $connection['user_token'],
-        ]);
-
-        if (!$session['success']) {
-            return $session;
+        $scoped = self::$ordinaryAttempt !== null;
+        $identity = ['id' => (string) ($connection['id'] ?? ''), 'base_url' => $connection['base_url'],
+            'app_token' => $connection['app_token'], 'user_token' => $connection['user_token']];
+        if ($scoped && self::$ordinaryAttempt['connection'] !== null && self::$ordinaryAttempt['connection'] !== $identity) {
+            throw new \RuntimeException('The GLPI B connection changed during the sync attempt.');
         }
-
-        $sessionToken = (string) ($session['body']['session_token'] ?? '');
+        $sessionToken = $scoped ? self::$ordinaryAttempt['token'] : '';
         if ($sessionToken === '') {
-            return [
-                'success'   => false,
-                'message'   => 'GLPI B did not return a session token.',
-                'transient' => false,
-            ];
+            $session = self::request('GET', self::apiUrl($connection['base_url'], 'initSession'), [
+                'App-Token: ' . $connection['app_token'],
+                'Authorization: user_token ' . $connection['user_token'],
+            ]);
+            if (!$session['success']) {
+                return $session;
+            }
+            $sessionToken = (string) ($session['body']['session_token'] ?? '');
+            if ($sessionToken === '') {
+                return [
+                    'success'   => false,
+                    'message'   => 'GLPI B did not return a session token.',
+                    'transient' => false,
+                ];
+            }
+            if ($scoped) {
+                self::$ordinaryAttempt['connection'] = $identity;
+                self::$ordinaryAttempt['token'] = $sessionToken;
+            }
+        }
+        if ($scoped) {
+            return $needsDateModTimezone
+                ? $callback($sessionToken, self::remoteDateModTimezone($connection, $sessionToken))
+                : $callback($sessionToken);
         }
 
         try {
