@@ -11,7 +11,7 @@ use GlpiPlugin\Assetsync20\FieldMapping;
  * GLPI bootstrap for the assetsync2.0 plugin.
  */
 
-define('PLUGIN_ASSETSYNC20_VERSION', '0.1.9');
+define('PLUGIN_ASSETSYNC20_VERSION', '0.1.10');
 define('PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION', '11.0.0');
 define('PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION', '12.0.0');
 define('PLUGIN_ASSETSYNC20_MIN_PHP_VERSION', '8.2.0');
