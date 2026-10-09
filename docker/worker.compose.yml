@@ -1,0 +1,21 @@
+services:
+  assetsync-worker:
+    image: glpi/glpi:11.0.11
+    container_name: assetsync-worker
+    user: "www-data"
+    entrypoint: ["php", "/var/www/glpi/bin/console"]
+    command: ["plugins:assetsync20:worker", "--loop"]
+    environment:
+      GLPI_DB_HOST: db
+      GLPI_DB_PORT: "3306"
+      GLPI_DB_NAME: glpi
+      GLPI_DB_USER: glpi
+      GLPI_DB_PASSWORD: ${GLPI_DB_PASSWORD:?Set GLPI_DB_PASSWORD before starting the worker}
+    volumes:
+      - glpi_data:/var/glpi
+    depends_on:
+      db:
+        condition: service_started
+      glpi:
+        condition: service_started
+    restart: unless-stopped
