@@ -1,0 +1,8 @@
+{
+  "name": "dmos/assetsync20agent",
+  "description": "Standalone Computer change notifier for AssetSync2.0",
+  "type": "glpi-plugin",
+  "license": "GPL-3.0-or-later",
+  "require": {"php": ">=8.2"},
+  "autoload": {"psr-4": {"GlpiPlugin\\Assetsync20agent\\": "src/"}}
+}

@@ -298,7 +298,7 @@ namespace {
         $sql->sqliteCreateFunction('LEAST', static fn (...$values) => min($values));
         $sql->sqliteCreateFunction('GREATEST', static fn (...$values) => max($values));
         $sql->sqliteCreateFunction('POW', static fn ($base, $power) => pow($base, $power), 2);
-        $sql->exec('CREATE TABLE jobs (id INTEGER, glpi_b_connection_id TEXT, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0)');
+        $sql->exec('CREATE TABLE jobs (id INTEGER, glpi_b_connection_id TEXT, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0, agent_requested INTEGER NOT NULL DEFAULT 0, agent_completed INTEGER NOT NULL DEFAULT 0)');
         $insert = $sql->prepare('INSERT INTO jobs (id,glpi_b_connection_id,status,attempts,finished_at,available_at,started_at,date_mod) VALUES (?, ?, ?, 1, ?, ?, ?, NULL)');
         foreach ($fixtures as $fixture) {
             $insert->execute($fixture);

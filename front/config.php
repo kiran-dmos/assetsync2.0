@@ -132,7 +132,13 @@ $connection = $editConnection ?? [
 $workerInterval = WorkerSettings::getInterval();
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
-    Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
+    $previousCronTimer = $_SESSION['glpicrontimer'] ?? null;
+    $_SESSION['glpicrontimer'] = time();
+    try {
+        Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
+    } finally {
+        if ($previousCronTimer === null) { unset($_SESSION['glpicrontimer']); } else { $_SESSION['glpicrontimer'] = $previousCronTimer; }
+    }
 }
 
 $html = static function (string $value): string {
@@ -182,6 +188,7 @@ echo '</tr>';
 echo '</table>';
 
 echo '<p class="assetsync-actions"><a class="submit" href="' . $html(Menu::syncActivityUrl()) . '">Open Sync Activity</a></p>';
+\GlpiPlugin\Assetsync20\AgentActivity::render();
 
 /* Worker settings */
 echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';

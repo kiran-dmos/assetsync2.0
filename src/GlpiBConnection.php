@@ -179,6 +179,10 @@ final class GlpiBConnection
     {
         self::invalidateRunCache();
         $connection = self::fromInput($input);
+        $previous = self::find($connection['id']);
+        if ($previous !== null && AgentInbox::identity($previous) !== AgentInbox::identity($connection)) {
+            AgentInbox::invalidate($connection['id']);
+        }
         $connections = self::loadAll();
         $saved = false;
 
@@ -201,6 +205,7 @@ final class GlpiBConnection
     {
         self::invalidateRunCache();
         $id = self::connectionId($id);
+        AgentInbox::invalidate($id);
         $connections = [];
 
         foreach (self::loadAll() as $connection) {

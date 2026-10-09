@@ -125,6 +125,22 @@ final class SyncActivity
         }
     }
 
+    public function agentRows(): array
+    {
+        if (!isset($this->scope['Computer']) || !$this->db->tableExists(AgentInbox::RECEIPTS)) {
+            return [];
+        }
+        $query = $this->query('Computer', $this->scope['Computer']);
+        $query['SELECT'] = [AgentInbox::RECEIPTS . '.*', new QueryExpression('`' . AssetSyncQueue::TABLE . '`.`status`', 'queue_status'),
+            AssetSyncQueue::TABLE . '.agent_completed', new QueryExpression('`glpi_computers`.`name`', 'asset_name'),
+            AgentInbox::REGISTRATIONS . '.last_seen'];
+        $query['INNER JOIN'][AgentInbox::RECEIPTS] = ['ON' => [AgentInbox::RECEIPTS => 'queue_id', AssetSyncQueue::TABLE => 'id']];
+        $query['INNER JOIN'][AgentInbox::REGISTRATIONS] = ['ON' => [AgentInbox::REGISTRATIONS => 'id', AgentInbox::RECEIPTS => 'registration_id']];
+        $query['ORDER'] = AgentInbox::RECEIPTS . '.received_at DESC';
+        $query['LIMIT'] = 50;
+        return iterator_to_array($this->db->request($query), false);
+    }
+
     public static function header(string $script): void
     {
         $present = array_key_exists('glpicrontimer', $_SESSION);

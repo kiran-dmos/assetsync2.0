@@ -32,6 +32,14 @@ final class AssetSyncLink
         }
 
         if ($db->tableExists(self::TABLE)) {
+            foreach (['confirmed_remote_id' => 'INT UNSIGNED DEFAULT NULL',
+                'confirmed_entity_id' => 'INT UNSIGNED DEFAULT NULL',
+                'confirmed_identity' => "CHAR(64) NOT NULL DEFAULT ''"] as $name => $definition) {
+                if (!$db->fieldExists(self::TABLE, $name)
+                    && !$db->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `' . $name . '` ' . $definition)) {
+                    return false;
+                }
+            }
             return true;
         }
 
@@ -118,6 +126,12 @@ final class AssetSyncLink
         if (!array_key_exists('last_payload_date', $data)) {
             unset($fields['last_payload_date']);
         }
+        // Only verified service readback can supply this evidence. Error status changes retain it.
+        foreach (['confirmed_remote_id', 'confirmed_entity_id', 'confirmed_identity'] as $key) {
+            if (array_key_exists($key, $data)) {
+                $fields[$key] = $data[$key];
+            }
+        }
 
         $existing = self::find($itemtype, $itemsId, $connectionId);
         if ($existing === null) {
@@ -199,6 +213,9 @@ CREATE TABLE IF NOT EXISTS `glpi_plugin_assetsync20_assetlinks` (
   `glpi_b_connection_id` VARCHAR(255) NOT NULL,
   `route_id` VARCHAR(255) NOT NULL DEFAULT '',
   `remote_items_id` INT {$primaryKeySign} DEFAULT NULL,
+  `confirmed_remote_id` INT UNSIGNED DEFAULT NULL,
+  `confirmed_entity_id` INT UNSIGNED DEFAULT NULL,
+  `confirmed_identity` CHAR(64) NOT NULL DEFAULT '',
   `status` VARCHAR(50) NOT NULL DEFAULT 'synced',
   `last_payload_hash` CHAR(64) NOT NULL DEFAULT '',
   `last_payload_date` TIMESTAMP NULL DEFAULT NULL,

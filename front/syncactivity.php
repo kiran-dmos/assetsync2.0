@@ -75,6 +75,7 @@ $assets = static function (array $row) use ($activity, $html): string {
 };
 
 echo '<div class="assetsync-page assetsync-activity"><h2>Sync Activity</h2>';
+\GlpiPlugin\Assetsync20\AgentActivity::render();
 echo '<div class="assetsync-activity-actions"><a href="' . $html(Menu::configUrl()) . '">Back to dashboard</a><a class="submit" href="' . $html($url(['id' => ''])) . '">Refresh activity</a></div>';
 echo '<h3>Current Work</h3><p class="assetsync-activity-note">Latest queue state only. Finished jobs do not prove field changes; retrying or blocked jobs may follow partial updates.</p>';
 if ($unavailable) {

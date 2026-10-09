@@ -30,8 +30,15 @@ final class AssetSyncQueue
                 return false;
             }
             try {
-                return $db->fieldExists(self::TABLE, 'needs_recheck')
-                    || (bool) $db->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `needs_recheck` TINYINT NOT NULL DEFAULT 0');
+                foreach (['needs_recheck' => 'TINYINT NOT NULL DEFAULT 0',
+                    'agent_requested' => 'BIGINT NOT NULL DEFAULT 0', 'agent_completed' => 'BIGINT NOT NULL DEFAULT 0',
+                    'claim_token' => "CHAR(32) NOT NULL DEFAULT ''"] as $name => $definition) {
+                    if (!$db->fieldExists(self::TABLE, $name)
+                        && !$db->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `' . $name . '` ' . $definition)) {
+                        return false;
+                    }
+                }
+                return true;
             } catch (\Throwable) {
                 return false;
             }
@@ -248,12 +255,14 @@ final class AssetSyncQueue
                 ? 1 : (int) ($row['attempts'] ?? 0) + 1;
             $affectedRows = 0;
             $startedRow = null;
-            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, $workCutoffNs, &$affectedRows, &$startedRow): bool {
+            $claimToken = bin2hex(random_bytes(16));
+            $updated = AssetSyncDbTime::write($db, static function () use ($db, $row, $attempts, $claimToken, $workCutoffNs, &$affectedRows, &$startedRow): bool {
                 if ($workCutoffNs !== null && hrtime(true) + 1_000_000 > $workCutoffNs) {
                     return false;
                 }
                 $written = $db->update(self::TABLE, [
                     'status'      => self::STATUS_RUNNING,
+                    'claim_token' => $claimToken,
                     'needs_recheck' => 0,
                     'attempts'    => $attempts,
                     'started_at'  => self::now(),
@@ -273,9 +282,9 @@ final class AssetSyncQueue
                 }
                 if ($written && $affectedRows === 1) {
                     foreach ($db->request([
-                        'SELECT' => ['started_at', new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch')],
+                        'SELECT' => ['started_at', 'agent_requested', 'agent_completed', new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`)', 'started_epoch')],
                         'FROM' => self::TABLE,
-                        'WHERE' => ['id' => (int) $row['id'], 'status' => self::STATUS_RUNNING, 'attempts' => $attempts],
+                        'WHERE' => ['id' => (int) $row['id'], 'status' => self::STATUS_RUNNING, 'claim_token' => $claimToken],
                         'LIMIT' => 1,
                     ]) as $selected) {
                         $startedRow = $selected;
@@ -295,6 +304,10 @@ final class AssetSyncQueue
             $row['attempts'] = $attempts;
             $row['started_at'] = $startedRow['started_at'];
             $row['started_epoch'] = (int) $startedRow['started_epoch'];
+            $row['claim_token'] = $claimToken;
+            // Snapshot before any asset/remote reads. Later arrivals stay outstanding.
+            $row['agent_snapshot'] = (int) ($startedRow['agent_requested'] ?? 0);
+            $row['agent_completed'] = (int) ($startedRow['agent_completed'] ?? 0);
             $claimed[] = $row;
         }
 
@@ -328,7 +341,7 @@ SELECT category, COUNT(*) AS count,
                     AND (age_epoch IS NULL OR age_epoch <= 0 OR age_epoch > {$now}) THEN 1 ELSE 0 END) AS unknown_age
 FROM (
     SELECT CASE
-               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1) THEN 'pending'
+               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`)) THEN 'pending'
                WHEN `status` = 'retry' AND {$due} THEN 'retry_due'
                WHEN `status` = 'retry' THEN 'retry_waiting'
                WHEN `status` = 'running' AND {$due} THEN 'running_reclaimable'
@@ -336,12 +349,12 @@ FROM (
                ELSE 'blocked'
            END AS category,
            CASE
-               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1) THEN {$pending}
+               WHEN `status` = 'pending' OR (`status` IN ('done', 'blocked') AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`)) THEN {$pending}
                WHEN `status` = 'retry' THEN {$retry}
                WHEN `status` = 'running' THEN {$running}
            END AS age_epoch
     FROM `glpi_plugin_assetsync20_syncqueue`
-    WHERE `status` IN ('pending', 'retry', 'running', 'blocked') OR (`status` = 'done' AND `needs_recheck` = 1)
+    WHERE `status` IN ('pending', 'retry', 'running', 'blocked') OR (`status` = 'done' AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`))
 ) AS queue_metrics
 GROUP BY category
 SQL;
@@ -450,10 +463,11 @@ SQL;
         $id = (int) ($job['id'] ?? 0);
         $attempts = (int) ($job['attempts'] ?? 0);
         $started = (int) ($job['started_epoch'] ?? 0);
-        if ($id <= 0 || $attempts <= 0 || $started <= 0) {
+        $token = (string) ($job['claim_token'] ?? '');
+        if ($id <= 0 || $attempts <= 0 || $started <= 0 || !preg_match('/^[a-f0-9]{32}$/D', $token)) {
             return null;
         }
-        return ['id' => $id, 'status' => self::STATUS_RUNNING, 'attempts' => $attempts,
+        return ['id' => $id, 'status' => self::STATUS_RUNNING, 'attempts' => $attempts, 'claim_token' => $token,
             new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`started_at`) = ' . $started)];
     }
 
@@ -508,6 +522,9 @@ SQL;
             $fields['remote_items_id'] = $remoteItemsId;
         }
 
+        if ((int) ($job['agent_snapshot'] ?? 0) > (int) ($job['agent_completed'] ?? 0)) {
+            return AgentInbox::complete($job, $fields, $where);
+        }
         return AssetSyncDbTime::write($db, static fn (): bool => $db->update(self::TABLE, $fields, $where) && $db->affectedRows() === 1);
     }
 
@@ -526,7 +543,8 @@ SQL;
             return true;
         }
         if (in_array($status, [self::STATUS_DONE, self::STATUS_BLOCKED], true)) {
-            return (int) ($row['needs_recheck'] ?? 0) === 1;
+            return (int) ($row['needs_recheck'] ?? 0) === 1
+                || (int) ($row['agent_requested'] ?? 0) > (int) ($row['agent_completed'] ?? 0);
         }
 
         if ($status === self::STATUS_RETRY) {
@@ -568,7 +586,7 @@ SQL;
         return <<<SQL
 (
   `status` = 'pending'
-  OR (`status` IN ('done', 'blocked') AND `needs_recheck` = 1)
+  OR (`status` IN ('done', 'blocked') AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`))
   OR (
     `status` = 'retry'
     AND (
@@ -616,6 +634,9 @@ CREATE TABLE IF NOT EXISTS `glpi_plugin_assetsync20_syncqueue` (
   `payload_date` TIMESTAMP NULL DEFAULT NULL,
   `status` VARCHAR(20) NOT NULL DEFAULT 'pending',
   `needs_recheck` TINYINT NOT NULL DEFAULT 0,
+  `agent_requested` BIGINT NOT NULL DEFAULT 0,
+  `agent_completed` BIGINT NOT NULL DEFAULT 0,
+  `claim_token` CHAR(32) NOT NULL DEFAULT '',
   `attempts` INT {$primaryKeySign} NOT NULL DEFAULT '0',
   `available_at` TIMESTAMP NULL DEFAULT NULL,
   `started_at` TIMESTAMP NULL DEFAULT NULL,

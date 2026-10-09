@@ -39,7 +39,7 @@ namespace {
             $this->pdo->sqliteCreateFunction('LEAST', static fn (...$values): int => (int) min($values));
             $this->pdo->sqliteCreateFunction('GREATEST', static fn (...$values): int => (int) max($values));
             $this->pdo->sqliteCreateFunction('POW', static fn ($base, $power): float => pow((float) $base, (float) $power), 2);
-            $this->pdo->exec('CREATE TABLE ' . AssetSyncQueue::TABLE . ' (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, date_creation INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0)');
+            $this->pdo->exec('CREATE TABLE ' . AssetSyncQueue::TABLE . ' (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, date_creation INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0, agent_requested INTEGER NOT NULL DEFAULT 0, agent_completed INTEGER NOT NULL DEFAULT 0)');
         }
 
         public function doQuery(string $sql)

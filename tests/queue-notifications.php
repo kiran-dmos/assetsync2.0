@@ -167,18 +167,21 @@ foreach (['UTC', '+08:00', 'America/New_York'] as $timezone) {
 if (extension_loaded('pdo_sqlite')) {
     $sql = new PDO('sqlite::memory:');
     $sql->sqliteCreateFunction('UNIX_TIMESTAMP', static fn ($value) => $value, 1);
-    $sql->exec('CREATE TABLE owners (id INTEGER, status TEXT, attempts INTEGER, started_at INTEGER)');
+    $sql->exec('CREATE TABLE owners (id INTEGER, status TEXT, attempts INTEGER, started_at INTEGER, claim_token TEXT)');
     $earlier = strtotime('2026-11-01 01:25:00 -04:00');
     $later = strtotime('2026-11-01 01:25:00 -05:00');
-    $insert = $sql->prepare('INSERT INTO owners VALUES (1, ?, ?, ?)');
-    $insert->execute(['running', 1, $earlier]);
-    $insert->execute(['running', 1, $later]);
-    $insert->execute(['running', 2, $later]);
-    $insert->execute(['done', 1, $later]);
+    $token = str_repeat('a', 32);
+    $insert = $sql->prepare('INSERT INTO owners VALUES (1, ?, ?, ?, ?)');
+    $insert->execute(['running', 1, $earlier, $token]);
+    $insert->execute(['running', 1, $later, $token]);
+    $insert->execute(['running', 2, $later, $token]);
+    $insert->execute(['done', 1, $later, $token]);
+    $insert->execute(['running', 1, $later, str_repeat('b', 32)]);
     $fence = (new ReflectionMethod(AssetSyncQueue::class, 'ownerWhere'))->invoke(null,
-        ['id' => 1, 'status' => 'running', 'attempts' => 1, 'started_epoch' => $later]);
-    $selected = $sql->query("SELECT started_at FROM owners WHERE id = 1 AND status = 'running' AND attempts = 1 AND " . $fence[0]->expression)->fetchAll(PDO::FETCH_COLUMN);
-    notificationCheck(array_map('intval', $selected) === [$later] && $later - $earlier === 3600, 'Epoch fence SQL must distinguish repeated local times and reject wrong status/attempt.');
+        ['id' => 1, 'status' => 'running', 'attempts' => 1, 'started_epoch' => $later, 'claim_token' => $token]);
+    $selected = $sql->query("SELECT started_at FROM owners WHERE id = 1 AND status = 'running' AND attempts = 1 AND claim_token = "
+        . $sql->quote($fence['claim_token']) . ' AND ' . $fence[0]->expression)->fetchAll(PDO::FETCH_COLUMN);
+    notificationCheck(array_map('intval', $selected) === [$later] && $later - $earlier === 3600, 'Epoch and token fence SQL must reject DST ambiguity and same-second ABA claims.');
 }
 
 // A notification before claim selection is consumed only before a fresh source read.

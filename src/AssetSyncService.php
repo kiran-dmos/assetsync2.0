@@ -555,6 +555,14 @@ final class AssetSyncService
             return;
         }
 
+        $agentWork = (int) ($job['agent_snapshot'] ?? 0) > (int) ($job['agent_completed'] ?? 0);
+        $agentPair = $agentWork ? AgentInbox::jobPair($job) : null;
+        if ($agentWork && ($itemtype !== 'Computer' || $agentPair === null)) {
+            $this->blockJob($job, (string) ($job['route_id'] ?? ''), AssetSyncLink::STATUS_BLOCKED_IDENTITY,
+                'Agent notification has no enabled, approved, confirmed asset pair.');
+            return;
+        }
+
         $connection = $this->activeConnection($connectionId);
         if ($connection === null) {
             $this->blockJob($job, '', AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, 'The GLPI B connection is missing or inactive.');
@@ -616,6 +624,25 @@ final class AssetSyncService
             return;
         }
 
+        if ($agentWork) {
+            // Billing preparation can write A, so validate the actual B scope first.
+            $remoteId = (int) $agentPair['confirmed_remote_id'];
+            $preflight = $this->callRemote('getItem', [$connection, $itemtype, $remoteId, false]);
+            if (!$this->remoteSucceeded($preflight)) {
+                $this->handleRemoteFailure($job, $route['id'], $preflight, $attempts, $remoteId);
+                return;
+            }
+            $remoteAsset = $preflight['item'] ?? [];
+            if (!AssetSyncQueue::owns($job) || AgentInbox::jobPair($job) === null
+                || (int) ($remoteAsset['id'] ?? 0) !== $remoteId
+                || (int) ($remoteAsset['entities_id'] ?? -1) !== (int) $agentPair['confirmed_entity_id']
+                || !empty($remoteAsset['is_deleted']) || !empty($remoteAsset['is_template'])) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_IDENTITY,
+                    'Agent asset pair or remote entity changed before preparation.', $remoteId);
+                return;
+            }
+        }
+
         try {
             $mappings = FieldMapping::syncMappings($connectionId, $itemtype, $asset);
             $customTypes = FieldMapping::expectedCustomTypes($itemtype, $mappings);
@@ -643,7 +670,7 @@ final class AssetSyncService
         $customKeys = array_keys($customTypes);
         $needsDateModTimezone = in_array('both', array_column($mappings, 'source_of_truth'), true);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
-        if ($checkUnchanged && !$this->payloadNeedsWork($link, $route, $payloadHash, $mappings)) {
+        if (!$agentWork && $checkUnchanged && !$this->payloadNeedsWork($link, $route, $payloadHash, $mappings)) {
             $this->recordJobOutcome('skipped', AssetSyncQueue::finish($job, 'Asset payload is unchanged.'));
             return;
         }
@@ -693,6 +720,9 @@ final class AssetSyncService
         $remoteItemsId = (int) ($link['remote_items_id'] ?? 0);
         if ($remoteItemsId <= 0) {
             $remoteItemsId = (int) ($job['remote_items_id'] ?? 0);
+        }
+        if ($agentWork) {
+            $remoteItemsId = (int) $agentPair['confirmed_remote_id'];
         }
         $remoteItem = null;
         $remoteDateModTimezone = '';
@@ -809,6 +839,13 @@ final class AssetSyncService
 
         if (!$createdRemote && (int) ($remoteItem['is_deleted'] ?? 0) === 1) {
             $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_MISSING_REMOTE, 'The linked GLPI B asset is deleted.', $remoteItemsId);
+            return;
+        }
+        if ($agentWork && ((int) ($remoteItem['id'] ?? 0) !== $remoteItemsId
+            || (int) ($remoteItem['entities_id'] ?? -1) !== (int) $agentPair['confirmed_entity_id']
+            || (int) ($remoteItem['is_template'] ?? 0) !== 0 || AgentInbox::jobPair($job) === null)) {
+            $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_IDENTITY,
+                'Agent asset pair or remote entity changed.', $remoteItemsId);
             return;
         }
         $ordinaryRemoteBefore = $remoteItem;
@@ -932,6 +969,25 @@ final class AssetSyncService
         }
         $nativeChanges = array_filter($changes['remote'], static fn (string $key): bool => !FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
         $customChanges = array_diff_key($changes['remote'], $nativeChanges);
+        if ($agentWork) {
+            // Revalidate immediately before mutations; never move/relink/create from a notification.
+            $currentPair = AgentInbox::jobPair($job);
+            if (!AssetSyncQueue::owns($job) || $currentPair === null || $currentPair['id'] !== $agentPair['id']
+                || isset($nativeChanges['entities_id'])) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_IDENTITY, 'Agent pair is no longer approved.', $remoteItemsId);
+                return;
+            }
+            $fresh = $this->callRemote('getItem', [$connection, $itemtype, $remoteItemsId, false]);
+            if (!$this->remoteSucceeded($fresh)) {
+                $this->handleRemoteFailure($job, $route['id'], $fresh, $attempts, $remoteItemsId);
+                return;
+            }
+            if ((int) ($fresh['item']['id'] ?? 0) !== $remoteItemsId || !empty($fresh['item']['is_deleted'])
+                || !empty($fresh['item']['is_template']) || (int) ($fresh['item']['entities_id'] ?? -1) !== (int) $agentPair['confirmed_entity_id']) {
+                $this->blockJob($job, $route['id'], AssetSyncLink::STATUS_BLOCKED_IDENTITY, 'Agent remote asset left its approved scope.', $remoteItemsId);
+                return;
+            }
+        }
         if ($customChanges !== []) {
             $validation = $this->callRemote('customTextValues', [$connection, $itemtype, $remoteItemsId, array_keys($customChanges), $customChanges, $customTypes, true, true, (int) $route['glpi_b_target_entity_id'], $customMetadata]);
             if (!$this->remoteSucceeded($validation)) {
@@ -1020,8 +1076,12 @@ final class AssetSyncService
             'last_payload_hash'    => $this->payloadHash($finalAsset, $route, $mappings),
             'last_payload_date'    => $this->payloadDate($finalAsset),
             'last_error'           => '',
+            'confirmed_remote_id'  => $remoteItemsId,
+            'confirmed_entity_id'  => (int) ($remoteItem['entities_id'] ?? $route['glpi_b_target_entity_id']),
+            'confirmed_identity'   => AgentInbox::identity($connection),
         ]);
-        $finished = AssetSyncQueue::finish($job, 'Asset synchronized.', $remoteItemsId);
+        $job['agent_changed'] = $prepared['billing_changed'] || $changes['local'] !== [] || $changes['remote'] !== [];
+        $finished = $saved && AssetSyncQueue::finish($job, 'Asset synchronized.', $remoteItemsId);
         $this->recordJobOutcome('succeeded', $saved && $finished);
     }
 
@@ -1339,7 +1399,8 @@ final class AssetSyncService
      * @return array{
      *     asset:array<string,mixed>,
      *     mappings:list<array{glpi_a_field:string,glpi_b_field:string,source_of_truth:string}>,
-     *     custom_types:array<string,string>
+     *     custom_types:array<string,string>,
+     *     billing_changed:bool
      * }
      */
     private function prepareAssetForSync(string $itemtype, int $itemsId, array $asset, array $mappings, array $customTypes): array
@@ -1353,6 +1414,7 @@ final class AssetSyncService
         );
         $asset += FieldsText::localValues($itemtype, $itemsId, $localValueKeys);
 
+        $beforeBilling = $asset;
         $asset = $this->applyHardwareBilling($itemtype, $itemsId, $asset);
         $asset = $this->applySwsdBilling($itemtype, $itemsId, $asset, $mappings);
 
@@ -1360,6 +1422,7 @@ final class AssetSyncService
             'asset' => $asset,
             'mappings' => $mappings,
             'custom_types' => $customTypes,
+            'billing_changed' => $asset !== $beforeBilling,
         ];
     }
 

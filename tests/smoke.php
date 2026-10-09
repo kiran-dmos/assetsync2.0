@@ -738,6 +738,11 @@ class PluginFieldsContainer
 {
     public static array $options = [];
 
+    public static function getClassname(string $itemtype, string $name): string
+    {
+        return 'PluginFields' . ucfirst(strtolower($itemtype . preg_replace('/s$/', '', $name)));
+    }
+
     public static function getAddSearchOptions($itemtype): array
     {
         return self::$options;
@@ -1508,7 +1513,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.1.10',
+    'version' => '0.2.0',
 ];
 
 foreach ($expectations as $key => $expected) {

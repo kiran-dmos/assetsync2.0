@@ -16,7 +16,7 @@ $db->sqliteCreateFunction('UNIX_TIMESTAMP', static fn ($value): ?int => $value =
 $db->sqliteCreateFunction('LEAST', static fn (...$values): int => (int) min($values));
 $db->sqliteCreateFunction('GREATEST', static fn (...$values): int => (int) max($values));
 $db->sqliteCreateFunction('POW', static fn ($base, $power): float => pow((float) $base, (float) $power), 2);
-$db->exec('CREATE TABLE jobs (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0)');
+$db->exec('CREATE TABLE jobs (id INTEGER, status TEXT, attempts INTEGER, finished_at INTEGER, available_at INTEGER, started_at INTEGER, date_mod INTEGER, needs_recheck INTEGER NOT NULL DEFAULT 0, agent_requested INTEGER NOT NULL DEFAULT 0, agent_completed INTEGER NOT NULL DEFAULT 0)');
 
 $now = time();
 $insert = $db->prepare('INSERT INTO jobs (id, status, attempts, finished_at, available_at, started_at, date_mod) VALUES (?, ?, ?, ?, ?, ?, ?)');
