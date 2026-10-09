@@ -289,6 +289,42 @@ AgentInbox::receive($event, $token);
 $service->processQueue(1);
 agentCheck(receipt()['outcome'] === 'unchanged', 'Echo notification finishes unchanged and cannot loop writes.');
 
+// An accepted agent event recovers a legacy ownership block even when the prepared A hash is unchanged.
+[$event, $token, $asset] = agentSetup();
+$DB->update('glpi_computers', ['comment' => 'Forwarded comment'], ['id' => 101]);
+saveTestMappings('b', 'Computer', [
+    'comment' => ['glpi_b_field_key' => 'comment', 'source_of_truth' => 'glpi_a'],
+    'name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_b'],
+]);
+GlpiBConnection::save(['id' => 'owner', 'base_url' => 'https://owner.invalid', 'active' => true]);
+EntitySyncRoute::save(['id' => 'owner-route', 'glpi_b_connection_id' => 'owner', 'glpi_a_source_entity_id' => '1',
+    'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
+saveTestMappings('owner', 'Computer', ['comment' => ['glpi_b_field_key' => 'comment', 'source_of_truth' => 'glpi_b']]);
+$remote = new FakeGlpiBClient();
+$remote->records['b:Computer'][201] = array_replace($asset, ['id' => 201, 'entities_id' => 100, 'comment' => 'Forwarded comment']);
+$service = new AssetSyncService($remote);
+agentCheck($service->queueAssetIfNeeded('Computer', 101, 'b'), 'The single-owner chain can establish its verified pair and prepared hash.');
+$service->processQueue(1);
+$preparedHash = AssetSyncLink::find('Computer', 101, 'b')['last_payload_hash'];
+AssetSyncQueue::notify('Computer', 101, 'b');
+$blockedJob = AssetSyncQueue::claimDue(1, 'b')[0];
+agentCheck(AssetSyncLink::saveStatus('Computer', 101, 'b', 'route', AssetSyncLink::STATUS_BLOCKED_CONFIGURATION,
+    'Previously rejected cross-connection ownership.') && AssetSyncQueue::block($blockedJob, 'Previously rejected cross-connection ownership.'),
+    'The legacy blocked fixture retains its prepared hash and confirmed pair.');
+agentCheck($preparedHash !== '' && AssetSyncLink::find('Computer', 101, 'b')['last_payload_hash'] === $preparedHash
+    && !$service->queueAssetIfNeeded('Computer', 101, 'b'), 'The unchanged blocked hash reproduces normal admission suppression.');
+$remote->records['b:Computer'][201]['name'] = 'Independent inbound change';
+agentCheck(AgentInbox::receive($event, $token)['status'] === 200, 'The confirmed pair still admits a normal agent notification.');
+$service->processQueue(1);
+agentCheck(receipt()['outcome'] === 'synchronized'
+    && AssetSyncLink::find('Computer', 101, 'b')['status'] === AssetSyncLink::STATUS_SYNCED
+    && $DB->firstRow('glpi_computers', ['id' => 101])['name'] === 'Independent inbound change',
+    'An agent notification bypasses the retained blocked hash and verifies the independent inbound update.');
+$event['revision'] = 2;
+AgentInbox::receive($event, $token);
+$service->processQueue(1);
+agentCheck(receipt()['outcome'] === 'unchanged', 'Recovered single-owner chain agent work remains idempotent.');
+
 foreach (['entity_exit', 'missing', 'permission', 'both'] as $case) {
     [$event, $token, $asset] = agentSetup();
     saveTestMappings('b', 'Computer', ['name' => ['glpi_b_field_key' => 'name', 'source_of_truth' => $case === 'both' ? 'both' : 'glpi_b']]);

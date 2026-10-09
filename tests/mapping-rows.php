@@ -83,16 +83,32 @@ foreach ([mappingRow('', 'name'), mappingRow('name', '', 'glpi_a'), mappingRow('
 }
 
 FieldMapping::save('two', 'Computer', [mappingRow('name', 'serial')], $catalog);
-foreach (['one', 'two'] as $connectionId) {
+GlpiBConnection::save(['id' => 'three', 'base_url' => 'https://three.example/glpi', 'active' => true]);
+FieldMapping::save('three', 'Computer', [mappingRow('Computer.name', 'comment')], $catalog);
+foreach (['one', 'two', 'three'] as $connectionId) {
     EntitySyncRoute::save(['id' => 'ownership-' . $connectionId, 'glpi_b_connection_id' => $connectionId,
         'glpi_a_source_entity_id' => '7', 'glpi_b_target_entity_id' => '100', 'asset_types' => ['Computer'], 'active' => true]);
 }
 $ownershipAsset = ['entities_id' => 7];
 rowCheck(count(FieldMapping::syncMappings('one', 'Computer', $ownershipAsset)) === 2, 'Cross-connection A fanout is allowed.');
 FieldMapping::save('two', 'Computer', [mappingRow('name', 'serial', 'glpi_b')], $catalog);
-rowError(static fn () => FieldMapping::syncMappings('one', 'Computer', $ownershipAsset), 'across active');
+// One incoming writer feeding distinct outbound endpoints is a chain, not competing ownership.
+foreach (['one' => 2, 'two' => 1, 'three' => 1] as $connectionId => $count) {
+    rowCheck(count(FieldMapping::syncMappings($connectionId, 'Computer', $ownershipAsset)) === $count, 'One B writer permits two outbound connections, including within-scope A fanout.');
+}
+storedScope(['version' => 2, 'rows' => [mappingRow('1', 'serial', 'glpi_b')]], 'two');
+rowCheck(count(FieldMapping::syncMappings('one', 'Computer', $ownershipAsset)) === 2, 'A saved numeric metadata alias resolves to the same single writer.');
+storedScope(['version' => 2, 'rows' => [mappingRow('Computer.name', 'comment', 'glpi_b')]], 'three');
+foreach (['one', 'two', 'three'] as $connectionId) {
+    rowError(static fn () => FieldMapping::syncMappings($connectionId, 'Computer', $ownershipAsset), 'across active');
+}
+FieldMapping::save('three', 'Computer', [mappingRow('name', 'comment')], $catalog);
+storedScope(['version' => 2, 'rows' => [mappingRow('1', 'serial', 'invalid')]], 'two');
+rowError(static fn () => FieldMapping::syncMappings('one', 'Computer', $ownershipAsset), 'authority');
 storedScope(['version' => 2, 'rows' => [mappingRow('1', 'serial', 'both')]], 'two');
-rowError(static fn () => FieldMapping::syncMappings('one', 'Computer', $ownershipAsset), 'across active');
+foreach (['one', 'two', 'three'] as $connectionId) {
+    rowError(static fn () => FieldMapping::syncMappings($connectionId, 'Computer', $ownershipAsset), 'across active');
+}
 GlpiBConnection::save(['id' => 'two', 'base_url' => 'https://two.example/glpi', 'active' => false]);
 rowCheck(count(FieldMapping::syncMappings('one', 'Computer', $ownershipAsset)) === 2, 'Inactive connection does not own A.');
 GlpiBConnection::save(['id' => 'two', 'base_url' => 'https://ONE.example:443/glpi/apirest.php/', 'active' => true]);
@@ -102,6 +118,7 @@ rowCheck(FieldMapping::canonicalApiEndpoint('https://one.example/other') !== Fie
 GlpiBConnection::save(['id' => 'two', 'active' => false]);
 EntitySyncRoute::delete('ownership-one');
 EntitySyncRoute::delete('ownership-two');
+EntitySyncRoute::delete('ownership-three');
 
 $legacy = [
     '1' => ['glpi_b_field_key' => '901', 'glpi_b_field_uid' => 'Computer.name', 'source_of_truth' => 'glpi_a'],

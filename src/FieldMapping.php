@@ -487,9 +487,9 @@ final class FieldMapping
     }
 
     /**
-     * Exclusive destinations and exclusive inbound A endpoints rule out chains and cycles.
+     * Destinations and inbound A endpoints remain exclusive within a mapping scope.
      * A-authority fanout is the only allowed repeated endpoint within a mapping scope.
-     * Runtime additionally checks connections whose routes resolve for this asset.
+     * Across asset-matching connections, one B writer may feed A-authority fanout; Both stays exclusive.
      * Save has no asset and checks only its scope, without remote requests or route-overlap guesses.
      */
     public static function validateOwnership(string $connectionId, string $itemtype, array $mappings, ?array $asset = null): void
@@ -532,6 +532,7 @@ final class FieldMapping
             return;
         }
         $endpoint = self::canonicalApiEndpoint($current['base_url']);
+        $ownerConnections = array_fill_keys(array_keys($aOwners), [$connectionId]);
         foreach ($connections as $connection) {
             if ($connection['id'] === $connectionId || !$connection['active']
                 || !isset($matchingConnections[$connection['id']])) {
@@ -549,10 +550,21 @@ final class FieldMapping
                     continue;
                 }
                 $a = self::safeLocalSyncField($itemtype, $row['glpi_a_field_key']);
-                if (isset($aOwners[$a]) && ($row['source_of_truth'] !== 'glpi_a'
-                    || array_filter($aOwners[$a], static fn ($source) => $source !== 'glpi_a'))) {
-                    throw new \RuntimeException('GLPI A endpoint has inbound ownership across active connections matching this asset: ' . $a . ' (' . $connection['id'] . ').');
+                if (isset($aOwners[$a])) {
+                    if (!isset(self::sourceOptions()[$row['source_of_truth']])) {
+                        throw new \RuntimeException('Invalid saved mapping authority: ' . $a . ' (' . $connection['id'] . ').');
+                    }
+                    $aOwners[$a][] = $row['source_of_truth'];
+                    $ownerConnections[$a][] = $connection['id'];
                 }
+            }
+        }
+        // Include every matching owner before deciding, even when this connection only sends A values.
+        foreach ($aOwners as $a => $authorities) {
+            $counts = array_count_values($authorities);
+            if (($counts['glpi_b'] ?? 0) > 1 || (isset($counts['both']) && count($authorities) > 1)) {
+                throw new \RuntimeException('GLPI A endpoint has conflicting inbound ownership across active connections matching this asset: '
+                    . $a . ' (' . implode(', ', array_unique($ownerConnections[$a])) . ').');
             }
         }
     }
