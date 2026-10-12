@@ -39,7 +39,8 @@ final class TaskJournal
                 throw new \RuntimeException('Task ID/hash collision.');
             }
             if ($existing['result'] !== '{}') { return json_decode($existing['result'], true, 32, JSON_THROW_ON_ERROR); }
-            $result = ['outcome' => 'uncertain', 'changed' => []];
+            $readOnlyMatch = $task['version'] === 4 && in_array($task['kind'], ['match', 'reverify'], true);
+            $result = ['outcome' => $readOnlyMatch ? 'stale' : 'uncertain', 'changed' => []];
         } else {
             TaskExecutor::validate($task, $settings);
             Outbox::sql('START TRANSACTION');
@@ -105,6 +106,7 @@ final class TaskJournal
     public static function send(array $settings, array $payload, int $deadline): array
     {
         if (!Settings::validEndpoint($settings['endpoint'] ?? '') || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
+        if (($payload['kind'] ?? '') === 'pull') { $payload['task_versions'] = [1, 2, 3, 4]; }
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $payload[$key] = $settings[$key]; }
         $encoded = json_encode($payload, JSON_THROW_ON_ERROR);
         if (strlen($encoded) > 65536) { throw new \RuntimeException('Task body exceeds limit.'); }

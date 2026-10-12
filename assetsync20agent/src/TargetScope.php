@@ -122,6 +122,8 @@ final class TargetScope
             'entity_id' => (int) $current['entity_id'], 'pair_id' => $current['pair_id']]);
         return ServiceContext::run($target, static function () use ($target): array {
             $snapshot = TaskExecutor::snapshot($target, 3);
+            $item = ServiceContext::computer($target);
+            if (array_key_exists('otherserial', $item->fields)) { $snapshot['otherserial'] = $item->fields['otherserial']; }
             if (\Plugin::isPluginActive('fields')) {
                 foreach (Snapshot::containers($target['itemtype']) as $container) {
                     if ((int) $container['entities_id'] === $target['entity_id'] && !$container['is_recursive']

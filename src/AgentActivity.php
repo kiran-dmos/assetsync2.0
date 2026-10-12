@@ -60,20 +60,48 @@ final class AgentActivity
         self::renderTasks($entities, $html);
     }
 
-    private static function renderTasks(array $entities, callable $html): void
+    public static function renderTasks(array $entities, callable $html, ?string $connection = null): void
     {
         global $DB;
         if (!$DB->tableExists(AgentTask::TABLE)) { return; }
         echo '<h3>Agent Tasks</h3><table class="tab_cadre_fixe"><tr><th>Task</th><th>Asset</th><th>Outcome</th><th>Created (UTC)</th></tr>';
-        foreach ($DB->request(['FROM' => AgentTask::TABLE, 'ORDER' => 'created_at DESC', 'LIMIT' => 100]) as $task) {
+        foreach ($DB->request(['FROM' => AgentTask::TABLE, 'WHERE' => $connection === null ? [] : ['connection_id' => $connection], 'ORDER' => 'created_at DESC', 'LIMIT' => 100]) as $task) {
             $pair = AgentTask::taskPair($task);
+            $body = json_decode($task['body'], true);
+            if (AgentTask::isMatch($body)) {
+                $context = json_decode($task['context'], true);
+                $pair = ['itemtype' => $body['itemtype'], 'local_id' => $context['local_id'], 'local_entity' => $context['scope']['local_entity']];
+            }
             if (!$pair) { continue; }
             $item = AgentTask::model($pair['itemtype']);
             if (!$pair || !in_array((int) $pair['local_entity'], $entities, true) || !$item->can((int) $pair['local_id'], READ)) { continue; }
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
+            $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
+            if (AgentTask::isMatch($body)) {
+                $label = match ($state) {
+                    'accepted' => 'Matching queued', 'executing' => 'Reading B identities', 'matched' => 'Matched; synchronization pending',
+                    'verified', 'unchanged' => 'Identity evidence received', default => 'Matching ' . $label,
+                };
+                $queue = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `id` = ' . (int) $task['queue_id']);
+                if ($queue && !$task['slot'] && $state === 'blocked') { $label .= ': ' . $queue['last_error']; }
+            }
             echo '<tr><td>' . $html($task['id']) . '</td><td>' . $html($pair['itemtype']) . ' #' . (int) $pair['local_id'] . '</td><td>'
-                . $html(in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown') . '</td><td>'
+                . $html($label) . '</td><td>'
                 . $html(gmdate('Y-m-d H:i:s', (int) $task['created_at'])) . '</td></tr>';
+        }
+        echo '</table>';
+        echo '<h4>Unpaired agent assets</h4><table class="tab_cadre_fixe"><tr><th>Asset</th><th>Matching outcome</th></tr>';
+        foreach ($DB->request(['FROM' => AssetSyncQueue::TABLE, 'WHERE' => $connection === null ? [] : ['glpi_b_connection_id' => $connection],
+            'ORDER' => 'id DESC', 'LIMIT' => 100]) as $queue) {
+            $connectionRow = AgentInbox::connection($queue['glpi_b_connection_id']);
+            if (!$connectionRow || !GlpiBConnection::isAgent($connectionRow)
+                || !in_array($queue['itemtype'], ['Computer', 'Printer'], true)
+                || AgentTask::pair($queue['glpi_b_connection_id'], $queue['itemtype'], (int) $queue['items_id'])) { continue; }
+            $item = AgentTask::model($queue['itemtype']);
+            if (!$item->getFromDB((int) $queue['items_id']) || !in_array((int) $item->fields['entities_id'], $entities, true)
+                || !$item->can((int) $queue['items_id'], READ)) { continue; }
+            echo '<tr><td>' . $html($queue['itemtype']) . ' #' . (int) $queue['items_id'] . '</td><td>'
+                . $html($queue['last_error'] ?: 'Matching ' . $queue['status']) . '</td></tr>';
         }
         echo '</table>';
     }

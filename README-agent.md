@@ -9,18 +9,84 @@ listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
+### Automatic Pairing (Protocol V4)
+
+Upgrade **B agent 0.4.0 first, then A controller 0.5.0**, with both workers stopped.
+Use GLPI's plugin Update action for each version. The new B code must accept
+v4 before A resumes its scanner. A's versioned Update runs the additive migration so
+`agentpairs.identity_basis` exists before resuming A. Its nullable JSON text column
+is the only new storage field; NULL retains legacy serial semantics. Do not rewrite
+retained v1-v3 task bodies, hashes, results, journal entries or uncertain work.
+Existing manual/confirmed pairs continue their original protocol behavior.
+New B pulls advertise `task_versions: [1,2,3,4]`. A withholds v4 tasks from older
+pulls and records a visible upgrade requirement without changing task bytes.
+There is no automatic downgrade or REST fallback.
+
+The existing bounded A scanner queues unpaired Computer/Printer assets on exactly
+one active, nonrecursive, single-type route with explicit source and target entities.
+It never creates an asset. Existing links and manual candidates are preserved.
+Hooks and page loads do not start matching or network requests. B supplies native
+read-only evidence through the existing task transport; A makes every decision.
+
+Matching uses native `serial` first. A unique serial wins; duplicate serials block.
+Only blank serial or a complete zero-result serial lookup permits native inventory
+number (`otherserial`) fallback. Duplicate inventory numbers block fallback, as do
+contradictory nonblank A/B serials. A identities are checked for duplicates before
+assignment, including assets already paired, so worker order cannot choose a winner.
+Names, numeric IDs, UUID equality, REST discovery and asset creation are not used.
+
+V4 trims ASCII spaces at the ends only and compares exact case-sensitive bytes.
+`0`, leading zeros, punctuation and internal whitespace remain significant. Missing
+columns, failed reads, invalid controls and values over 255 bytes block; explicit
+NULL is blank only when the native column exists. Both sides apply the exact SQL
+predicate before the two-row limit. Discovery pagination and permission filtering
+cannot hide a duplicate. B requires fresh type rights and an explicit entity grant;
+a denied candidate or exhausted read budget leaves that identifier's lookup
+incomplete, never zero. Serial and inventory completeness are separate: a valid
+unique serial does not depend on a failed or denied inventory lookup.
+
+Each lookup is restricted to the exact entity and active native type, with the
+binary identity predicate before `LIMIT 2`. MySQL 8/9 uses the per-statement
+`MAX_EXECUTION_TIME` hint; MariaDB 10.6+ uses `SET STATEMENT max_statement_time`.
+Each query gets at most one second and shrinks to the remaining two-second lookup
+budget. Unsupported database versions fail explicitly. There is no global inventory
+row cap or duplicate-query `FOR UPDATE`; session timeout settings are not changed.
+Host tests simulate database deadline failures. Actual optimizer/deadline behavior
+requires independent MySQL/MariaDB verification.
+
+A publishes a separate read-only reverify task after choosing a candidate. Fresh
+A route/binding/entity/identifiers and B lookup plus snapshot must agree before
+pair and link confirmation in one transaction. Manual and automatic confirmation
+share the binding lock; existing typed unique indexes protect pair ownership.
+These locks serialize plugin pair claims, not external native asset edits/inserts:
+an external writer can still introduce a new duplicate after the fresh lookup.
+New pairs retain separate A/B serial and inventory guards in `identity_basis`.
+Ordinary v4 inspect/apply and readback enforce those guards, including blank-serial
+inventory pairs. Fingerprints include inventory. Matching errors and expiry use
+the existing queue backoff; uncertain applies are never automatically reset.
+
+Agent Pair and Activity show queued matching, evidence received, matched pending
+synchronization, and blocked/retrying outcomes, including unpaired assets. Matching
+is not synchronization: mapped updates still require the ordinary inspect/apply
+cycle with their existing authority, readonly Fields, scalar/date, billing, and
+History checks. Host tests use GLPI doubles and SQLite, including case-insensitive
+fixture columns; they do not prove live MySQL collation, InnoDB concurrency or scale.
+
+### Installation And Automatic Pairing
+
 Stop both workers, including scheduled runs, before upgrading AssetSync. Install
-the multi-asset B agent code first (0.3.0), then the A controller code (0.4.0),
+the B agent code first (0.4.0), then the A controller code (0.5.0),
 using GLPI's plugin Update action when upgrading from older installed versions.
 New task/pair/journal tables and columns are additive. Existing connections default
 to REST and retain their existing behavior. This is an AssetSync upgrade only;
 do not upgrade official GLPI or Fields as part of this procedure. Resume workers
 only after both code updates and any required additive migrations succeed.
 
-The controller publishes task version 3 with immutable pair ID, item type, item ID
-and exact entity, plus the scalar `type` on each change. Install B before A: older
-agents reject version 3. There is no protocol downgrade or REST fallback.
-Versions 1 and 2 retain their original wire and snapshot shapes. Existing task bodies, hashes, saved
+New automatic pairs use **version 4** for matching, reverify, inspect and apply,
+including separate native identity guards. Existing manual/legacy pairs continue
+**version 3**, with immutable pair ID, item type, item ID, exact entity and the
+scalar `type` on each change. Versions **1 and 2** retain their original wire and
+snapshot shapes. There is no protocol downgrade or REST fallback. Existing task bodies, hashes, saved
 results and journal replay are preserved, including expired tasks with durable
 results; do not rewrite, delete or reset them during an upgrade. B validates the
 original wire hash before checking scalar values. Refresh observation after the
@@ -42,25 +108,28 @@ upgrade to expose Yes/No and Date fields in the mapping catalog.
    read-only permitted entity information. B has no asset-scope editor. Migration
    enrolls nothing; old configured Computer/entity settings remain solely for
    v1/v2 compatibility. Inventory, links and outbox rows never enroll subscriptions.
-6. Request B discovery on A's existing Agent Pair page, then run B's worker.
-   The readonly HTTPS task returns at most 50 summaries, a cursor and its original
-   observation time. Pending, empty, stale and error are distinct. Choose A and B
-   independently by name, type, serial and entity. A checkboxes select only the
-   displayed page (at most 50); save page selection to retain explicit choices across
-   pages in a cart capped at 200. Each selected A asset needs its own independent B
-   choice from a fresh discovery page. Save chosen candidates, then confirm selected
-   pairs with individual routes and per-row results (at most 50 per request).
-   Candidate selection does not infer positional/name/UUID matches. Refresh its
-   independent inspection. Add an exact single-type nonrecursive route on A using
-   the B entity selector populated by discovery. Confirm the pair through
-   the protected Agent Pair POST. Fresh A reads, matching serial/entity, route
-   authorization and reverse uniqueness are required. Existing REST confirmation
-   is not agent confirmation. No asset is created, moved or relinked.
+6. Configure an active, exact single-type nonrecursive route on A for each intended
+   source/target entity. B discovery on Agent Pair can populate the B entity selector;
+   it is read-only and does not require selecting assets or saving manual candidates.
+   Run A and B workers. A's scanner automatically queues eligible unpaired assets;
+   B supplies exact identity evidence, then a fresh reverify before A confirms them.
+   Manual selection/save/confirm is **not required** for automatic matching.
+   No asset is created, moved or relinked. Existing candidates and links remain intact.
 7. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
    Custom endpoint types must match. Each mapping must use
    `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
    stored B observation; explicit refresh queues a fresh inspection without REST.
-   Run A and B workers independently using the commands below.
+   An initial automatic pair provides the stored B metadata when configuring new
+   custom mappings. Run A and B workers independently using the commands below;
+   confirmed pairs then synchronize according to those mappings.
+
+Agent Pair is also available for optional manual exceptions and inspection of
+blocked work. Its existing discovery/cart flow lets an operator choose A and B
+independently, save candidates, refresh their observation, and confirm matching
+serials on an exact route. Discovery remains paginated (50 rows), and this manual
+flow does not infer positional, name or UUID matches. Manual candidates are never
+overwritten by automatic matching. Inspect and resolve the visible cause of blocked
+work; partial or uncertain apply results still require investigation.
 
 B pulls tasks from the separate `front/agent-task.php` HTTPS endpoint and reports
 durable results before ACK. A retains immutable task IDs, bindings, expected
@@ -183,7 +252,7 @@ independent verification on those installed versions remains required.
 
 ## REST Notification Mode Setup
 
-1. Upgrade/install controller version **0.4.0** as `plugins/assetsync20` on A using GLPI's
+1. After upgrading B first as described above, upgrade/install controller version **0.5.0** as `plugins/assetsync20` on A using GLPI's
    plugin installer. This adds registration/receipt tables, confirmed-link
    evidence, queue revision counters and claim tokens. Stop workers during the
    schema upgrade, including cron, and run GLPI's plugin **Update** action (not

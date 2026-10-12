@@ -63,6 +63,7 @@ class Plugin
 }
 class Session
 {
+    public static bool $entityAccess = true;
     public static function checkRight($right, $level): void {}
     public static function getNewCSRFToken(): string { return 'test-csrf'; }
     public static function destroy(): void { $_SESSION = []; }
@@ -74,7 +75,7 @@ class Session
     public static function isCron(): bool { return false; }
     public static function isInventory(): bool { return false; }
     public static function isRightChecksDisabled(): bool { return false; }
-    public static function haveAccessToEntity($id): bool { return true; }
+    public static function haveAccessToEntity($id): bool { return self::$entityAccess; }
 }
 class Auth
 {
@@ -128,13 +129,14 @@ class Computer
     public static function getTable(): string { return 'glpi_computers'; }
     public array $fields = [];
     public static bool $allowUpdate = true;
+    public static bool $allowRead = true;
     public function getFromDB($id): bool
     {
         global $DB;
         $this->fields = $DB->firstRow(static::getTable(), ['id' => $id]) ?? [];
         return $this->fields !== [];
     }
-    public function can($id, $right): bool { return ($right !== UPDATE || self::$allowUpdate) && $this->getFromDB($id); }
+    public function can($id, $right): bool { return ($right !== READ || self::$allowRead) && ($right !== UPDATE || self::$allowUpdate) && $this->getFromDB($id); }
     public function update(array $input): bool
     {
         global $DB;
@@ -284,6 +286,8 @@ function scalarSetup(): array
     Config::$values = [];
     User::$active = true;
     Computer::$allowUpdate = true;
+    Computer::$allowRead = true;
+    Session::$entityAccess = true;
     PluginFieldsComputerscalar::$ignoreUpdate = false;
     PluginFieldsComputerscalar::$dateNullSentinel = true;
     Profile_User::$granted = true;

@@ -359,8 +359,15 @@ final class AssetSyncService
     private function prepareAndQueueLockedAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline, ?float $scanDeadline): ?bool
     {
         if (GlpiBConnection::isAgent($this->activeConnection($connectionId) ?? [])) {
+            if ($deadline !== null && $scanDeadline !== null && AgentTask::matchTask($connectionId, $itemtype, $itemsId)) {
+                return AgentTask::queueMatch($connectionId, $itemtype, $itemsId);
+            }
             $pair = AgentTask::pair($connectionId, $itemtype, $itemsId);
-            if (!$pair || !$pair['confirmed']) {
+            if (!$pair) {
+                return $deadline !== null && $scanDeadline !== null
+                    ? AgentTask::queueMatch($connectionId, $itemtype, $itemsId) : false;
+            }
+            if (!$pair['confirmed']) {
                 return false;
             }
             try {

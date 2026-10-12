@@ -10,7 +10,7 @@ final class AgentTask
     public const PAIRS = 'glpi_plugin_assetsync20_agentpairs';
     public const TABLE = 'glpi_plugin_assetsync20_agenttasks';
     public const BINDINGS = 'glpi_plugin_assetsync20_agentbindings';
-    public const OUTCOMES = ['accepted', 'executing', 'waiting_agent', 'verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'];
+    public const OUTCOMES = ['accepted', 'executing', 'waiting_agent', 'matched', 'verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'];
 
     public static function install(): bool
     {
@@ -33,7 +33,7 @@ final class AgentTask
             `created_at` BIGINT NOT NULL, `expires` BIGINT NOT NULL, UNIQUE KEY `outstanding` (`slot`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
         if (!$ok) { return false; }
-        foreach (['local_fingerprint' => "CHAR(64) NOT NULL DEFAULT ''", 'checked_at' => 'BIGINT NOT NULL DEFAULT 0'] as $column => $definition) {
+        foreach (['identity_basis' => 'TEXT DEFAULT NULL', 'local_fingerprint' => "CHAR(64) NOT NULL DEFAULT ''", 'checked_at' => 'BIGINT NOT NULL DEFAULT 0'] as $column => $definition) {
             if (!$DB->fieldExists(self::PAIRS, $column)
                 && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` ADD `' . $column . '` ' . $definition)) { return false; }
         }
@@ -120,7 +120,28 @@ final class AgentTask
 
     private static function localFingerprint(array $context): string
     {
-        return self::hash([$context['policy'], $context['metadata'], $context['values']]);
+        $parts = [$context['policy'], $context['metadata'], $context['values']];
+        if (isset($context['identity'])) { $parts[] = $context['identity']; }
+        return self::hash($parts);
+    }
+
+    /** V4 only: absent is unknown, explicit NULL is blank, and "0" is an identifier. */
+    public static function identity(array $row): array
+    {
+        $identity = [];
+        foreach (['serial', 'otherserial'] as $key) {
+            if (!array_key_exists($key, $row) || ($row[$key] !== null && !is_string($row[$key]))
+                || strlen((string) $row[$key]) > 255 || preg_match('/[\x00-\x1f\x7f]/', (string) $row[$key])) {
+                throw new \RuntimeException('Native identity is missing or invalid.');
+            }
+            $identity[$key] = trim((string) $row[$key], ' ');
+        }
+        return $identity;
+    }
+
+    public static function isMatch(array $body): bool
+    {
+        return ($body['version'] ?? 0) === 4 && in_array($body['kind'] ?? '', ['match', 'reverify'], true);
     }
 
     public static function model(string $type): object
@@ -179,7 +200,8 @@ final class AgentTask
     {
         global $DB;
         $body = isset($task['body']) ? json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR) : $task;
-        if (($body['version'] ?? 0) === 3) {
+        if (self::isMatch($body)) { return null; }
+        if (($body['version'] ?? 0) >= 3) {
             $pair = self::byId($body['connection_id'], $body['pair_id']);
             return $pair && $pair['itemtype'] === $body['itemtype'] && (int) $pair['computer_id'] === $body['items_id']
                 && (int) $pair['entity_id'] === $body['entity_id'] && $pair['registration'] === $body['registration']
@@ -380,6 +402,12 @@ final class AgentTask
         if (!$confirmed) {
             return ['connection' => $connection, 'registration' => $registration, 'asset' => $computer->fields];
         }
+        if (!empty($pair['identity_basis'])) {
+            $binding = self::binding($pair['connection_id']);
+            if (!$binding || $binding['registration'] !== $pair['registration'] || $binding['installation'] !== $pair['installation']) {
+                throw new \RuntimeException('Automatic pair binding changed.');
+            }
+        }
         EntitySyncRoute::loadAll(true);
         $match = EntitySyncRoute::matchAsset($type, (string) $pair['local_entity'], [], $pair['connection_id']);
         $route = $match['matches'][0]['route'] ?? null;
@@ -389,7 +417,8 @@ final class AgentTask
         if (!$pair['confirmed'] || !$route || count($match['matches']) !== 1 || $match['conflicts'] !== []
             || $route['id'] !== $pair['route_id'] || $route['include_child_entities'] || $route['asset_types'] !== [$type]
             || (int) $route['glpi_b_target_entity_id'] !== (int) $pair['entity_id'] || $route['glpi_b_target_entity_id'] === ''
-            || trim((string) $computer->fields['serial']) !== $pair['serial'] || !$link || count($links) !== 1
+            || (empty($pair['identity_basis']) ? trim((string) $computer->fields['serial']) !== $pair['serial']
+                : self::identity($computer->fields) !== json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['a']) || !$link || count($links) !== 1
             || (int) $link['remote_items_id'] !== (int) $pair['computer_id'] || $link['confirmed_identity'] !== AgentInbox::identity($connection)
             || (json_decode($registration['routes'], true)[$route['id']]['fingerprint'] ?? '') !== AgentInbox::routeIdentity($route)) {
             throw new \RuntimeException('Agent pair, serial or exact route changed.');
@@ -410,6 +439,10 @@ final class AgentTask
         $pair = $pairId === null ? self::pair($connectionId) : self::byId($connectionId, $pairId);
         if (!$pair) { throw new \RuntimeException('Declare an agent pair first.'); }
         AssetUuidOperation::withAssetLock($pair['itemtype'], (int) $pair['local_id'], static function () use ($pair, $routeId, $DB): void {
+            AgentInbox::sql('START TRANSACTION');
+            try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($pair['connection_id']) . ' FOR UPDATE');
+            $pair = self::byId($pair['connection_id'], $pair['id']);
             $type = $pair['itemtype'];
             $scope = self::scope($pair, false);
             $item = self::model($type);
@@ -433,8 +466,6 @@ final class AgentTask
             $duplicates = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
                 'itemtype' => $type, 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
             if (count($duplicates) > ($link ? 1 : 0)) { throw new \RuntimeException('Reverse link is not unique.'); }
-            AgentInbox::sql('START TRANSACTION');
-            try {
                 if (!$link) {
                     self::write(AssetSyncLink::saveStatus($type, (int) $pair['local_id'], $pair['connection_id'], $routeId,
                         AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, 'Agent pair independently confirmed.', (int) $pair['computer_id']));
@@ -501,6 +532,10 @@ final class AgentTask
             'items_id' => (int) $pair['computer_id'], 'entity_id' => (int) $pair['entity_id'],
             'serial' => $pair['confirmed'] ? $pair['serial'] : '', 'policy' => $context['policy'] ?? '',
             'expires' => time() + 300, 'changes' => $changes];
+        if (!empty($pair['identity_basis'])) {
+            $task['version'] = 4;
+            $task['identity'] = json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['b'];
+        }
         $task['hash'] = self::hash($task);
         if (strlen(json_encode(['status' => 200, 'task' => $task], JSON_THROW_ON_ERROR)) > 65536) {
             throw new \RuntimeException('Task exceeds the 64 KiB transport envelope.');
@@ -551,21 +586,30 @@ final class AgentTask
                     $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
                     if ($body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
                         || $body['installation'] !== $binding['installation']) { throw new \UnexpectedValueException('Task ownership changed.'); }
-                    $pair = $body['kind'] === 'discover' ? null : self::taskPair($task);
+                    $matching = self::isMatch($body);
+                    $pair = $body['kind'] === 'discover' || $matching ? null : self::taskPair($task);
                     $policyCurrent = true;
                     try {
-                        if ($body['kind'] !== 'discover') {
+                        if ($matching) {
+                            $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+                            $policyCurrent = self::sameMatchScope(self::matchContext($binding['connection_id'], $body['itemtype'], $expected['local_id']), $expected['scope']);
+                        } elseif ($body['kind'] !== 'discover') {
                             if (!$pair) { throw new \RuntimeException('Pair unavailable.'); }
                             self::scope($pair, $body['kind'] === 'apply' || (bool) $pair['confirmed']);
                         }
-                        if ($task['queue_id'] !== null) {
+                        if ($task['queue_id'] !== null && !$matching) {
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                             $policyCurrent = $expected['policy'] === self::policy($pair);
                         }
                     } catch (\Throwable) { $policyCurrent = false; }
-                    if ((int) $task['expires'] < time() || !$policyCurrent) {
+                    if (($body['version'] ?? 0) === 4 && !in_array(4, $request['task_versions'] ?? [], true)) {
+                        if ($task['queue_id'] !== null) {
+                            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.'],
+                                ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
+                        }
+                    } elseif ((int) $task['expires'] < time() || !$policyCurrent) {
                         // A delivered task may have written before losing its result. Never issue another write.
-                        $outcome = $task['state'] === 'executing' && $body['kind'] !== 'discover' ? 'uncertain' : 'stale';
+                        $outcome = $task['state'] === 'executing' && $body['kind'] !== 'discover' && !$matching ? 'uncertain' : 'stale';
                         self::storeResult($task, ['outcome' => $outcome, 'changed' => []]);
                     } else {
                         self::write($DB->update(self::TABLE, ['state' => 'executing'], ['id' => $task['id']]));
@@ -582,8 +626,9 @@ final class AgentTask
                 $body = json_decode($saved['body'], true, 32, JSON_THROW_ON_ERROR);
                 if ($body['registration'] !== $registration['id'] || $body['generation'] !== $request['generation'] || $body['installation'] !== $request['installation']) { throw new \UnexpectedValueException('Stale result binding.'); }
                 if ($saved['result'] === '{}') {
-                    $pair = $body['kind'] === 'discover' ? null : self::taskPair($saved);
-                    $task = $pair ? self::outstanding($binding['connection_id'], $pair) : self::discoveryTask($binding['connection_id']);
+                    $pair = $body['kind'] === 'discover' || self::isMatch($body) ? null : self::taskPair($saved);
+                    $task = self::isMatch($body) ? AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote((string) $saved['slot']))
+                        : ($pair ? self::outstanding($binding['connection_id'], $pair) : self::discoveryTask($binding['connection_id']));
                     if (!$task || $task['id'] !== $saved['id']) { throw new \UnexpectedValueException('No matching outstanding task.'); }
                     try { self::validateResult($body, $result); }
                     catch (\RuntimeException $error) { throw new \UnexpectedValueException('Invalid task evidence.', 0, $error); }
@@ -655,14 +700,32 @@ final class AgentTask
 
     private static function validateResult(array $task, array $result): void
     {
+        if (self::isMatch($task)) {
+            if ($result['changed'] !== []) { throw new \RuntimeException('Matching cannot write assets.'); }
+            if (in_array($result['outcome'], ['verified', 'unchanged'], true)) {
+                self::chooseMatch($task['identity'], $result['evidence'] ?? []);
+                if ($result['evidence']['observed_at'] < $task['expires'] - 300 || $result['evidence']['observed_at'] > $task['expires']) {
+                    throw new \RuntimeException('Matching evidence is outside the task window.');
+                }
+                if ($task['kind'] === 'reverify') {
+                    $snapshotTask = $task;
+                    $snapshotTask['kind'] = 'inspect';
+                    $snapshotTask['identity'] = self::identity($result['snapshot'] ?? []);
+                    $snapshotTask['serial'] = $snapshotTask['identity']['serial'];
+                    self::validateResult($snapshotTask, $result);
+                }
+            }
+            return;
+        }
         if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) { return; }
         if ($task['kind'] === 'discover') { self::validateDiscovery($task, $result); return; }
         $snapshot = $result['snapshot'] ?? [];
         $type = $task['itemtype'] ?? 'Computer';
         if (($snapshot['items_id'] ?? $snapshot['computer_id'] ?? null) !== ($task['items_id'] ?? $task['computer_id']) || ($snapshot['entity_id'] ?? null) !== $task['entity_id']
             || ($snapshot['itemtype'] ?? 'Computer') !== $type
-            || ($task['version'] === 3 && ($snapshot['pair_id'] ?? '') !== $task['pair_id'])
-            || !is_string($snapshot['serial'] ?? null) || $snapshot['serial'] === ''
+            || ($task['version'] >= 3 && ($snapshot['pair_id'] ?? '') !== $task['pair_id'])
+            || !is_string($snapshot['serial'] ?? null) || ($task['version'] < 4 && $snapshot['serial'] === '')
+            || ($task['version'] === 4 && self::identity($snapshot) !== $task['identity'])
             || ($task['serial'] !== '' && $snapshot['serial'] !== $task['serial'])
             || !is_int($snapshot['observed_at'] ?? null) || $snapshot['observed_at'] > $task['expires']
             || $snapshot['observed_at'] < $task['expires'] - 300
@@ -780,7 +843,9 @@ final class AgentTask
                 $metadata[$key] = self::hash([$meta, $container->fields, $definition->fields, (int) $child['id']]);
             }
         }
-        return ['policy' => self::policy($pair), 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings, 'types' => $types];
+        $context = ['policy' => self::policy($pair), 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings, 'types' => $types];
+        if (!empty($pair['identity_basis'])) { $context['identity'] = self::identity($scope['asset']); }
+        return $context;
     }
 
     public static function policy(array $pair): string
@@ -792,11 +857,304 @@ final class AgentTask
             \Config::getConfigurationValues('plugin:assetsync20', ['billing_fields'])]);
     }
 
+    public static function matchTask(string $connection, string $type, int $id): ?array
+    {
+        global $DB;
+        return AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote('match:' . self::hash([$connection, $type, $id])));
+    }
+
+    private static function sameMatchScope(array $fresh, array $expected): bool
+    {
+        // Only the chosen identifier's count controls confirmation. Unrelated inventory
+        // lookup errors or duplicates must not veto a unique serial.
+        unset($fresh['local_counts'], $expected['local_counts']);
+        return $fresh === $expected;
+    }
+
+    /** No discovery pages or permission filtering: two exact rows already prove ambiguity. */
+    private static function localIdentityCount(string $type, int $entity, string $column, string $value, int $deadline): int
+    {
+        global $DB;
+        $item = self::model($type);
+        $result = self::identityQuery('SELECT `id` FROM `' . $item::getTable() . '` WHERE `entities_id` = ' . $entity
+            . ' AND `is_deleted` = 0 AND `is_template` = 0 AND CAST(TRIM(`' . $column . '`) AS BINARY) = CAST('
+            . $DB->quote($value) . ' AS BINARY) LIMIT 2', $deadline);
+        $count = 0;
+        while ($DB->fetchAssoc($result)) { ++$count; }
+        return $count;
+    }
+
+    /** Per-statement limits do not alter pooled/session settings or lock other assets. */
+    private static function identityQuery(string $sql, int $deadline): mixed
+    {
+        $version = (string) (AgentInbox::one('SELECT VERSION() AS version')['version'] ?? '');
+        $milliseconds = min(1000, (int) (($deadline - hrtime(true)) / 1_000_000));
+        if ($milliseconds < 1) { throw new \RuntimeException('Local identity read budget exhausted.'); }
+        if (stripos($version, 'MariaDB') !== false && preg_match('/(\d+)\.(\d+)\.\d+-MariaDB/i', $version, $parts)
+            && ((int) $parts[1] > 10 || ((int) $parts[1] === 10 && (int) $parts[2] >= 6))) {
+            return AgentInbox::sql('SET STATEMENT max_statement_time=' . sprintf('%.3F', $milliseconds / 1000) . ' FOR ' . $sql);
+        }
+        if (stripos($version, 'MariaDB') === false && preg_match('/^(8|9)\./', $version)) {
+            return AgentInbox::sql('SELECT /*+ MAX_EXECUTION_TIME(' . $milliseconds . ') */ ' . substr($sql, 7));
+        }
+        throw new \RuntimeException('Automatic matching requires MySQL 8/9 or MariaDB 10.6+ statement time limits.');
+    }
+
+    public static function matchContext(string $connection, string $type, int $id, bool $checkDuplicates = true, bool $lock = false): array
+    {
+        $binding = self::binding($connection);
+        if (!$binding) { throw new \RuntimeException('Automatic matching needs an active B registration.'); }
+        $registration = self::registration($binding);
+        $item = self::model($type);
+        if ($lock) {
+            $item->fields = AgentInbox::one('SELECT * FROM `' . $item::getTable() . '` WHERE `id` = ' . $id . ' FOR UPDATE') ?? [];
+        } else {
+            $item->getFromDB($id);
+        }
+        if ($item->fields === [] || !array_key_exists('entities_id', $item->fields)
+            || !array_key_exists('is_deleted', $item->fields) || !array_key_exists('is_template', $item->fields)
+            || $item->fields['is_deleted'] || $item->fields['is_template']) {
+            throw new \RuntimeException('Automatic matching local asset unavailable.');
+        }
+        if (self::pair($connection, $type, $id) || AssetSyncLink::find($type, $id, $connection)) {
+            throw new \RuntimeException('Existing pair or link retained; automatic matching skipped.');
+        }
+        EntitySyncRoute::loadAll(true);
+        $match = EntitySyncRoute::matchAsset($type, (string) $item->fields['entities_id'], [], $connection);
+        $route = $match['matches'][0]['route'] ?? null;
+        if (!$route || count($match['matches']) !== 1 || $match['conflicts'] !== [] || !$route['active']
+            || $route['include_child_entities'] || $route['asset_types'] !== [$type]
+            || $route['glpi_b_target_entity_id'] === '' || $route['glpi_a_source_entity_id'] === ''
+            || (int) $route['glpi_a_source_entity_id'] !== (int) $item->fields['entities_id']) {
+            throw new \RuntimeException('Automatic matching requires one exact active single-type route.');
+        }
+        // Enrollment proves only scope. Identity/metadata failures must reach the queue
+        // so eligible assets have a visible failure and retain the normal retry clock.
+        if (!$checkDuplicates) { return []; }
+        $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
+        if (isset($approved[$route['id']]) && $approved[$route['id']] !== [
+            'fingerprint' => AgentInbox::routeIdentity($route), 'source_entity' => (int) $item->fields['entities_id']]) {
+            throw new \RuntimeException('Retained route approval differs; automatic matching blocked.');
+        }
+        // Like scope(), controller reads use the authenticated binding and A's route,
+        // not an interactive session (the B bearer endpoint has no A login).
+        FieldMapping::endRunCache();
+        self::validateMappings($type, FieldMapping::load($connection, $type));
+        $identity = self::identity($item->fields);
+        if ($identity['serial'] === '' && $identity['otherserial'] === '') {
+            throw new \RuntimeException('No native serial or inventory identifier.');
+        }
+        $counts = [];
+        $deadline = hrtime(true) + 2_000_000_000;
+        foreach ($identity as $column => $value) {
+            try {
+                $counts[$column] = $value !== '' ? self::localIdentityCount($type, (int) $item->fields['entities_id'], $column, $value, $deadline) : 0;
+            } catch (\Throwable $error) {
+                if ($column === 'serial' || $identity['serial'] === '') { throw $error; }
+                $counts[$column] = null;
+            }
+            if ($checkDuplicates && $value !== '' && ($column === 'serial' || $identity['serial'] === '') && $counts[$column] !== 1) {
+                throw new \RuntimeException('Duplicate local identity; automatic matching blocked.');
+            }
+        }
+        return ['binding' => array_intersect_key($binding, array_flip(['connection_id', 'registration', 'installation'])),
+            'generation' => $registration['generation'], 'connection_identity' => $registration['connection_identity'],
+            'route' => $route, 'identity' => $identity, 'local_counts' => $counts, 'local_entity' => (int) $item->fields['entities_id']];
+    }
+
+    /** Called only by the bounded scanner; never by inventory hooks or page rendering. */
+    public static function queueMatch(string $connection, string $type, int $id): bool
+    {
+        global $DB;
+        $task = self::matchTask($connection, $type, $id);
+        if ($task) {
+            if ((int) $task['expires'] < time()) {
+                self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'],
+                    ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
+            }
+            return false;
+        }
+        try { self::matchContext($connection, $type, $id, false); }
+        catch (\Throwable) { return false; }
+        return AssetSyncQueue::notify($type, $id, $connection);
+    }
+
+    /** A alone makes the matching decision from complete native exact-lookup evidence. */
+    public static function chooseMatch(array $identity, array $evidence): array
+    {
+        if (($evidence['complete'] ?? false) !== true || !is_int($evidence['observed_at'] ?? null)
+            || !is_array($evidence['lookup_complete'] ?? null) || array_keys($evidence['lookup_complete']) !== ['serial', 'otherserial']) {
+            throw new \RuntimeException('Incomplete identity evidence.');
+        }
+        foreach (['serial', 'otherserial'] as $column) {
+            if (!is_array($evidence[$column] ?? null) || !array_is_list($evidence[$column]) || count($evidence[$column]) > 2
+                || !is_bool($evidence['lookup_complete'][$column])
+                || (!$evidence['lookup_complete'][$column] && $evidence[$column] !== [])
+                || ($identity[$column] === '' && $evidence[$column] !== [])) { throw new \RuntimeException('Invalid identity candidates.'); }
+            if (isset($evidence['lookup_errors']) && (!is_string($evidence['lookup_errors'][$column] ?? null)
+                || strlen($evidence['lookup_errors'][$column]) > 160)) { throw new \RuntimeException('Invalid lookup error.'); }
+            $ids = [];
+            foreach ($evidence[$column] as $row) {
+                if (!is_array($row) || !is_int($row['items_id'] ?? null) || $row['items_id'] <= 0
+                    || !is_int($row['entity_id'] ?? null) || $row['entity_id'] < 0
+                    || !in_array($row['itemtype'] ?? '', ['Computer', 'Printer'], true)
+                    || self::identity($row) !== array_intersect_key($row, array_flip(['serial', 'otherserial']))
+                    || $row[$column] !== $identity[$column] || isset($ids[$row['items_id']])) {
+                    throw new \RuntimeException('Invalid exact candidate identity.');
+                }
+                $ids[$row['items_id']] = true;
+            }
+        }
+        $serial = $evidence['serial'];
+        $inventory = $evidence['otherserial'];
+        if (!$evidence['lookup_complete']['serial']) { return ['outcome' => 'Serial lookup incomplete; matching blocked. ' . ($evidence['lookup_errors']['serial'] ?? '')]; }
+        if (count($serial) > 1) { return ['outcome' => 'Duplicate B serial; matching blocked.']; }
+        if (count($serial) === 1) { return ['outcome' => 'Unique serial match.', 'candidate' => $serial[0], 'method' => 'serial']; }
+        if (!$evidence['lookup_complete']['otherserial']) { return ['outcome' => 'Inventory lookup incomplete; matching blocked. ' . ($evidence['lookup_errors']['otherserial'] ?? '')]; }
+        if (count($inventory) > 1) { return ['outcome' => 'Duplicate B inventory number; matching blocked.']; }
+        if ($inventory === []) { return ['outcome' => 'No exact native identity match.']; }
+        if ($identity['serial'] !== '' && $inventory[0]['serial'] !== '' && $identity['serial'] !== $inventory[0]['serial']) {
+            return ['outcome' => 'Conflicting serials on inventory candidate; matching blocked.'];
+        }
+        return ['outcome' => 'Unique inventory match.', 'candidate' => $inventory[0], 'method' => 'otherserial'];
+    }
+
+    private static function publishMatch(array $job, array $scope, ?array $previous = null, ?array $candidate = null): void
+    {
+        global $DB;
+        $body = ['version' => 4, 'id' => bin2hex(random_bytes(16)), 'kind' => $candidate ? 'reverify' : 'match',
+            'installation' => $scope['binding']['installation'], 'registration' => $scope['binding']['registration'],
+            'generation' => $scope['generation'], 'connection_id' => $job['glpi_b_connection_id'], 'pair_id' => '',
+            'itemtype' => $job['itemtype'], 'items_id' => $candidate['items_id'] ?? 0,
+            'entity_id' => (int) $scope['route']['glpi_b_target_entity_id'], 'serial' => '', 'policy' => self::hash($scope),
+            'expires' => time() + 300, 'changes' => [], 'identity' => $scope['identity']];
+        $body['hash'] = self::hash($body);
+        $context = ['local_id' => (int) $job['items_id'], 'scope' => $scope, 'candidate' => $candidate];
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            if (!AssetSyncQueue::owns($job)) { throw new \RuntimeException('Matching queue claim changed.'); }
+            if ($previous) {
+                self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $previous['id'], 'slot' => $previous['slot']]));
+                if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching task ownership changed.'); }
+            }
+            self::write($DB->insert(self::TABLE, ['id' => $body['id'], 'connection_id' => $body['connection_id'],
+                'slot' => 'match:' . self::hash([$body['connection_id'], $body['itemtype'], (int) $job['items_id']]),
+                'hash' => $body['hash'], 'body' => json_encode($body, JSON_THROW_ON_ERROR), 'state' => 'accepted', 'result' => '{}',
+                'queue_id' => (int) $job['id'], 'job' => json_encode($job, JSON_THROW_ON_ERROR),
+                'context' => json_encode($context, JSON_THROW_ON_ERROR), 'created_at' => time(), 'expires' => $body['expires']]));
+            self::write(AssetSyncQueue::waitForAgent($job));
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    private static function processMatch(array $job): void
+    {
+        global $DB;
+        $task = self::matchTask($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id']);
+        try {
+            $other = AgentInbox::one('SELECT `id` FROM `' . self::TABLE . '` WHERE `queue_id` = ' . (int) $job['id']
+                . ' AND `slot` IS NOT NULL AND `id` <> ' . $DB->quote($task['id'] ?? '') . ' LIMIT 1');
+            if ($other) {
+                // A retained apply may have written. Matching must not change its queue or slot.
+                self::write(AssetSyncQueue::waitForAgent($job));
+                return;
+            }
+            $scope = self::matchContext($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id']);
+            if (!$task) { self::publishMatch($job, $scope); return; }
+            if ((int) $task['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Another matching queue owns this task.'); }
+            if ((int) $task['expires'] < time()) { throw new \RuntimeException('Read-only matching expired; retry scheduled.'); }
+            if ($task['result'] === '{}') { self::park($job, $task); return; }
+            $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+            if (!self::sameMatchScope($scope, $expected['scope']) || !in_array($task['state'], ['verified', 'unchanged'], true)) {
+                throw new \RuntimeException('Matching scope changed or read failed; retry scheduled.');
+            }
+            self::validateResult($body, $result);
+            $choice = self::chooseMatch($scope['identity'], $result['evidence']);
+            if (!isset($choice['candidate'])) { throw new \RuntimeException($choice['outcome']); }
+            if ($scope['local_counts'][$choice['method']] !== 1) { throw new \RuntimeException('Duplicate local identity; automatic matching blocked.'); }
+            $candidate = $choice['candidate'];
+            foreach (['serial', 'otherserial'] as $column) {
+                foreach ($result['evidence'][$column] as $row) {
+                    if ($row['itemtype'] !== $body['itemtype'] || $row['entity_id'] !== $body['entity_id']) {
+                        throw new \RuntimeException('Candidate type or entity differs.');
+                    }
+                }
+            }
+            if ($body['kind'] === 'match') { self::publishMatch($job, $scope, $task, $candidate); return; }
+            if ($candidate !== $expected['candidate'] || $candidate['items_id'] !== $body['items_id']
+                || self::identity($result['snapshot']) !== self::identity($candidate)) {
+                throw new \RuntimeException('Fresh B identity evidence changed.');
+            }
+            self::confirmMatch($job, $task, $scope, $choice, $result['snapshot']);
+        } catch (\Throwable $error) {
+            AgentInbox::sql('START TRANSACTION');
+            try {
+                if (AssetSyncQueue::owns($job)) {
+                    if ($task && (int) $task['queue_id'] === (int) $job['id']) {
+                        // Match/reverify are read-only. Retain immutable bodies/results and release only this slot.
+                        self::write($DB->update(self::TABLE, ['slot' => null, 'state' => 'blocked'], ['id' => $task['id'], 'slot' => $task['slot']]));
+                    }
+                    self::write(AssetSyncQueue::retry($job, 'Verification failed: ' . $error->getMessage()));
+                }
+                AgentInbox::sql('COMMIT');
+            } catch (\Throwable $storageError) { $DB->doQuery('ROLLBACK'); throw $storageError; }
+        }
+    }
+
+    private static function confirmMatch(array $job, array $task, array $scope, array $choice, array $snapshot): void
+    {
+        global $DB;
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
+            $fresh = self::matchContext($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id'], true, true);
+            if (!AssetSyncQueue::owns($job) || (int) $task['expires'] < time()
+                || !self::sameMatchScope($fresh, $scope) || $fresh['local_counts'][$choice['method']] !== 1) {
+                throw new \RuntimeException('Fresh local matching scope or claim changed.');
+            }
+            $candidate = $choice['candidate'];
+            $reverse = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
+                'itemtype' => $job['itemtype'], 'glpi_b_connection_id' => $job['glpi_b_connection_id'], 'remote_items_id' => $candidate['items_id']], 'LIMIT' => 1]));
+            if ($reverse !== []) { throw new \RuntimeException('Existing reverse link retained.'); }
+            $route = $scope['route'];
+            $id = bin2hex(random_bytes(16));
+            $basis = ['normalization_version' => 4, 'method' => $choice['method'], 'a' => $scope['identity'], 'b' => self::identity($candidate)];
+            $snapshot['pair_id'] = $id;
+            self::write($DB->insert(self::PAIRS, $scope['binding'] + ['id' => $id, 'itemtype' => $job['itemtype'],
+                'local_id' => (int) $job['items_id'], 'local_entity' => $scope['local_entity'], 'computer_id' => $candidate['items_id'],
+                'entity_id' => $candidate['entity_id'], 'serial' => $candidate['serial'], 'route_id' => $route['id'], 'confirmed' => 1,
+                'identity_basis' => json_encode($basis, JSON_THROW_ON_ERROR), 'snapshot' => json_encode($snapshot, JSON_THROW_ON_ERROR),
+                'observed_at' => $snapshot['observed_at']]));
+            self::write(AssetSyncLink::saveStatus($job['itemtype'], (int) $job['items_id'], $job['glpi_b_connection_id'], $route['id'],
+                AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, 'Automatically matched; synchronization pending.', $candidate['items_id']));
+            self::write($DB->update(AssetSyncLink::TABLE, ['confirmed_remote_id' => $candidate['items_id'],
+                'confirmed_entity_id' => $candidate['entity_id'], 'confirmed_identity' => $scope['connection_identity']],
+                ['itemtype' => $job['itemtype'], 'items_id' => (int) $job['items_id'], 'glpi_b_connection_id' => $job['glpi_b_connection_id']]));
+            $registration = AgentInbox::one('SELECT * FROM `' . AgentInbox::REGISTRATIONS . '` WHERE `id` = ' . $DB->quote($scope['binding']['registration']) . ' FOR UPDATE');
+            $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
+            $approved[$route['id']] = ['fingerprint' => AgentInbox::routeIdentity($route), 'source_entity' => $scope['local_entity']];
+            self::write($DB->update(AgentInbox::REGISTRATIONS, ['routes' => json_encode($approved, JSON_THROW_ON_ERROR)], ['id' => $registration['id']]));
+            self::scope(self::byId($job['glpi_b_connection_id'], $id));
+            self::write($DB->update(self::TABLE, ['slot' => null, 'state' => 'matched'], ['id' => $task['id'], 'slot' => $task['slot']]));
+            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching task ownership changed.'); }
+            self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending', 'claim_token' => '', 'started_at' => null,
+                'last_error' => 'Automatically matched; synchronization pending.'], ['id' => (int) $job['id'], 'claim_token' => $job['claim_token'], 'status' => 'running']));
+            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching queue ownership changed.'); }
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
     public static function process(array $job, callable $applyLocal): void
     {
         global $DB;
         $type = $job['itemtype'];
         $pair = self::pair($job['glpi_b_connection_id'], $type, (int) $job['items_id']);
+        if (!$pair || self::matchTask($job['glpi_b_connection_id'], $type, (int) $job['items_id'])) {
+            AssetUuidOperation::withAssetLock($type, (int) $job['items_id'], static fn () => self::processMatch($job));
+            return;
+        }
         $task = $pair ? self::outstanding($job['glpi_b_connection_id'], $pair) : null;
         try {
             if ($task && $task['state'] === 'finalizing') {

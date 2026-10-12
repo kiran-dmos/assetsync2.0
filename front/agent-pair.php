@@ -260,6 +260,6 @@ foreach ($pairs as $pair) {
 }
 if ($count === 50) { echo '<a href="?' . $html(http_build_query(array_replace($viewContext, ['connection' => $connectionId, 'pair_cursor' => $pairCursor + 50]))) . '">Next pairs</a>'; }
 echo '<p><a href="entitysyncroutes.php?connection_id=' . rawurlencode($connectionId) . '">Entity routes</a> | <a href="fieldmapping.php?connection_id=' . rawurlencode($connectionId) . '&amp;itemtype=' . rawurlencode($type) . '">Field mappings</a></p>';
-foreach (AgentTask::recent($connectionId) as $recent) { echo '<p>Task ' . $html($recent['id']) . ': ' . $html($recent['state']) . '</p>'; }
+\GlpiPlugin\Assetsync20\AgentActivity::renderTasks(array_map('intval', \Session::getActiveEntities()), $html, $connectionId);
 echo '</div>';
 Html::footer();

@@ -99,8 +99,8 @@ namespace {
     $options = AgentTransport::$options;
     $check($options[CURLOPT_SSL_VERIFYPEER] && $options[CURLOPT_SSL_VERIFYHOST] === 2
         && !$options[CURLOPT_FOLLOWLOCATION] && $options[CURLOPT_PROTOCOLS] === CURLPROTO_HTTPS, 'Task transport also requires strict HTTPS with no redirect.');
-    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull'] + array_intersect_key($settings,
-        array_flip(['registration', 'generation', 'installation', 'connection_id'])), 'Task request includes its complete binding, not service credentials.');
+    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4]] + array_intersect_key($settings,
+        array_flip(['registration', 'generation', 'installation', 'connection_id'])), 'Task request includes only capabilities and complete binding, not service credentials.');
     AgentTransport::$body = str_repeat('x', 65537);
     $check(\GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000)['status'] === 0,
         'Task response is capped at 64 KiB.');

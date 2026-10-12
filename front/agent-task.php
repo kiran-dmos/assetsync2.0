@@ -30,6 +30,12 @@ try {
         if (!is_bool($request['subscriptions_only'])) { throw new InvalidArgumentException(); }
         $keys[] = 'subscriptions_only';
     }
+    if (($request['kind'] ?? '') === 'pull' && array_key_exists('task_versions', $request)) {
+        if (!is_array($request['task_versions']) || !array_is_list($request['task_versions'])
+            || count($request['task_versions']) > 4 || array_diff($request['task_versions'], [1, 2, 3, 4]) !== []
+            || count(array_filter($request['task_versions'], 'is_int')) !== count($request['task_versions'])) { throw new InvalidArgumentException(); }
+        $keys[] = 'task_versions';
+    }
     if (array_diff(array_keys($request), $keys) !== [] || array_diff($keys, array_keys($request)) !== []) { throw new InvalidArgumentException(); }
     foreach (['registration', 'generation', 'installation'] as $key) {
         if (!is_string($request[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $request[$key])) { throw new InvalidArgumentException(); }

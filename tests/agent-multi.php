@@ -302,7 +302,7 @@ $oldOutbox = $DB->firstRow(Outbox::TABLE, ['computer_id' => 201]);
 $DB->doQuery('CREATE TABLE ' . AgentTask::PAIRS . ' (connection_id VARCHAR(255) PRIMARY KEY, registration CHAR(32), installation CHAR(32),
     local_id INT, local_entity INT, computer_id INT, entity_id INT, serial VARCHAR(255), route_id VARCHAR(255), confirmed INT, snapshot TEXT,
     observed_at BIGINT, local_fingerprint CHAR(64), checked_at BIGINT)');
-$DB->insert(AgentTask::PAIRS, array_diff_key($computerPair, array_flip(['id', 'itemtype', 'subscription_revision', 'subscription_issued', 'subscription_active', 'subscription_generation'])));
+$DB->insert(AgentTask::PAIRS, array_diff_key($computerPair, array_flip(['id', 'itemtype', 'identity_basis', 'subscription_revision', 'subscription_issued', 'subscription_active', 'subscription_generation'])));
 $oldPair = $DB->firstRow(AgentTask::PAIRS, ['connection_id' => 'b']);
 $DB->doQuery('CREATE TABLE `' . AgentInbox::RECEIPTS . '` (`id` INTEGER PRIMARY KEY, `registration_id` CHAR(32), `computer_id` INT,
     `received_revision` BIGINT, `admitted_revision` BIGINT, `completed_revision` BIGINT, `work_generation` BIGINT, `queue_id` INT,

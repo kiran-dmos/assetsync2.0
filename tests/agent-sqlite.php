@@ -8,6 +8,7 @@ final class AgentSqlite
     public PDO $pdo;
     public ?string $failOn = null;
     public ?Closure $beforeQuery = null;
+    public string $databaseVersion = '8.0.36';
     private int $affected = 0;
 
     public function __construct(string $file = ':memory:')
@@ -28,6 +29,8 @@ final class AgentSqlite
     {
         if ($this->beforeQuery !== null) { ($this->beforeQuery)($sql); }
         if ($this->failOn !== null && str_contains($sql, $this->failOn)) { return false; }
+        if ($sql === 'SELECT VERSION() AS version') { return $this->pdo->query('SELECT ' . $this->quote($this->databaseVersion) . ' AS version'); }
+        $sql = preg_replace(['/\/\*\+ MAX_EXECUTION_TIME\([1-9][0-9]*\) \*\/ /', '/^SET STATEMENT max_statement_time=0?1?\.[0-9]{3} FOR /'], '', $sql);
         if ($sql === 'SELECT @@SESSION.time_zone AS session_timezone') {
             return $this->pdo->query("SELECT '+00:00' AS session_timezone");
         }
@@ -84,6 +87,8 @@ final class AgentSqlite
             $sql = preg_replace('/,\s*\)$/', ')', $sql);
         }
         $sql = str_replace([' FOR UPDATE', 'INSERT IGNORE'], ['', 'INSERT OR IGNORE'], $sql);
+        // SQLite BLOB comparisons model the v4 MySQL byte comparison, not a text collation.
+        $sql = str_replace(' AS BINARY)', ' AS BLOB)', $sql);
         if (str_contains($sql, 'ON DUPLICATE KEY UPDATE')) {
             $columns = str_contains($sql, '`glpi_plugin_assetsync20_syncqueue`')
                 ? '`itemtype`,`items_id`,`glpi_b_connection_id`' : (str_contains($sql, '`glpi_plugin_assetsync20agent_targets`')

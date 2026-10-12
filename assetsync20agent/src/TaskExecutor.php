@@ -16,17 +16,19 @@ final class TaskExecutor
         $hash = $task['hash'] ?? '';
         unset($task['hash']);
         $keys = ['version', 'id', 'kind', 'installation', 'registration', 'generation', 'connection_id', 'computer_id', 'entity_id', 'serial', 'policy', 'expires', 'changes'];
-        if (($task['version'] ?? null) === 3) {
+        if (in_array($task['version'] ?? null, [3, 4], true)) {
             $keys = array_values(array_diff($keys, ['computer_id']));
             $keys = array_merge($keys, ['pair_id', 'itemtype', 'items_id']);
             if (($task['kind'] ?? '') === 'discover') { $keys[] = 'filter'; }
         }
+        if (($task['version'] ?? null) === 4) { $keys[] = 'identity'; }
         if (array_diff(array_keys($task), $keys) !== [] || array_diff($keys, array_keys($task)) !== []) {
             throw new \RuntimeException('Unknown task schema.');
         }
         if (!is_string($hash) || !hash_equals(self::hash($task), $hash)
-            || !in_array($task['version'] ?? null, [1, 2, 3], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
-            || !in_array($task['kind'] ?? '', $task['version'] === 3 ? ['inspect', 'apply', 'discover'] : ['inspect', 'apply'], true)
+            || !in_array($task['version'] ?? null, [1, 2, 3, 4], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
+            || !in_array($task['kind'] ?? '', $task['version'] === 4 ? ['inspect', 'apply', 'match', 'reverify']
+                : ($task['version'] === 3 ? ['inspect', 'apply', 'discover'] : ['inspect', 'apply']), true)
             || !is_int($task['expires'] ?? null) || ($execution && ($task['expires'] < time()
             || $task['expires'] > time() + 3600)) || !is_array($task['changes'] ?? null)
             || count($task['changes']) > 32) {
@@ -41,9 +43,18 @@ final class TaskExecutor
             || ($task['kind'] !== 'apply' && $task['changes'] !== [])) {
             throw new \RuntimeException('Task target mismatch.');
         }
-        if ($task['version'] === 3) {
+        if ($task['version'] === 4 && (!is_array($task['identity']) || self::identity($task['identity']) !== $task['identity'])) {
+            throw new \RuntimeException('Invalid v4 identity guard.');
+        }
+        if ($task['version'] >= 3) {
             TargetScope::model($task['itemtype']);
-            if ($task['kind'] === 'discover') {
+            if (in_array($task['kind'], ['match', 'reverify'], true)) {
+                if ($task['pair_id'] !== '' || !is_int($task['items_id'])
+                    || ($task['kind'] === 'match' ? $task['items_id'] !== 0 : $task['items_id'] <= 0)
+                    || $task['serial'] !== '' || $task['identity'] === ['serial' => '', 'otherserial' => '']) {
+                    throw new \RuntimeException('Invalid read-only match target.');
+                }
+            } elseif ($task['kind'] === 'discover') {
                 if ($task['pair_id'] !== '' || $task['items_id'] !== 0 || !is_array($task['filter'])
                     || array_keys($task['filter']) !== ['search', 'cursor'] || !is_string($task['filter']['search'])
                     || strlen($task['filter']['search']) > 100 || !is_int($task['filter']['cursor']) || $task['filter']['cursor'] < 0) {
@@ -69,6 +80,20 @@ final class TaskExecutor
                 throw new \RuntimeException('Invalid scalar change.');
             }
         }
+    }
+
+    /** Independently packaged v4 normalization; never used for retained v1-v3 tasks. */
+    public static function identity(array $row): array
+    {
+        $identity = [];
+        foreach (['serial', 'otherserial'] as $key) {
+            if (!array_key_exists($key, $row) || ($row[$key] !== null && !is_string($row[$key]))
+                || strlen((string) $row[$key]) > 255 || preg_match('/[\x00-\x1f\x7f]/', (string) $row[$key])) {
+                throw new \RuntimeException('Native identity is missing or invalid.');
+            }
+            $identity[$key] = trim((string) $row[$key], ' ');
+        }
+        return $identity;
     }
 
     /** Independently packaged equivalent of A's strict agent normalization. */
@@ -112,6 +137,10 @@ final class TaskExecutor
         }
         if (\Plugin::isPluginActive('fields')) {
             foreach (Snapshot::containers($type) as $container) {
+                if ($version === 4 && (int) $container['entities_id'] === (int) $settings['entity_id'] && !$container['is_recursive']
+                    && \PluginFieldsProfile::getRightOnContainer((int) $settings['service_profile'], (int) $container['id']) <= READ) {
+                    throw new \RuntimeException('V4 scoped Fields permission unavailable.');
+                }
                 if ((int) $container['entities_id'] !== (int) $settings['entity_id'] || $container['is_recursive']
                     || \PluginFieldsProfile::getRightOnContainer((int) $settings['service_profile'], (int) $container['id']) <= READ
                     || !$computer->can($id, UPDATE)) {
@@ -162,13 +191,14 @@ final class TaskExecutor
         }
         $snapshot = ['computer_id' => $id, 'entity_id' => (int) $computer->fields['entities_id'],
             'serial' => trim((string) $computer->fields['serial']), 'fields' => $fields, 'observed_at' => time()];
-        if ($version === 3) {
+        if ($version >= 3) {
             unset($snapshot['computer_id']);
             $snapshot['itemtype'] = $type;
             $snapshot['items_id'] = $id;
             $snapshot['pair_id'] = $settings['pair_id'];
             $snapshot['name'] = (string) $computer->fields['name'];
         }
+        if ($version === 4) { $snapshot = array_replace($snapshot, self::identity($computer->fields)); }
         if (strlen(json_encode($snapshot, JSON_THROW_ON_ERROR)) > 49152) {
             throw new \RuntimeException('Scoped snapshot exceeds the transport budget.');
         }
@@ -181,7 +211,7 @@ final class TaskExecutor
         $attempted = false;
         try {
             self::validate($task, $settings);
-            if ($task['version'] === 3) {
+            if ($task['version'] >= 3) {
                 $settings = array_replace($settings, array_intersect_key($task, array_flip(['itemtype', 'items_id', 'pair_id', 'entity_id'])));
                 if ($task['kind'] === 'discover' && $task['entity_id'] === -1) {
                     $entities = Settings::entities((int) $settings['service_user'], (int) $settings['service_profile']);
@@ -194,10 +224,20 @@ final class TaskExecutor
                 if ($task['kind'] === 'discover') {
                     return ['outcome' => 'unchanged', 'changed' => [], 'discovery' => self::discover($task, $settings)];
                 }
+                if (in_array($task['kind'], ['match', 'reverify'], true)) {
+                    $evidence = self::matchEvidence($task, $settings);
+                    $result = ['outcome' => 'unchanged', 'changed' => [], 'evidence' => $evidence];
+                    if ($task['kind'] === 'reverify') { $result['snapshot'] = self::snapshot($settings, 4); }
+                    if (strlen(json_encode($result, JSON_THROW_ON_ERROR)) > 49152) {
+                        throw new \RuntimeException('Matching read budget exceeded.');
+                    }
+                    return $result;
+                }
                 $type = $settings['itemtype'] ?? 'Computer';
                 $id = (int) ($settings['items_id'] ?? $settings['computer_id']);
                 $before = self::snapshot($settings, $task['version']);
-                if ($task['serial'] !== '' && $before['serial'] !== $task['serial']) {
+                if (($task['serial'] !== '' && $before['serial'] !== $task['serial'])
+                    || ($task['version'] === 4 && self::identity($before) !== $task['identity'])) {
                     return ['outcome' => 'stale', 'changed' => []];
                 }
                 foreach ($task['changes'] as $key => $change) {
@@ -220,7 +260,7 @@ final class TaskExecutor
                     $fresh = self::snapshot($settings, $task['version']);
                     $field = $fresh['fields'][$key] ?? null;
                     if (!$field || $field['type'] !== ($change['type'] ?? 'text')
-                        || $fresh['serial'] !== $before['serial'] || $field['metadata'] !== $change['metadata']
+                        || $fresh['serial'] !== $before['serial'] || ($task['version'] === 4 && self::identity($fresh) !== $task['identity']) || $field['metadata'] !== $change['metadata']
                         || $field['value'] !== $change['expected']) {
                         Outbox::sql('ROLLBACK');
                         return ['outcome' => $changed === [] ? 'stale' : 'partial', 'changed' => $changed];
@@ -259,7 +299,7 @@ final class TaskExecutor
                             'plugin_fields_containers_id' => $field['container'], $definition->fields['name'] => $value], $type, false);
                     }
                     $after = self::snapshot($settings, $task['version']);
-                    if (!$ok || ($after['fields'][$key]['value'] ?? null) !== $change['value']
+                    if (!$ok || ($task['version'] === 4 && self::identity($after) !== $task['identity']) || ($after['fields'][$key]['value'] ?? null) !== $change['value']
                         || ($after['fields'][$key]['metadata'] ?? null) !== $field['metadata']) {
                         throw new \RuntimeException('Model readback failed.');
                     }
@@ -293,6 +333,73 @@ final class TaskExecutor
         } catch (\Throwable) {
             return ['outcome' => $attempted ? 'uncertain' : ($changed !== [] ? 'partial' : 'blocked'), 'changed' => $changed];
         }
+    }
+
+    private static function matchEvidence(array $task, array $settings): array
+    {
+        global $DB;
+        // Even a zero-result lookup needs fresh explicit entity and type authorization.
+        ServiceContext::account((int) $settings['service_user']);
+        ServiceContext::grant($settings);
+        $profile = new \Profile();
+        if ((int) \Session::getLoginUserID() !== (int) $settings['service_user']
+            || \Session::isCron() || \Session::isInventory() || \Session::isRightChecksDisabled()
+            || (int) ($_SESSION['glpiactiveprofile']['id'] ?? 0) !== (int) $settings['service_profile']
+            || (int) ($_SESSION['glpiactive_entity'] ?? -1) !== $task['entity_id']
+            || !\Session::haveAccessToEntity($task['entity_id']) || !$profile->getFromDB((int) $settings['service_profile'])
+            || ((int) ($profile->fields[strtolower($task['itemtype'])] ?? 0) & (READ | UPDATE)) !== (READ | UPDATE)) {
+            throw new \RuntimeException('Native lookup permission unavailable.');
+        }
+        $model = TargetScope::model($task['itemtype']);
+        $table = $model::getTable();
+        foreach (['serial', 'otherserial', 'entities_id', 'is_deleted', 'is_template'] as $column) {
+            if (!$DB->fieldExists($table, $column)) { throw new \RuntimeException('Native lookup column unavailable.'); }
+        }
+        $evidence = ['complete' => true, 'observed_at' => time(), 'lookup_complete' => ['serial' => true, 'otherserial' => true],
+            'lookup_errors' => ['serial' => '', 'otherserial' => ''], 'serial' => [], 'otherserial' => []];
+        $deadline = hrtime(true) + 2_000_000_000;
+        foreach (['serial', 'otherserial'] as $column) {
+            if ($task['identity'][$column] === '') { continue; }
+            try {
+            // TRIM without a character argument removes ASCII spaces only in MySQL.
+            // Exact byte matching is scoped in SQL before LIMIT; database execution is bounded.
+            $result = self::identityQuery('SELECT `id`,`serial`,`otherserial`,`entities_id` FROM `' . $table . '` WHERE `entities_id` = ' . $task['entity_id']
+                . ' AND `is_deleted` = 0 AND `is_template` = 0 AND CAST(TRIM(`' . $column . '`) AS BINARY) = CAST('
+                . $DB->quote($task['identity'][$column]) . ' AS BINARY) LIMIT 2', $deadline);
+            while ($row = $DB->fetchAssoc($result)) {
+                $target = array_replace($settings, ['items_id' => (int) $row['id']]);
+                $item = ServiceContext::computer($target);
+                $identity = self::identity($row);
+                if (self::identity($item->fields) !== $identity || $identity[$column] !== $task['identity'][$column]) {
+                    throw new \RuntimeException('Native candidate changed during lookup.');
+                }
+                $evidence[$column][] = ['items_id' => (int) $row['id'], 'itemtype' => $task['itemtype'],
+                    'entity_id' => (int) $row['entities_id']] + $identity;
+            }
+            if (hrtime(true) > $deadline) { throw new \RuntimeException('Native identity read deadline exceeded.'); }
+            } catch (\Throwable $error) {
+                $evidence[$column] = [];
+                $evidence['lookup_complete'][$column] = false;
+                $evidence['lookup_errors'][$column] = $error instanceof \UnexpectedValueException
+                    ? 'Unsupported database statement timeout.' : 'Identity read failed, timed out, or permission denied.';
+            }
+        }
+        return $evidence;
+    }
+
+    private static function identityQuery(string $sql, int $deadline): mixed
+    {
+        $version = (string) (Outbox::one('SELECT VERSION() AS version')['version'] ?? '');
+        $milliseconds = min(1000, (int) (($deadline - hrtime(true)) / 1_000_000));
+        if ($milliseconds < 1) { throw new \RuntimeException('Identity read budget exhausted.'); }
+        if (stripos($version, 'MariaDB') !== false && preg_match('/(\d+)\.(\d+)\.\d+-MariaDB/i', $version, $parts)
+            && ((int) $parts[1] > 10 || ((int) $parts[1] === 10 && (int) $parts[2] >= 6))) {
+            return Outbox::sql('SET STATEMENT max_statement_time=' . sprintf('%.3F', $milliseconds / 1000) . ' FOR ' . $sql);
+        }
+        if (stripos($version, 'MariaDB') === false && preg_match('/^(8|9)\./', $version)) {
+            return Outbox::sql('SELECT /*+ MAX_EXECUTION_TIME(' . $milliseconds . ') */ ' . substr($sql, 7));
+        }
+        throw new \UnexpectedValueException('Unsupported database statement timeout.');
     }
 
     private static function lockRows(array $settings): void
