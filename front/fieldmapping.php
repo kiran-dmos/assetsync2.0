@@ -92,7 +92,7 @@ $fields = FieldMapping::fieldsFor($selectedItemtype);
 if ($selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection)) {
     $sourceOptions = array_intersect_key($sourceOptions, array_flip(['glpi_a', 'glpi_b']));
     $fields = array_values(array_filter($fields, static fn (array $field): bool => in_array($field['key'], ['name', 'comment'], true)
-        || ($field['group'] === 'Custom' && $field['type'] === 'text')));
+        || ($field['group'] === 'Custom' && in_array($field['type'], ['text', 'yesno', 'date'], true))));
 }
 
 if (class_exists('Html') && method_exists('Html', 'header')) {

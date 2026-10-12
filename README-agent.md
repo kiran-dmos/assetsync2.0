@@ -9,9 +9,23 @@ listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
-Upgrade A to 0.3.0 and B to 0.2.0 through GLPI's plugin Update action while workers
-are stopped. New task/pair/journal tables and columns are additive. Existing
-connections default to REST and retain their existing behavior.
+Stop both workers, including scheduled runs, before upgrading AssetSync. Install
+the scalar-capable B agent code first (0.2.0), then the A controller code (0.3.0),
+using GLPI's plugin Update action when upgrading from older installed versions.
+New task/pair/journal tables and columns are additive. Existing connections default
+to REST and retain their existing behavior. This is an AssetSync upgrade only;
+do not upgrade official GLPI or Fields as part of this procedure. Resume workers
+only after both code updates and any required additive migrations succeed.
+
+The scalar extension publishes task version 2 with an explicit `type` on each
+change. Deploy this revision of B before A even when the displayed plugin versions
+already match: an older text-only B rejects version 2. There is no protocol
+downgrade or REST fallback. Version 1 tasks still execute with their original
+text-only snapshot shape and string values. Existing task bodies, hashes, saved
+results and journal replay are preserved, including expired tasks with durable
+results; do not rewrite, delete or reset them during an upgrade. B validates the
+original wire hash before checking scalar values. Refresh observation after the
+upgrade to expose Yes/No and Date fields in the mapping catalog.
 
 1. Select **agent** for the A connection. B REST tokens are not saved in this mode.
 2. On B's agent configuration, obtain its persisted installation identity. This
@@ -29,7 +43,8 @@ connections default to REST and retain their existing behavior.
    the protected Agent Pair POST. Fresh A reads, matching serial/entity, route
    authorization and reverse uniqueness are required. Existing REST confirmation
    is not agent confirmation. No asset is created, moved or relinked.
-6. Map Name, Comments or existing custom **text** fields. Each mapping must use
+6. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
+   Custom endpoint types must match. Each mapping must use
    `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
    stored B observation; explicit refresh queues a fresh inspection without REST.
    Run A and B workers independently using the commands below.
@@ -47,7 +62,7 @@ B uses real Auth login and Session profile/entity selection, fresh direct grants
 and model permissions, Computer search-cache clearing before/after contexts, and
 official Computer/Fields model writes. Existing parent/child rows are locked on
 InnoDB through each write and readback. Named official parent history is checked.
-Readonly Fields text still requires ordinary parent/container authorization; its
+Readonly Fields scalars still require ordinary parent/container authorization; their
 definition is not changed. A keeps billing calculations after verified inbound
 work, guards existing billing child rows and schedules a recheck for derived changes.
 
@@ -58,10 +73,29 @@ crash is never blindly rerun. Late evidence is retained but is not fresh input.
 Only confirmed no-write stale operations offer an administrator retry. Scope
 failure before task publication retains revisions with bounded retry backoff.
 
-Creation, other asset types, recursive/inherited-only grants, non-text mappings,
-other native fields and UUID mutation are unsupported. The separate UUID service
+Yes/No accepts only integer or database string `0`/`1`, transported as JSON integers.
+A blank authoritative Yes/No blocks in either direction; a blank destination is
+distinct from zero and may be set to either value. Date accepts only a valid
+`YYYY-MM-DD` calendar date, or blank/SQL NULL for clearing. Clearing uses the
+official model and is denied for mandatory dates. Missing metadata, columns or
+existing child rows never count as blank values and cannot trigger row creation.
+Date-clear guards consult the current Computer status and fresh Fields overrides.
+B conservatively also denies a base-mandatory date clear: Fields 1.24.2/1.24.4's
+tab-container validator enforces that base flag even when a status override relaxes
+it. No Fields configuration or validation is bypassed to force a clear.
+B checks the official localized `Dropdown::getYesNo()` history labels; a date
+clear reads back as blank (empty string or SQL NULL). Generated Fields models can
+log an empty new value; date-aware models can log the `"NULL"` input sentinel.
+Both representations require verified blank readback and named History evidence;
+an old database NULL has blank history text. A reuses FieldsText
+normalization and its existing model writer. Both writers preserve NULL-to-zero
+Yes/No updates despite GLPI's loose comparison.
+
+Creation, other asset types, recursive/inherited-only grants, Both, dropdowns,
+textarea, number, datetime, other native fields and UUID mutation are unsupported
+in agent-only mode. The separate UUID service
 returns `unsupported_agent` before any mutation/REST for agent participation,
-including mixed REST/agent participant sets. Ordinary supported text work remains
+including mixed REST/agent participant sets. Supported scalar work remains
 available. REST entry points are fenced against agent fallback.
 
 There is no pruning. A task/pair records and B journal survive uninstall, including
@@ -72,7 +106,7 @@ older than five minutes; the mapping catalog can display observations up to one
 hour old. Receiving delayed evidence does not refresh its observation time.
 
 The bounded snapshot permits at most 32 total eligible fields, including Name and
-Comments, even when some fields are unmapped. It is limited to 48 KiB of encoded
+Comments and eligible custom text/Yes/No/Date fields, even when unmapped. It is limited to 48 KiB of encoded
 JSON. Individual text values are limited to 16 KiB and complete task/result HTTPS
 envelopes to 64 KiB; JSON escaping and metadata count toward these byte limits.
 Oversized work fails closed and needs smaller values or a narrower eligible scope.
@@ -92,8 +126,14 @@ human policy/metadata edit, and no production, scale, browser/accessibility, inv
 ingress or storage power-loss qualification. Row locks protect existing asset rows,
 not all GLPI policy tables. Isolated GLPI 11.0.7 / Fields 1.24.5 / PHP 8.5.7 evidence
 and host PHP 8.2 regressions are prepared for independent review, not an approval.
-Focused suites: `tests/agent-tasks.php`, `tests/agent-task-reporting.php` and
-`tests/agent-http.php`. The latter uses mocked HTTP, not live traffic measurement.
+Focused suites: `tests/agent-tasks.php`, `tests/agent-scalars.php`,
+`tests/agent-task-reporting.php` and `tests/agent-http.php`. Scalar tests use host
+model doubles and SQLite for normalization parity, both authorities, raw history,
+readback failures, stale/no-op behavior and immutable v1/v2 replay. HTTP tests use
+mocked transport, not live traffic measurement. These tests do not certify live
+GLPI/Fields behavior or InnoDB locking. The scalar executor uses Computer's own
+UPDATE permission check, avoiding a helper absent from Fields 1.24.2 and 1.24.4;
+independent verification on those installed versions remains required.
 
 ## REST Notification Mode Setup
 

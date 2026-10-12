@@ -214,7 +214,7 @@ final class AgentTask
             $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
             foreach ($snapshot['fields'] ?? [] as $key => $field) {
                 $fields[] = ['key' => $key, 'uid' => $key, 'id' => (string) $field['option'], 'label' => $field['label'],
-                    'type' => 'text', 'group' => $field['group'], 'supported' => true, 'reason' => ''];
+                    'type' => $field['type'], 'group' => $field['group'], 'supported' => true, 'reason' => ''];
             }
         }
         return ['success' => $fields !== [], 'fields' => $fields, 'message' => $fields === []
@@ -223,14 +223,14 @@ final class AgentTask
 
     public static function validateMappings(string $type, array $rows): void
     {
-        if ($type !== 'Computer' || count($rows) > 32) { throw new \RuntimeException('Agent mode supports one Computer and at most 32 text mappings.'); }
+        if ($type !== 'Computer' || count($rows) > 32) { throw new \RuntimeException('Agent mode supports one Computer and at most 32 mappings.'); }
         foreach ($rows as $row) {
             if (!in_array($row['source_of_truth'] ?? '', ['glpi_a', 'glpi_b'], true)) { throw new \RuntimeException('Agent mode requires one-way mapping authority.'); }
             foreach (['glpi_a_field_key', 'glpi_b_field_key'] as $side) {
                 $key = $row[$side] ?? '';
                 if (!in_array($key, ['name', 'comment', 'Computer.name', 'Computer.comment'], true)
                     && !preg_match('/^Computer\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key)) {
-                    throw new \RuntimeException('Unsupported agent mapping: Name, Comments and existing custom text only; UUID is unsupported.');
+                    throw new \RuntimeException('Unsupported agent mapping: Name, Comments and existing custom text, yesno or date only; UUID is unsupported.');
                 }
             }
         }
@@ -241,7 +241,7 @@ final class AgentTask
     {
         global $DB;
         $scope = self::scope($pair, $job !== null);
-        $task = ['version' => 1, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
+        $task = ['version' => 2, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
             'installation' => $pair['installation'], 'registration' => $pair['registration'], 'generation' => $scope['registration']['generation'],
             'connection_id' => $pair['connection_id'], 'computer_id' => (int) $pair['computer_id'], 'entity_id' => (int) $pair['entity_id'],
             'serial' => $pair['confirmed'] ? $pair['serial'] : '', 'policy' => $context['policy'] ?? '',
@@ -337,8 +337,11 @@ final class AgentTask
             || $snapshot['observed_at'] < $task['expires'] - 300
             || !is_array($snapshot['fields'] ?? null) || count($snapshot['fields']) > 32) { throw new \RuntimeException('Invalid independent snapshot.'); }
         foreach ($snapshot['fields'] as $key => $field) {
-            if (!is_array($field) || ($field['key'] ?? '') !== $key || ($field['type'] ?? '') !== 'text'
-                || !is_string($field['value'] ?? null) || strlen($field['value']) > 16384
+            $types = $task['version'] === 1 ? ['text'] : ['text', 'yesno', 'date'];
+            if (!is_array($field) || ($field['key'] ?? '') !== $key || !in_array($field['type'] ?? '', $types, true)
+                || !array_key_exists('value', $field) || self::normalizeValue($field['type'], $field['value']) !== $field['value']
+                || (is_string($field['value']) && strlen($field['value']) > 16384)
+                || (in_array($key, ['name', 'comment'], true) && $field['type'] !== 'text')
                 || !is_string($field['label'] ?? null) || !is_int($field['option'] ?? null) || $field['option'] <= 0
                 || !preg_match('/^[a-f0-9]{64}$/D', $field['metadata'] ?? '')
                 || (!in_array($key, ['name', 'comment'], true) && !preg_match('/^Computer\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key))) {
@@ -348,10 +351,27 @@ final class AgentTask
         foreach ($task['changes'] as $key => $change) {
             if (($snapshot['fields'][$key]['value'] ?? null) !== $change['value']
                 || ($snapshot['fields'][$key]['metadata'] ?? '') !== $change['metadata']
+                || ($snapshot['fields'][$key]['type'] ?? '') !== ($change['type'] ?? 'text')
                 || ($change['expected'] !== $change['value'] && !is_int($result['changed'][$key] ?? null))) {
                 throw new \RuntimeException('Result lacks readback or named history evidence.');
             }
         }
+    }
+
+    /** Agent scalars are stricter than the shared writer; blank reads remain distinct from zero. */
+    public static function normalizeValue(string $type, mixed $value, bool $authoritative = false): string|int
+    {
+        if (!in_array($type, ['text', 'yesno', 'date'], true)) {
+            throw new \RuntimeException('Unsupported agent scalar type.');
+        }
+        if ($type === 'yesno' && !in_array($value, [0, 1, '0', '1'], true)
+            && ($authoritative || !in_array($value, [null, ''], true))) {
+            throw new \RuntimeException('Agent yesno requires 0 or 1; blank authority is unsupported.');
+        }
+        if ($type === 'date' && is_string($value) && str_starts_with($value, '0000')) {
+            throw new \RuntimeException('Agent date requires a valid YYYY-MM-DD.');
+        }
+        return FieldsText::normalizeReadValue($type, $value);
     }
 
     private static function storeResult(array $task, array $result, bool $fresh = true): void
@@ -388,20 +408,24 @@ final class AgentTask
         if ($mappings === []) { throw new \RuntimeException('No supported agent mappings.'); }
         $values = [];
         $metadata = [];
+        $types = [];
         foreach ($mappings as $mapping) {
             $key = $mapping['glpi_a_field'];
             if (isset($values[$key])) { continue; }
             if (in_array($key, ['name', 'comment'], true)) {
+                $types[$key] = 'text';
                 $values[$key] = (string) ($scope['asset'][$key] ?? '');
                 $metadata[$key] = NativeField::local('Computer', $key);
             } else {
                 $meta = FieldsText::customMetadata('Computer', [$key])[$key];
-                if ($meta['type'] !== 'text') { throw new \RuntimeException('Agent custom mappings require text fields.'); }
+                if (!in_array($meta['type'], ['text', 'yesno', 'date'], true)) { throw new \RuntimeException('Agent custom mappings require text, yesno or date fields.'); }
+                $types[$key] = $meta['type'];
                 $container = new \PluginFieldsContainer();
                 $definition = new \PluginFieldsField();
                 if (!$definition->getFromDB($meta['field_id'])) { throw new \RuntimeException('Local Fields definition is unavailable.'); }
                 $meta['container_id'] = (int) $definition->fields['plugin_fields_containers_id'];
-                if (!$container->getFromDB($meta['container_id']) || !$definition->fields['is_active'] || $definition->fields['type'] !== 'text'
+                if (!$container->getFromDB($meta['container_id']) || !$definition->fields['is_active'] || $definition->fields['type'] !== $meta['type']
+                    || $definition->fields['name'] !== $meta['field']
                     || !$container->fields['is_active'] || $container->fields['is_recursive']
                     || (int) $container->fields['entities_id'] !== (int) $pair['local_entity']) {
                     throw new \RuntimeException('Local Fields scope is unsupported.');
@@ -413,11 +437,12 @@ final class AgentTask
                 if (($child['itemtype'] ?? '') !== 'Computer' || (int) ($child['plugin_fields_containers_id'] ?? 0) !== $meta['container_id']) {
                     throw new \RuntimeException('Local custom row identity changed.');
                 }
-                $values[$key] = (string) ($child[$meta['field']] ?? '');
+                if (!array_key_exists($meta['field'], $child)) { throw new \RuntimeException('Local Fields column is unavailable.'); }
+                $values[$key] = self::normalizeValue($meta['type'], $child[$meta['field']]);
                 $metadata[$key] = self::hash([$meta, $container->fields, $definition->fields, (int) $child['id']]);
             }
         }
-        return ['policy' => self::policy($pair), 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings];
+        return ['policy' => self::policy($pair), 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings, 'types' => $types];
     }
 
     public static function policy(array $pair): string
@@ -477,9 +502,11 @@ final class AgentTask
                 foreach ($context['mappings'] as $mapping) {
                     $key = $mapping['glpi_b_field'];
                     $field = $result['snapshot']['fields'][$key] ?? null;
-                    if (!$field || $field['type'] !== 'text') { throw new \RuntimeException('Mapped B text field or existing row is unavailable.'); }
-                    $changes[$key] = ['metadata' => $field['metadata'], 'expected' => $field['value'], 'value' =>
-                        $mapping['source_of_truth'] === 'glpi_a' ? $context['values'][$mapping['glpi_a_field']] : $field['value']];
+                    $type = $context['types'][$mapping['glpi_a_field']];
+                    if (!$field || $field['type'] !== $type) { throw new \RuntimeException('Mapped B field type or existing row is unavailable.'); }
+                    $value = $mapping['source_of_truth'] === 'glpi_a' ? $context['values'][$mapping['glpi_a_field']] : $field['value'];
+                    $changes[$key] = ['type' => $type, 'metadata' => $field['metadata'], 'expected' => $field['value'],
+                        'value' => self::normalizeValue($type, $value, true)];
                 }
                 self::publish($pair, 'apply', $changes, $job, $context, $task['id']);
                 return;
@@ -501,6 +528,25 @@ final class AgentTask
                 $current = self::context($pair);
                 if ($current['policy'] !== $context['policy'] || $current['values'] !== $context['values'] || $current['metadata'] !== $context['metadata']) {
                     throw new \RuntimeException('Local expected values changed.');
+                }
+                foreach ($localChanges as $key => $value) {
+                    if ($current['types'][$key] === 'date' && $value === '') {
+                        $meta = FieldsText::customMetadata('Computer', [$key])[$key];
+                        $definition = new \PluginFieldsField();
+                        $computer = new \Computer();
+                        if (!$definition->getFromDB($meta['field_id']) || !$computer->getFromDB((int) $pair['local_id'])) {
+                            throw new \RuntimeException('Local date metadata disappeared.');
+                        }
+                        $mandatory = !empty($definition->fields['mandatory']);
+                        $statusField = \PluginFieldsStatusOverride::getStatusFieldName('Computer');
+                        foreach (\PluginFieldsStatusOverride::getOverridesForItemtypeAndStatus(
+                            (int) $definition->fields['plugin_fields_containers_id'], 'Computer', (int) $computer->fields[$statusField]) as $override) {
+                            if ((int) $override['plugin_fields_fields_id'] === (int) $meta['field_id']) { $mandatory = !empty($override['mandatory']); }
+                        }
+                        if ($mandatory) {
+                            throw new \RuntimeException('Local mandatory date cannot be cleared.');
+                        }
+                    }
                 }
                 $billingChanged = $applyLocal($localChanges, $context['mappings']) === true;
                 AgentInbox::sql('COMMIT');

@@ -20,7 +20,7 @@ final class TaskExecutor
             throw new \RuntimeException('Unknown task schema.');
         }
         if (!is_string($hash) || !hash_equals(self::hash($task), $hash)
-            || ($task['version'] ?? null) !== 1 || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
+            || !in_array($task['version'] ?? null, [1, 2], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
             || !in_array($task['kind'] ?? '', ['inspect', 'apply'], true)
             || !is_int($task['expires'] ?? null) || ($execution && ($task['expires'] < time()
             || $task['expires'] > time() + 3600)) || !is_array($task['changes'] ?? null)
@@ -39,16 +39,39 @@ final class TaskExecutor
             throw new \RuntimeException('Task target mismatch.');
         }
         foreach ($task['changes'] as $key => $change) {
-            if (!is_string($key) || !is_array($change) || array_keys($change) !== ['metadata', 'expected', 'value']
-                || !is_string($change['metadata']) || !is_string($change['expected']) || !is_string($change['value'])
-                || strlen($change['value']) > 16384 || strlen($change['expected']) > 16384) {
-                throw new \RuntimeException('Invalid text change.');
+            $keys = $task['version'] === 1 ? ['metadata', 'expected', 'value'] : ['type', 'metadata', 'expected', 'value'];
+            if (!is_string($key) || !is_array($change) || array_keys($change) !== $keys || !is_string($change['metadata'])) {
+                throw new \RuntimeException('Invalid change schema.');
+            }
+            $type = $task['version'] === 1 ? 'text' : $change['type'];
+            if (!is_string($type) || self::normalizeValue($type, $change['expected']) !== $change['expected']
+                || self::normalizeValue($type, $change['value'], true) !== $change['value']
+                || (is_string($change['value']) && strlen($change['value']) > 16384)
+                || (is_string($change['expected']) && strlen($change['expected']) > 16384)
+                || (in_array($key, ['name', 'comment'], true) && $type !== 'text')) {
+                throw new \RuntimeException('Invalid scalar change.');
             }
         }
     }
 
+    /** Independently packaged equivalent of A's strict agent normalization. */
+    public static function normalizeValue(string $type, mixed $value, bool $authoritative = false): string|int
+    {
+        if ($type === 'text' && ($value === null || is_scalar($value))) { return (string) $value; }
+        if ($type === 'yesno') {
+            if (in_array($value, [0, 1, '0', '1'], true)) { return (int) $value; }
+            if (!$authoritative && ($value === null || $value === '')) { return ''; }
+        }
+        if ($type === 'date') {
+            if ($value === null || $value === '') { return ''; }
+            if (is_string($value) && preg_match('/^([0-9]{4})-([0-9]{2})-([0-9]{2})$/D', $value, $parts)
+                && checkdate((int) $parts[2], (int) $parts[3], (int) $parts[1])) { return $value; }
+        }
+        throw new \RuntimeException('Unsupported agent scalar value.');
+    }
+
     /** Keys and generated model classes come only from fresh local official metadata. */
-    public static function snapshot(array $settings): array
+    public static function snapshot(array $settings, int $version = 2): array
     {
         global $DB;
         \Glpi\Search\SearchOption::clearSearchOptionCache('Computer');
@@ -71,32 +94,46 @@ final class TaskExecutor
             foreach (Snapshot::containers() as $container) {
                 if ((int) $container['entities_id'] !== (int) $settings['entity_id'] || $container['is_recursive']
                     || \PluginFieldsProfile::getRightOnContainer((int) $settings['service_profile'], (int) $container['id']) <= READ
-                    || !\PluginFieldsContainer::canUpdateTargetItem('Computer', $id)) {
+                    || !$computer->can($id, UPDATE)) {
                     continue;
                 }
+                $definitions = iterator_to_array($DB->request(['FROM' => 'glpi_plugin_fields_fields', 'WHERE' => [
+                    'plugin_fields_containers_id' => (int) $container['id'], 'is_active' => 1,
+                    'type' => $version === 1 ? 'text' : ['text', 'yesno', 'date']], 'LIMIT' => 33]));
+                if ($definitions === []) { continue; }
                 $children = iterator_to_array($DB->request(['FROM' => $container['table'], 'WHERE' => ['items_id' => $id], 'LIMIT' => 2]));
                 if (count($children) !== 1) {
+                    if ($version === 2) { throw new \RuntimeException('Exactly one existing Fields row is required.'); }
                     continue;
                 }
                 $child = array_values($children)[0];
-                if (($child['itemtype'] ?? '') !== 'Computer' || (int) ($child['plugin_fields_containers_id'] ?? 0) !== (int) $container['id']) { continue; }
-                foreach ($DB->request(['FROM' => 'glpi_plugin_fields_fields', 'WHERE' => [
-                    'plugin_fields_containers_id' => (int) $container['id'], 'is_active' => 1, 'type' => 'text'], 'LIMIT' => 33]) as $field) {
+                if (($child['itemtype'] ?? '') !== 'Computer' || (int) ($child['plugin_fields_containers_id'] ?? 0) !== (int) $container['id']) {
+                    if ($version === 2) { throw new \RuntimeException('Fields row identity changed.'); }
+                    continue;
+                }
+                foreach ($definitions as $field) {
                     $column = $field['name'];
                     if (!preg_match('/^[a-z][a-z0-9_]*$/D', $column) || !array_key_exists($column, $child)) {
+                        if ($version === 2) { throw new \RuntimeException('Fields column is unavailable.'); }
                         continue;
                     }
                     $matches = array_filter($options, static fn ($option): bool => is_array($option)
                         && ($option['table'] ?? '') === $container['table'] && ($option['field'] ?? '') === $column);
                     if (count($matches) !== 1) {
+                        if ($version === 2) { throw new \RuntimeException('Fields metadata is missing or ambiguous.'); }
                         continue;
                     }
+                    $option = reset($matches);
+                    if (($field['type'] === 'yesno' && ($option['datatype'] ?? '') !== 'bool')
+                        || ($field['type'] === 'date' && ($option['datatype'] ?? '') !== 'date')) {
+                        throw new \RuntimeException('Fields definition and search type disagree.');
+                    }
                     $key = 'Computer.' . $container['class'] . '.' . $column;
-                    $fields[$key] = ['key' => $key, 'label' => $container['label'] . ' - ' . $field['label'],
-                        'type' => 'text', 'group' => 'Custom', 'option' => (int) array_key_first($matches),
+                    $fields[$key] = ['key' => $key, 'label' => $version === 1 ? $container['label'] . ' - ' . $field['label'] : $option['name'],
+                        'type' => $field['type'], 'group' => 'Custom', 'option' => (int) array_key_first($matches),
                         'container' => (int) $container['id'], 'field' => (int) $field['id'], 'child' => (int) $child['id'],
                         'metadata' => self::hash([$container, $field, (int) $child['id'], $matches]),
-                        'value' => (string) ($child[$column] ?? '')];
+                        'value' => self::normalizeValue($field['type'], $child[$column])];
                     if (count($fields) > 32) {
                         throw new \RuntimeException('Scoped metadata budget exceeded.');
                     }
@@ -119,13 +156,14 @@ final class TaskExecutor
             self::validate($task, $settings);
             self::configuration($settings);
             return ServiceContext::run($settings, static function () use ($task, $settings, &$changed, &$attempted): array {
-                $before = self::snapshot($settings);
+                $before = self::snapshot($settings, $task['version']);
                 if ($task['serial'] !== '' && $before['serial'] !== $task['serial']) {
                     return ['outcome' => 'stale', 'changed' => []];
                 }
                 foreach ($task['changes'] as $key => $change) {
                     $field = $before['fields'][$key] ?? null;
-                    if (!$field || $field['metadata'] !== $change['metadata'] || $field['value'] !== $change['expected']) {
+                    if (!$field || $field['type'] !== ($change['type'] ?? 'text')
+                        || $field['metadata'] !== $change['metadata'] || $field['value'] !== $change['expected']) {
                         return ['outcome' => 'stale', 'changed' => []];
                     }
                 }
@@ -134,14 +172,15 @@ final class TaskExecutor
                     self::validate($task, $settings);
                     self::configuration($settings);
                     // InnoDB row/range locks keep the existing parent and child present through the model call.
-                    // Official Fields 1.24.5 does not start or commit its own transaction here.
+                    // Official Fields 1.24.2/1.24.4/1.24.5 do not start or commit a transaction here.
                     global $DB;
                     Outbox::sql('START TRANSACTION');
                     try {
                     self::lockRows($settings);
-                    $fresh = self::snapshot($settings);
+                    $fresh = self::snapshot($settings, $task['version']);
                     $field = $fresh['fields'][$key] ?? null;
-                    if (!$field || $fresh['serial'] !== $before['serial'] || $field['metadata'] !== $change['metadata']
+                    if (!$field || $field['type'] !== ($change['type'] ?? 'text')
+                        || $fresh['serial'] !== $before['serial'] || $field['metadata'] !== $change['metadata']
                         || $field['value'] !== $change['expected']) {
                         Outbox::sql('ROLLBACK');
                         return ['outcome' => $changed === [] ? 'stale' : 'partial', 'changed' => $changed];
@@ -152,8 +191,8 @@ final class TaskExecutor
                     }
                     $computer = ServiceContext::computer($settings);
                     $history = \Log::getHistoryData($computer, 0, 100);
-                    $attempted = true;
                     if (in_array($key, ['name', 'comment'], true)) {
+                        $attempted = true;
                         $ok = $computer->update(['id' => $task['computer_id'], $key => $change['value']]);
                     } else {
                         $container = new \PluginFieldsContainer();
@@ -161,10 +200,25 @@ final class TaskExecutor
                         if (!$container->getFromDB($field['container']) || !$definition->getFromDB($field['field'])) {
                             throw new \RuntimeException('Fields metadata disappeared.');
                         }
+                        if ($field['type'] === 'date' && $change['value'] === '') {
+                            $mandatory = !empty($definition->fields['mandatory']);
+                            $statusField = \PluginFieldsStatusOverride::getStatusFieldName('Computer');
+                            foreach (\PluginFieldsStatusOverride::getOverridesForItemtypeAndStatus($field['container'], 'Computer',
+                                (int) $computer->fields[$statusField]) as $override) {
+                                if ((int) $override['plugin_fields_fields_id'] === $field['field']) { $mandatory = !empty($override['mandatory']); }
+                            }
+                            // These Fields versions also enforce the base flag in their model validator.
+                            if ($mandatory || !empty($definition->fields['mandatory'])) {
+                                throw new \RuntimeException('Mandatory date cannot be cleared.');
+                            }
+                        }
+                        // GLPI loosely compares NULL and integer zero; string "0" forces the real update.
+                        $value = $field['type'] === 'yesno' && $change['value'] === 0 ? '0' : $change['value'];
+                        $attempted = true;
                         $ok = $container->updateFieldsValues(['items_id' => $task['computer_id'], 'itemtype' => 'Computer',
-                            'plugin_fields_containers_id' => $field['container'], $definition->fields['name'] => $change['value']], 'Computer', false);
+                            'plugin_fields_containers_id' => $field['container'], $definition->fields['name'] => $value], 'Computer', false);
                     }
-                    $after = self::snapshot($settings);
+                    $after = self::snapshot($settings, $task['version']);
                     if (!$ok || ($after['fields'][$key]['value'] ?? null) !== $change['value']
                         || ($after['fields'][$key]['metadata'] ?? null) !== $field['metadata']) {
                         throw new \RuntimeException('Model readback failed.');
@@ -176,10 +230,14 @@ final class TaskExecutor
                         throw new \RuntimeException('Named parent history missing.');
                     }
                     $log = Outbox::one('SELECT * FROM `glpi_logs` WHERE `id` = ' . (int) array_values($named)[0]['id']);
+                    // Generated Fields models may retain blank; date-aware models use the SQL NULL sentinel.
+                    $newHistoryValues = $field['type'] === 'date' && $change['value'] === ''
+                        ? ['', 'NULL'] : [self::historyValue($change['value'], $field['type'])];
                     // GLPI renders Comments as "Update of the field"; compare official raw audit values.
                     if (!$log || (int) $log['id_search_option'] !== $field['option'] || $log['itemtype'] !== 'Computer'
                         || (int) $log['items_id'] !== $task['computer_id'] || $log['itemtype_link'] !== '' || (int) $log['linked_action'] !== 0
-                        || $log['old_value'] !== self::historyValue($field['value']) || $log['new_value'] !== self::historyValue($change['value'])) {
+                        || $log['old_value'] !== self::historyValue($field['value'], $field['type'])
+                        || !in_array($log['new_value'], $newHistoryValues, true)) {
                         throw new \RuntimeException('Named parent history values mismatch.');
                     }
                     Outbox::sql('COMMIT');
@@ -190,7 +248,7 @@ final class TaskExecutor
                         throw $error;
                     }
                 }
-                return ['outcome' => $changed === [] ? 'unchanged' : 'verified', 'changed' => $changed, 'snapshot' => self::snapshot($settings)];
+                return ['outcome' => $changed === [] ? 'unchanged' : 'verified', 'changed' => $changed, 'snapshot' => self::snapshot($settings, $task['version'])];
             });
         } catch (\Throwable) {
             return ['outcome' => $attempted ? 'uncertain' : ($changed !== [] ? 'partial' : 'blocked'), 'changed' => $changed];
@@ -228,8 +286,9 @@ final class TaskExecutor
         }
     }
 
-    private static function historyValue(string $value): string
+    private static function historyValue(string|int $value, string $type = 'text'): string
     {
+        if ($type === 'yesno') { $value = \Dropdown::getYesNo($value); }
         $decoded = json_decode($value);
         return is_array($decoded) || is_object($decoded) ? '' : mb_substr($value, 0, 255);
     }
