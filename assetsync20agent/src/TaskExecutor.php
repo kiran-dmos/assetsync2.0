@@ -16,19 +16,21 @@ final class TaskExecutor
         $hash = $task['hash'] ?? '';
         unset($task['hash']);
         $keys = ['version', 'id', 'kind', 'installation', 'registration', 'generation', 'connection_id', 'computer_id', 'entity_id', 'serial', 'policy', 'expires', 'changes'];
-        if (in_array($task['version'] ?? null, [3, 4], true)) {
+        if (in_array($task['version'] ?? null, [3, 4, 5], true)) {
             $keys = array_values(array_diff($keys, ['computer_id']));
             $keys = array_merge($keys, ['pair_id', 'itemtype', 'items_id']);
             if (($task['kind'] ?? '') === 'discover') { $keys[] = 'filter'; }
         }
-        if (($task['version'] ?? null) === 4) { $keys[] = 'identity'; }
+        if (in_array($task['version'] ?? null, [4, 5], true)) { $keys[] = 'identity'; }
+        if (($task['version'] ?? null) === 5) { $keys = array_merge($keys, ['seed', 'prerequisites']); }
         if (array_diff(array_keys($task), $keys) !== [] || array_diff($keys, array_keys($task)) !== []) {
             throw new \RuntimeException('Unknown task schema.');
         }
         if (!is_string($hash) || !hash_equals(self::hash($task), $hash)
-            || !in_array($task['version'] ?? null, [1, 2, 3, 4], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
-            || !in_array($task['kind'] ?? '', $task['version'] === 4 ? ['inspect', 'apply', 'match', 'reverify']
-                : ($task['version'] === 3 ? ['inspect', 'apply', 'discover'] : ['inspect', 'apply']), true)
+            || !in_array($task['version'] ?? null, [1, 2, 3, 4, 5], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
+            || !in_array($task['kind'] ?? '', $task['version'] === 5 ? ['prepare_create', 'create', 'confirm_create']
+                : ($task['version'] === 4 ? ['inspect', 'apply', 'match', 'reverify']
+                : ($task['version'] === 3 ? ['inspect', 'apply', 'discover'] : ['inspect', 'apply'])), true)
             || !is_int($task['expires'] ?? null) || ($execution && ($task['expires'] < time()
             || $task['expires'] > time() + 3600)) || !is_array($task['changes'] ?? null)
             || count($task['changes']) > 32) {
@@ -43,12 +45,14 @@ final class TaskExecutor
             || ($task['kind'] !== 'apply' && $task['changes'] !== [])) {
             throw new \RuntimeException('Task target mismatch.');
         }
-        if ($task['version'] === 4 && (!is_array($task['identity']) || self::identity($task['identity']) !== $task['identity'])) {
+        if ($task['version'] >= 4 && (!is_array($task['identity']) || self::identity($task['identity']) !== $task['identity'])) {
             throw new \RuntimeException('Invalid v4 identity guard.');
         }
         if ($task['version'] >= 3) {
             TargetScope::model($task['itemtype']);
-            if (in_array($task['kind'], ['match', 'reverify'], true)) {
+            if ($task['version'] === 5) {
+                Creation::validate($task);
+            } elseif (in_array($task['kind'], ['match', 'reverify'], true)) {
                 if ($task['pair_id'] !== '' || !is_int($task['items_id'])
                     || ($task['kind'] === 'match' ? $task['items_id'] !== 0 : $task['items_id'] <= 0)
                     || $task['serial'] !== '' || $task['identity'] === ['serial' => '', 'otherserial' => '']) {
@@ -221,6 +225,7 @@ final class TaskExecutor
             }
             self::configuration($settings, $task['version'] < 3);
             return ServiceContext::run($settings, static function () use ($task, $settings, &$changed, &$attempted): array {
+                if ($task['version'] === 5) { return Creation::execute($task, $settings); }
                 if ($task['kind'] === 'discover') {
                     return ['outcome' => 'unchanged', 'changed' => [], 'discovery' => self::discover($task, $settings)];
                 }
@@ -335,7 +340,7 @@ final class TaskExecutor
         }
     }
 
-    private static function matchEvidence(array $task, array $settings): array
+    public static function matchEvidence(array $task, array $settings): array
     {
         global $DB;
         // Even a zero-result lookup needs fresh explicit entity and type authorization.
@@ -462,7 +467,7 @@ final class TaskExecutor
         return $page;
     }
 
-    private static function historyValue(string|int $value, string $type = 'text'): string
+    public static function historyValue(string|int $value, string $type = 'text'): string
     {
         if ($type === 'yesno') { $value = \Dropdown::getYesNo($value); }
         $decoded = json_decode($value);

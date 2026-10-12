@@ -22,7 +22,7 @@ class Printer extends Computer
 {
     public static array $unreadable = [];
     public static function getTable(): string { return 'glpi_printers'; }
-    public function can($id, $right): bool { return !in_array($id, self::$unreadable, true) && parent::can($id, $right); }
+    public function can($id, $right, ?array &$input = null): bool { return !in_array($id, self::$unreadable, true) && parent::can($id, $right, $input); }
 }
 class PluginFieldsPrinterscalar extends PluginFieldsComputerscalar
 {

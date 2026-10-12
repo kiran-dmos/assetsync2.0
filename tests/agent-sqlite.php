@@ -39,6 +39,8 @@ final class AgentSqlite
             return $this->pdo->query('SELECT 1 AS ' . ($m[1] === 'GET_LOCK' ? 'acquired' : 'released'));
         }
         if ($sql === 'START TRANSACTION') { return $this->pdo->beginTransaction(); }
+        // SQLite cannot model InnoDB snapshots; actual lock contention is tested in the isolated lab.
+        if ($sql === 'SET TRANSACTION ISOLATION LEVEL READ COMMITTED') { return true; }
         if ($sql === 'COMMIT') { return $this->pdo->commit(); }
         if ($sql === 'ROLLBACK') { return $this->pdo->rollBack(); }
         if (preg_match('/^SHOW INDEX FROM `([^`]+)` WHERE Key_name = \'([^\']+)\' AND Seq_in_index = (\d+)$/', $sql, $match)) {

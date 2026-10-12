@@ -52,6 +52,14 @@ final class TaskJournal
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
             $result = TaskExecutor::execute($task, $settings);
         }
+        if ($task['version'] === 5 && $task['kind'] === 'create') {
+            // Creation writes its successful result in the same transaction as the model add.
+            // A failed/ambiguous COMMIT must not report inferred success from an in-memory result.
+            $saved = Outbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($id));
+            if (!$saved) { throw new \RuntimeException('Creation journal disappeared.'); }
+            if ($saved['result'] !== '{}') { return json_decode($saved['result'], true, 32, JSON_THROW_ON_ERROR); }
+            if ($result['outcome'] === 'verified') { $result = ['outcome' => 'uncertain', 'changed' => []]; }
+        }
         Outbox::sql('START TRANSACTION');
         try {
             if (!$DB->update(self::TABLE, ['state' => $result['outcome'], 'result' => json_encode($result, JSON_THROW_ON_ERROR)], ['id' => $id, 'result' => '{}'])) {
@@ -106,7 +114,7 @@ final class TaskJournal
     public static function send(array $settings, array $payload, int $deadline): array
     {
         if (!Settings::validEndpoint($settings['endpoint'] ?? '') || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
-        if (($payload['kind'] ?? '') === 'pull') { $payload['task_versions'] = [1, 2, 3, 4]; }
+        if (($payload['kind'] ?? '') === 'pull') { $payload['task_versions'] = [1, 2, 3, 4, 5]; }
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $payload[$key] = $settings[$key]; }
         $encoded = json_encode($payload, JSON_THROW_ON_ERROR);
         if (strlen($encoded) > 65536) { throw new \RuntimeException('Task body exceeds limit.'); }

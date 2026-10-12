@@ -9,22 +9,93 @@ listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
+### Automatic Creation (Protocol V5)
+
+Upgrade **B agent 0.5.0 first, then A controller 0.6.0**, with both workers stopped,
+using GLPI's plugin Update action. B advertises `task_versions: [1,2,3,4,5]`;
+A withholds creation tasks from older agents and shows an upgrade requirement.
+There are no new configuration switches or creation-specific database columns.
+Existing eligible routes authorize automatic creation after complete no-match.
+Preserve all retained task/journal bodies, hashes, results and outstanding slots.
+Versions 1-4 keep their wire formats and replay behavior.
+
+Only Computer and Printer are supported. Both native identity lookups must be
+complete and empty, and every supplied A identifier must be locally unique.
+Missing metadata, denied reads, timeouts, duplicates and conflicting identifiers
+never authorize creation. A first sends a read-only `prepare_create` task. B reads
+fresh native/Fields metadata without requiring an existing parent or child row.
+The subsequent `create` task must match that prerequisite fingerprint and repeat
+the complete no-match lookup before adding anything. If an existing B asset appears,
+A returns to ordinary independent matching; that asset is never seeded.
+
+For a brand-new B asset only, initialization copies **every mapped A value once**,
+including mappings whose authority is B. Supported mapped fields are native Name
+and Comments and Fields text, yesno and date. No other A asset columns are copied;
+the target entity and native serial/inventory identity come from the captured route
+and source identity. Conflicting seeds for one B field are rejected. After independent
+confirmation, normal mapping authority applies immediately, including B-to-A writes.
+
+B uses its real service login and fresh CREATE/READ/UPDATE, exact nonrecursive entity
+grant and container rights. It validates all applicable mandatory definitions and
+status overrides, including unsupported required fields, before writing. Supported
+unmapped Fields values use validated configured defaults, or blank text/date and
+zero yesno when no default exists. Required unsupported values block creation.
+Initialization writes complete container values together using the normal
+`PluginFieldsContainer::updateFieldsValues(..., false)` and generated child model.
+Readonly Fields retain the existing agent policy; profile/container rights and
+mandatory checks remain enforced. Normal updates still require existing child rows.
+
+B commits its executing journal marker before mutation. Normal parent `add()`,
+custom child initialization, official History and the result containing the created
+B ID share one transaction. Parent creation requires `HISTORY_CREATE_ITEM`; custom
+creation History is verified for nonempty values. Blank values and zero do not
+require nonexistent Fields creation entries. A savepoint detects unexpected model
+or plugin commits; these become uncertain rather than inferred success. A returned
+model ID is retained as `attempted_id` when available; it does not prove that the
+parent survived rollback. On a lost
+COMMIT acknowledgement, only a reread durable result proves creation succeeded.
+An interrupted executing creation is never run again.
+
+A retains a delivered creation across expiry and accepts its original late durable
+result without issuing another add. It then publishes a separate read-only
+`confirm_create`, requiring fresh B identity/snapshot and unchanged A source,
+mapping, binding and route before committing the link. Mapped A child rows are
+locked through confirmation. Creation confirmation uses transaction-local READ
+COMMITTED so a child edit committed while waiting for its lock cannot be hidden by
+an earlier repeatable-read snapshot. Changed A values leave the created ID retained for
+review, without reseeding or recreating. Read-only prerequisite/confirmation tasks
+can renew on expiry; a create can renew only when a locked reread proves it was
+never delivered. Uncertain operations retain their slots for investigation.
+
+Activity distinguishes **Created B; awaiting confirmation** from confirmed linkage
+and completed synchronization. Creation does not bypass the normal inspect/apply,
+billing and authority cycle. Do not delete retained uncertain operations to retry.
+Host SQLite tests cover protocol and failure paths, but cannot prove InnoDB locking.
+Isolated GLPI 11.0.7 / Fields A 1.24.2 and B 1.24.4 / MySQL 8.4 verification covered normal tab/DOM
+creation, defaults, History, authority transitions, physical pre/post-commit crashes,
+late HTTPS results and concurrent confirmation edits. This does not establish an
+atomic claim against external human/inventory writers: a new duplicate after the
+lookup must still fail independent confirmation. Arbitrary third-party hook side
+effects and MariaDB concurrency were not verified by that lab.
+
 ### Automatic Pairing (Protocol V4)
 
-Upgrade **B agent 0.4.0 first, then A controller 0.5.0**, with both workers stopped.
+V4 was introduced in **B agent 0.4.0 and A controller 0.5.0**. For current upgrade
+versions use the v5 procedure above, with both workers stopped.
 Use GLPI's plugin Update action for each version. The new B code must accept
 v4 before A resumes its scanner. A's versioned Update runs the additive migration so
 `agentpairs.identity_basis` exists before resuming A. Its nullable JSON text column
 is the only new storage field; NULL retains legacy serial semantics. Do not rewrite
 retained v1-v3 task bodies, hashes, results, journal entries or uncertain work.
 Existing manual/confirmed pairs continue their original protocol behavior.
-New B pulls advertise `task_versions: [1,2,3,4]`. A withholds v4 tasks from older
+V4-capable B pulls advertise `task_versions: [1,2,3,4]`. A withholds v4 tasks from older
 pulls and records a visible upgrade requirement without changing task bytes.
 There is no automatic downgrade or REST fallback.
 
 The existing bounded A scanner queues unpaired Computer/Printer assets on exactly
 one active, nonrecursive, single-type route with explicit source and target entities.
-It never creates an asset. Existing links and manual candidates are preserved.
+The matching tasks never create an asset; complete no-match starts the separate v5
+creation chain described above. Existing links and manual candidates are preserved.
 Hooks and page loads do not start matching or network requests. B supplies native
 read-only evidence through the existing task transport; A makes every decision.
 
@@ -33,7 +104,7 @@ Only blank serial or a complete zero-result serial lookup permits native invento
 number (`otherserial`) fallback. Duplicate inventory numbers block fallback, as do
 contradictory nonblank A/B serials. A identities are checked for duplicates before
 assignment, including assets already paired, so worker order cannot choose a winner.
-Names, numeric IDs, UUID equality, REST discovery and asset creation are not used.
+Names, numeric IDs, UUID equality and REST discovery are not matching criteria.
 
 V4 trims ASCII spaces at the ends only and compares exact case-sensitive bytes.
 `0`, leading zeros, punctuation and internal whitespace remain significant. Missing
@@ -75,7 +146,7 @@ fixture columns; they do not prove live MySQL collation, InnoDB concurrency or s
 ### Installation And Automatic Pairing
 
 Stop both workers, including scheduled runs, before upgrading AssetSync. Install
-the B agent code first (0.4.0), then the A controller code (0.5.0),
+the B agent code first (0.5.0), then the A controller code (0.6.0),
 using GLPI's plugin Update action when upgrading from older installed versions.
 New task/pair/journal tables and columns are additive. Existing connections default
 to REST and retain their existing behavior. This is an AssetSync upgrade only;
@@ -114,11 +185,19 @@ upgrade to expose Yes/No and Date fields in the mapping catalog.
    Run A and B workers. A's scanner automatically queues eligible unpaired assets;
    B supplies exact identity evidence, then a fresh reverify before A confirms them.
    Manual selection/save/confirm is **not required** for automatic matching.
-   No asset is created, moved or relinked. Existing candidates and links remain intact.
+   Complete authorized no-match starts v5 creation using the saved supported mappings,
+   followed by independent confirmation. Existing assets are not moved or relinked;
+   existing candidates and links remain intact.
 7. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
    Custom endpoint types must match. Each mapping must use
    `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
    stored B observation; explicit refresh queues a fresh inspection without REST.
+
+Automatic creation uses existing saved mappings. The mapping UI still requires an
+accessible, scoped B pair observation less than one hour old to populate its field
+catalog. An empty, previously unconfigured B has no such catalog: automatic creation
+does not provide cold-start mapping setup. Establish and inspect a suitable pair
+before configuring mappings; registration alone does not supply field metadata.
    An initial automatic pair provides the stored B metadata when configuring new
    custom mappings. Run A and B workers independently using the commands below;
    confirmed pairs then synchronize according to those mappings.
@@ -173,7 +252,7 @@ an old database NULL has blank history text. A reuses FieldsText
 normalization and its existing model writer. Both writers preserve NULL-to-zero
 Yes/No updates despite GLPI's loose comparison.
 
-Creation, types other than Computer and Printer, recursive/inherited-only grants, Both, dropdowns,
+Types other than Computer and Printer, recursive/inherited-only grants, Both, dropdowns,
 textarea, number, datetime, other native fields and UUID mutation are unsupported
 in agent-only mode. The separate UUID service
 returns `unsupported_agent` before any mutation/REST for agent participation,
@@ -252,7 +331,7 @@ independent verification on those installed versions remains required.
 
 ## REST Notification Mode Setup
 
-1. After upgrading B first as described above, upgrade/install controller version **0.5.0** as `plugins/assetsync20` on A using GLPI's
+1. After upgrading B first as described above, upgrade/install controller version **0.6.0** as `plugins/assetsync20` on A using GLPI's
    plugin installer. This adds registration/receipt tables, confirmed-link
    evidence, queue revision counters and claim tokens. Stop workers during the
    schema upgrade, including cron, and run GLPI's plugin **Update** action (not
@@ -384,6 +463,7 @@ Offline checks:
 ```sh
 php tests/agent-prototype.php
 php tests/agent-http.php
+php tests/agent-auto-create.php
 php tests/queue-notifications.php
 ```
 

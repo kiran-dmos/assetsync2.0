@@ -9,6 +9,7 @@ require_once __DIR__ . '/../src/autoload.php';
 require_once __DIR__ . '/../assetsync20agent/src/autoload.php';
 define('READ', 1);
 define('UPDATE', 2);
+define('CREATE', 4);
 
 class ScalarDB
 {
@@ -130,13 +131,33 @@ class Computer
     public array $fields = [];
     public static bool $allowUpdate = true;
     public static bool $allowRead = true;
+    public static bool $allowCreate = false;
+    public static int $adds = 0;
+    public static ?Closure $afterAdd = null;
     public function getFromDB($id): bool
     {
         global $DB;
         $this->fields = $DB->firstRow(static::getTable(), ['id' => $id]) ?? [];
         return $this->fields !== [];
     }
-    public function can($id, $right): bool { return ($right !== READ || self::$allowRead) && ($right !== UPDATE || self::$allowUpdate) && $this->getFromDB($id); }
+    public function can($id, $right, ?array &$input = null): bool
+    {
+        if ($right === CREATE) { return self::$allowCreate; }
+        return ($right !== READ || self::$allowRead) && ($right !== UPDATE || self::$allowUpdate) && $this->getFromDB($id);
+    }
+    public function add(array $input): int
+    {
+        global $DB;
+        if (!self::$allowCreate) { throw new LogicException('Unexpected parent creation'); }
+        self::$adds++;
+        $id = (int) $DB->sql->pdo->query('SELECT COALESCE(MAX(id),0)+1 FROM ' . static::getTable())->fetchColumn();
+        $DB->insert(static::getTable(), ['id' => $id] + $input + ['name' => '', 'comment' => '', 'states_id' => 0]);
+        $DB->insert('glpi_logs', ['items_id' => $id, 'itemtype' => static::class, 'id_search_option' => 0,
+            'itemtype_link' => '0', 'linked_action' => Log::HISTORY_CREATE_ITEM, 'field' => 'Creation',
+            'user_name' => User::getNameForLog(Session::getLoginUserID()), 'old_value' => '', 'new_value' => '']);
+        if (self::$afterAdd) { (self::$afterAdd)($id); }
+        return $id;
+    }
     public function update(array $input): bool
     {
         global $DB;
@@ -211,7 +232,7 @@ class PluginFieldsContainer
         if (self::$fault === 'ignore') { return true; }
         $class = self::getClassname($type, 'scalars');
         $row = new $class();
-        if (!$row->getFromDBByCrit(['items_id' => $input['items_id']])) { throw new LogicException('Unexpected child creation'); }
+        if (!$row->getFromDBByCrit(['items_id' => $input['items_id']])) { return $row->add($input); }
         return $row->update(['id' => $row->fields['id']] + $input);
     }
 }
@@ -250,10 +271,25 @@ class PluginFieldsComputerscalar
         }
         return true;
     }
-    public function add($input): never { throw new LogicException('Unexpected child creation'); }
+    public function add($input): bool
+    {
+        global $DB;
+        if (!Computer::$allowCreate) { throw new LogicException('Unexpected child creation'); }
+        unset($input['entities_id']);
+        $input += ['id' => $input['items_id'], 'textfield' => null, 'yesfield' => 0, 'datefield' => null];
+        if (!$DB->insert(static::getTable(), $input)) { return false; }
+        foreach ($DB->request(['FROM' => 'glpi_plugin_fields_fields', 'WHERE' => ['plugin_fields_containers_id' => $input['plugin_fields_containers_id']]]) as $field) {
+            $value = $input[$field['name']] ?? null;
+            if (empty($value) || PluginFieldsContainer::$fault === 'history_missing') { continue; }
+            Log::record($input['items_id'], $field['name'], $field['type'] === 'yesno' ? '' : 'N/A',
+                $field['type'] === 'yesno' ? Dropdown::getYesNo($value) : $value, $input['itemtype']);
+        }
+        return true;
+    }
 }
 class Log
 {
+    public const HISTORY_CREATE_ITEM = 20;
     public static function record(int $id, string $column, mixed $old, mixed $new, string $type = 'Computer'): void
     {
         global $DB;
@@ -287,6 +323,9 @@ function scalarSetup(): array
     User::$active = true;
     Computer::$allowUpdate = true;
     Computer::$allowRead = true;
+    Computer::$allowCreate = false;
+    Computer::$adds = 0;
+    Computer::$afterAdd = null;
     Session::$entityAccess = true;
     PluginFieldsComputerscalar::$ignoreUpdate = false;
     PluginFieldsComputerscalar::$dateNullSentinel = true;

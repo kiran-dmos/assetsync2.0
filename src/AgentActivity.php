@@ -84,6 +84,17 @@ final class AgentActivity
                 };
                 $queue = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `id` = ' . (int) $task['queue_id']);
                 if ($queue && !$task['slot'] && $state === 'blocked') { $label .= ': ' . $queue['last_error']; }
+                if ($body['version'] === 5) {
+                    $result = json_decode($task['result'], true);
+                    $createdId = $result['created_id'] ?? $context['created']['items_id'] ?? null;
+                    $label = $state === 'matched' ? 'Created and confirmed; synchronization pending'
+                        : ($createdId ? 'Created B #' . $createdId . '; awaiting confirmation'
+                            : 'Creation ' . $state);
+                    if (isset($result['attempted_id'])) { $label = 'Uncertain creation; B model returned #' . (int) $result['attempted_id']; }
+                    if ($queue && $task['slot'] && in_array($state, ['blocked', 'stale', 'uncertain'], true)) {
+                        $label .= ': ' . $queue['last_error'];
+                    }
+                }
             }
             echo '<tr><td>' . $html($task['id']) . '</td><td>' . $html($pair['itemtype']) . ' #' . (int) $pair['local_id'] . '</td><td>'
                 . $html($label) . '</td><td>'

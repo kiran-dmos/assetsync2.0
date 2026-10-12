@@ -141,7 +141,8 @@ final class AgentTask
 
     public static function isMatch(array $body): bool
     {
-        return ($body['version'] ?? 0) === 4 && in_array($body['kind'] ?? '', ['match', 'reverify'], true);
+        return (($body['version'] ?? 0) === 4 && in_array($body['kind'] ?? '', ['match', 'reverify'], true))
+            || (($body['version'] ?? 0) === 5 && in_array($body['kind'] ?? '', ['prepare_create', 'create', 'confirm_create'], true));
     }
 
     public static function model(string $type): object
@@ -592,7 +593,12 @@ final class AgentTask
                     try {
                         if ($matching) {
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
-                            $policyCurrent = self::sameMatchScope(self::matchContext($binding['connection_id'], $body['itemtype'], $expected['local_id']), $expected['scope']);
+                            $currentScope = self::matchContext($binding['connection_id'], $body['itemtype'], $expected['local_id']);
+                            $policyCurrent = self::sameMatchScope($currentScope, $expected['scope']);
+                            if ($body['version'] === 5) {
+                                $sourceJob = ['glpi_b_connection_id' => $binding['connection_id'], 'itemtype' => $body['itemtype'], 'items_id' => $expected['local_id']];
+                                $policyCurrent = $policyCurrent && self::creationSourceGuard($sourceJob) === $expected['source']['guard'];
+                            }
                         } elseif ($body['kind'] !== 'discover') {
                             if (!$pair) { throw new \RuntimeException('Pair unavailable.'); }
                             self::scope($pair, $body['kind'] === 'apply' || (bool) $pair['confirmed']);
@@ -602,11 +608,19 @@ final class AgentTask
                             $policyCurrent = $expected['policy'] === self::policy($pair);
                         }
                     } catch (\Throwable) { $policyCurrent = false; }
-                    if (($body['version'] ?? 0) === 4 && !in_array(4, $request['task_versions'] ?? [], true)) {
+                    if (($body['version'] ?? 0) >= 4 && !in_array($body['version'], $request['task_versions'] ?? [], true)) {
                         if ($task['queue_id'] !== null) {
-                            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.'],
+                            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => $body['version'] === 5
+                                ? 'Creation waiting: upgrade B to agent 0.5.0 (protocol v5), then upgrade A.'
+                                : 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.'],
                                 ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
                         }
+                    } elseif ($body['version'] === 5 && ((int) $task['expires'] < time() || !$policyCurrent)) {
+                        // Do not synthesize a result that would conflict with B's late committed creation evidence.
+                        $state = $body['kind'] === 'create'
+                            ? ($task['state'] === 'executing' ? 'uncertain' : ($policyCurrent ? 'accepted' : 'blocked')) : 'stale';
+                        self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $task['id']]));
+                        self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
                     } elseif ((int) $task['expires'] < time() || !$policyCurrent) {
                         // A delivered task may have written before losing its result. Never issue another write.
                         $outcome = $task['state'] === 'executing' && $body['kind'] !== 'discover' && !$matching ? 'uncertain' : 'stale';
@@ -632,7 +646,7 @@ final class AgentTask
                     if (!$task || $task['id'] !== $saved['id']) { throw new \UnexpectedValueException('No matching outstanding task.'); }
                     try { self::validateResult($body, $result); }
                     catch (\RuntimeException $error) { throw new \UnexpectedValueException('Invalid task evidence.', 0, $error); }
-                    self::storeResult($saved, $result, (int) $saved['expires'] >= time());
+                    self::storeResult($saved, $result, $body['version'] === 5 || (int) $saved['expires'] >= time());
                 } elseif (self::hash(json_decode($saved['result'], true)) !== self::hash($result)) {
                     throw new \UnexpectedValueException('Conflicting result replay.');
                 }
@@ -700,6 +714,10 @@ final class AgentTask
 
     private static function validateResult(array $task, array $result): void
     {
+        if ($task['version'] === 5) {
+            self::validateCreationResult($task, $result);
+            return;
+        }
         if (self::isMatch($task)) {
             if ($result['changed'] !== []) { throw new \RuntimeException('Matching cannot write assets.'); }
             if (in_array($result['outcome'], ['verified', 'unchanged'], true)) {
@@ -752,6 +770,55 @@ final class AgentTask
         }
     }
 
+    private static function validateCreationResult(array $task, array $result): void
+    {
+        if ($result['changed'] !== []) { throw new \RuntimeException('Creation uses separate creation History evidence.'); }
+        if (isset($result['attempted_id']) && ($task['kind'] !== 'create' || $result['outcome'] !== 'uncertain'
+            || !is_int($result['attempted_id']) || $result['attempted_id'] <= 0)) {
+            throw new \RuntimeException('Invalid uncertain creation identity.');
+        }
+        if (isset($result['evidence']) && (!is_int($result['evidence']['observed_at'] ?? null)
+            || $result['evidence']['observed_at'] < $task['expires'] - 300 || $result['evidence']['observed_at'] > $task['expires'])) {
+            throw new \RuntimeException('Creation evidence is outside the task window.');
+        }
+        if (($result['existing'] ?? false) === true) {
+            if (!in_array($task['kind'], ['prepare_create', 'create'], true) || $result['outcome'] !== 'stale'
+                || isset($result['created_id'])) { throw new \RuntimeException('Invalid precreation match.'); }
+            self::chooseMatch($task['identity'], $result['evidence'] ?? []);
+            return;
+        }
+        if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) { return; }
+        if ($task['kind'] === 'prepare_create') {
+            if (!preg_match('/^[a-f0-9]{64}$/D', $result['prerequisites'] ?? '')
+                || !(self::chooseMatch($task['identity'], $result['evidence'] ?? [])['no_match'] ?? false)) {
+                throw new \RuntimeException('Incomplete creation prerequisites.');
+            }
+            return;
+        }
+        $snapshotTask = $task;
+        $snapshotTask['version'] = 4;
+        $snapshotTask['kind'] = $task['kind'] === 'confirm_create' ? 'reverify' : 'inspect';
+        if ($task['kind'] === 'create') {
+            if ($result['outcome'] !== 'verified' || !is_int($result['created_id'] ?? null) || $result['created_id'] <= 0
+                || !is_int($result['creation_history'] ?? null) || $result['creation_history'] <= 0
+                || !is_array($result['field_history'] ?? null)) { throw new \RuntimeException('Creation identity or audit evidence missing.'); }
+            $snapshotTask['items_id'] = $result['created_id'];
+        }
+        self::validateResult($snapshotTask, $result);
+        if ($task['kind'] === 'create') {
+            foreach ($task['seed'] as $key => $seed) {
+                if (($result['snapshot']['fields'][$key]['value'] ?? null) !== $seed['value']
+                    || ($result['snapshot']['fields'][$key]['type'] ?? '') !== $seed['type']) {
+                    throw new \RuntimeException('Created seed readback mismatch.');
+                }
+                if (!in_array($key, ['name', 'comment'], true) && !empty($seed['value'])
+                    && (!is_int($result['field_history'][$key] ?? null) || $result['field_history'][$key] <= 0)) {
+                    throw new \RuntimeException('Created custom field History missing.');
+                }
+            }
+        }
+    }
+
     /** Agent scalars are stricter than the shared writer; blank reads remain distinct from zero. */
     public static function normalizeValue(string $type, mixed $value, bool $authoritative = false): string|int
     {
@@ -796,16 +863,21 @@ final class AgentTask
 
     public static function context(array $pair): array
     {
+        $scope = self::scope($pair);
+        return self::mappingContext($pair, $scope['asset'], self::policy($pair));
+    }
+
+    private static function mappingContext(array $pair, array $asset, string $policy): array
+    {
         global $DB;
         // Agent results may arrive in a later profile or worker pass; metadata must be fresh.
         FieldMapping::endRunCache();
         FieldsText::endRunCache();
-        $scope = self::scope($pair);
         $type = $pair['itemtype'];
         \Glpi\Search\SearchOption::clearSearchOptionCache($type);
         $rows = FieldMapping::load($pair['connection_id'], $type);
         self::validateMappings($type, $rows);
-        $mappings = FieldMapping::syncMappings($pair['connection_id'], $type, $scope['asset']);
+        $mappings = FieldMapping::syncMappings($pair['connection_id'], $type, $asset);
         if ($mappings === []) { throw new \RuntimeException('No supported agent mappings.'); }
         $values = [];
         $metadata = [];
@@ -814,8 +886,9 @@ final class AgentTask
             $key = $mapping['glpi_a_field'];
             if (isset($values[$key])) { continue; }
             if (in_array($key, ['name', 'comment'], true)) {
+                if (!array_key_exists($key, $asset)) { throw new \RuntimeException('Local native field is unavailable.'); }
                 $types[$key] = 'text';
-                $values[$key] = (string) ($scope['asset'][$key] ?? '');
+                $values[$key] = (string) $asset[$key];
                 $metadata[$key] = NativeField::local($type, $key);
             } else {
                 $meta = FieldsText::customMetadata($type, [$key])[$key];
@@ -843,8 +916,8 @@ final class AgentTask
                 $metadata[$key] = self::hash([$meta, $container->fields, $definition->fields, (int) $child['id']]);
             }
         }
-        $context = ['policy' => self::policy($pair), 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings, 'types' => $types];
-        if (!empty($pair['identity_basis'])) { $context['identity'] = self::identity($scope['asset']); }
+        $context = ['policy' => $policy, 'metadata' => self::hash($metadata), 'values' => $values, 'mappings' => $mappings, 'types' => $types];
+        if (!empty($pair['identity_basis'])) { $context['identity'] = self::identity($asset); }
         return $context;
     }
 
@@ -968,6 +1041,8 @@ final class AgentTask
         global $DB;
         $task = self::matchTask($connection, $type, $id);
         if ($task) {
+            $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            if ($body['version'] === 5 && !in_array($task['state'], ['accepted', 'executing'], true)) { return false; }
             if ((int) $task['expires'] < time()) {
                 self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'],
                     ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
@@ -1012,7 +1087,7 @@ final class AgentTask
         if (count($serial) === 1) { return ['outcome' => 'Unique serial match.', 'candidate' => $serial[0], 'method' => 'serial']; }
         if (!$evidence['lookup_complete']['otherserial']) { return ['outcome' => 'Inventory lookup incomplete; matching blocked. ' . ($evidence['lookup_errors']['otherserial'] ?? '')]; }
         if (count($inventory) > 1) { return ['outcome' => 'Duplicate B inventory number; matching blocked.']; }
-        if ($inventory === []) { return ['outcome' => 'No exact native identity match.']; }
+        if ($inventory === []) { return ['outcome' => 'No exact native identity match.', 'no_match' => true]; }
         if ($identity['serial'] !== '' && $inventory[0]['serial'] !== '' && $identity['serial'] !== $inventory[0]['serial']) {
             return ['outcome' => 'Conflicting serials on inventory candidate; matching blocked.'];
         }
@@ -1051,6 +1126,10 @@ final class AgentTask
     {
         global $DB;
         $task = self::matchTask($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id']);
+        if ($task && json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR)['version'] === 5) {
+            self::processCreation($job, $task);
+            return;
+        }
         try {
             $other = AgentInbox::one('SELECT `id` FROM `' . self::TABLE . '` WHERE `queue_id` = ' . (int) $job['id']
                 . ' AND `slot` IS NOT NULL AND `id` <> ' . $DB->quote($task['id'] ?? '') . ' LIMIT 1');
@@ -1072,6 +1151,11 @@ final class AgentTask
             }
             self::validateResult($body, $result);
             $choice = self::chooseMatch($scope['identity'], $result['evidence']);
+            if (($choice['no_match'] ?? false) === true) {
+                $source = self::creationSource($job, $scope);
+                self::publishCreation($job, $scope, $task, 'prepare_create', $source);
+                return;
+            }
             if (!isset($choice['candidate'])) { throw new \RuntimeException($choice['outcome']); }
             if ($scope['local_counts'][$choice['method']] !== 1) { throw new \RuntimeException('Duplicate local identity; automatic matching blocked.'); }
             $candidate = $choice['candidate'];
@@ -1106,6 +1190,12 @@ final class AgentTask
     private static function confirmMatch(array $job, array $task, array $scope, array $choice, array $snapshot): void
     {
         global $DB;
+        $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+        if (isset($expected['source'])) {
+            // Only this transaction: after waiting for child locks, read the committed edit,
+            // not an earlier repeatable-read snapshot. The row locks remain held to COMMIT.
+            AgentInbox::sql('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+        }
         AgentInbox::sql('START TRANSACTION');
         try {
             AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
@@ -1113,6 +1203,13 @@ final class AgentTask
             if (!AssetSyncQueue::owns($job) || (int) $task['expires'] < time()
                 || !self::sameMatchScope($fresh, $scope) || $fresh['local_counts'][$choice['method']] !== 1) {
                 throw new \RuntimeException('Fresh local matching scope or claim changed.');
+            }
+            if (isset($expected['source'])) {
+                self::lockLocalRows(['itemtype' => $job['itemtype'], 'local_id' => (int) $job['items_id']],
+                    array_keys($expected['source']['context']['values']));
+                if (self::creationSource($job, $fresh) !== $expected['source']) {
+                    throw new \RuntimeException('Creation source changed before link confirmation; created identity retained.');
+                }
             }
             $candidate = $choice['candidate'];
             $reverse = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
@@ -1144,6 +1241,191 @@ final class AgentTask
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching queue ownership changed.'); }
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    /** Capture every mapped A value, including B-authority values, for new-item initialization only. */
+    private static function creationSource(array $job, array $scope): array
+    {
+        foreach ($scope['identity'] as $column => $value) {
+            if ($value !== '' && $scope['local_counts'][$column] !== 1) {
+                throw new \RuntimeException('Creation requires unique local identifiers.');
+            }
+        }
+        $item = self::model($job['itemtype']);
+        if (!$item->getFromDB((int) $job['items_id'])) { throw new \RuntimeException('Creation source unavailable.'); }
+        $pair = ['itemtype' => $job['itemtype'], 'connection_id' => $job['glpi_b_connection_id'],
+            'local_id' => (int) $job['items_id'], 'local_entity' => $scope['local_entity']];
+        $context = self::mappingContext($pair, $item->fields, self::hash([$scope,
+            FieldMapping::load($pair['connection_id'], $pair['itemtype'])]));
+        $seed = [];
+        foreach ($context['mappings'] as $mapping) {
+            $key = $mapping['glpi_a_field'];
+            $type = $context['types'][$key];
+            $value = self::normalizeValue($type, $context['values'][$key], true);
+            if (is_string($value) && strlen($value) > 16384) { throw new \RuntimeException('Creation seed exceeds field budget.'); }
+            $destination = $mapping['glpi_b_field'];
+            $entry = ['type' => $type, 'value' => $value];
+            if (isset($seed[$destination]) && $seed[$destination] !== $entry) {
+                throw new \RuntimeException('Conflicting initialization values target the same B field.');
+            }
+            $seed[$destination] = $entry;
+        }
+        if (count($seed) > 32) { throw new \RuntimeException('Creation mapping budget exceeded.'); }
+        return ['context' => $context, 'seed' => $seed, 'guard' => self::creationSourceGuard($job)];
+    }
+
+    /** Bearer pulls have no interactive Fields catalog. Compare the worker-validated persisted source. */
+    private static function creationSourceGuard(array $job): string
+    {
+        global $DB;
+        $type = $job['itemtype'];
+        $item = self::model($type);
+        if (!$item->getFromDB((int) $job['items_id'])) { throw new \RuntimeException('Creation source unavailable.'); }
+        $rows = FieldMapping::load($job['glpi_b_connection_id'], $type);
+        self::validateMappings($type, $rows);
+        $source = [];
+        foreach ($rows as $row) {
+            $key = $row['glpi_a_field_key'];
+            if (!FieldsText::isCustom($key)) {
+                $column = str_starts_with($key, $type . '.') ? substr($key, strlen($type) + 1) : $key;
+                if (!array_key_exists($column, $item->fields)) { throw new \RuntimeException('Creation source column unavailable.'); }
+                $source[$key] = $item->fields[$column];
+                continue;
+            }
+            $descriptor = FieldsText::descriptor($type, $key);
+            $children = array_values(iterator_to_array($DB->request(['FROM' => $descriptor['table'],
+                'WHERE' => ['items_id' => (int) $job['items_id']], 'LIMIT' => 2])));
+            if (count($children) !== 1 || $children[0]['itemtype'] !== $type
+                || !array_key_exists($descriptor['field'], $children[0])) { throw new \RuntimeException('Creation source row unavailable.'); }
+            $child = $children[0];
+            $container = new \PluginFieldsContainer();
+            if (!$container->getFromDB((int) $child['plugin_fields_containers_id'])) { throw new \RuntimeException('Creation source container unavailable.'); }
+            $definitions = array_values(iterator_to_array($DB->request(['FROM' => 'glpi_plugin_fields_fields',
+                'WHERE' => ['plugin_fields_containers_id' => (int) $child['plugin_fields_containers_id'], 'name' => $descriptor['field']], 'LIMIT' => 2])));
+            if (count($definitions) !== 1) { throw new \RuntimeException('Creation source definition unavailable.'); }
+            $source[$key] = [$child['id'], $child['itemtype'], $child[$descriptor['field']], $container->fields, $definitions[0]];
+        }
+        return self::hash([$rows, $source]);
+    }
+
+    private static function publishCreation(array $job, array $scope, array $previous, string $kind, array $source,
+        string $prerequisites = '', ?array $created = null): void
+    {
+        global $DB;
+        $body = ['version' => 5, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
+            'installation' => $scope['binding']['installation'], 'registration' => $scope['binding']['registration'],
+            'generation' => $scope['generation'], 'connection_id' => $job['glpi_b_connection_id'], 'pair_id' => '',
+            'itemtype' => $job['itemtype'], 'items_id' => $created['items_id'] ?? 0,
+            'entity_id' => (int) $scope['route']['glpi_b_target_entity_id'], 'serial' => '', 'policy' => self::hash([$scope, $source]),
+            'expires' => time() + 300, 'changes' => [], 'identity' => $scope['identity'],
+            'seed' => $kind === 'confirm_create' ? [] : $source['seed'], 'prerequisites' => $prerequisites];
+        $body['hash'] = self::hash($body);
+        if (strlen(json_encode($body, JSON_THROW_ON_ERROR)) > 49152) { throw new \RuntimeException('Creation task exceeds transport budget.'); }
+        $context = ['local_id' => (int) $job['items_id'], 'scope' => $scope, 'source' => $source, 'created' => $created];
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
+            $current = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($previous['id']) . ' FOR UPDATE');
+            if (!AssetSyncQueue::owns($job)) { throw new \RuntimeException('Creation queue ownership changed.'); }
+            if (!$current || $current['slot'] !== $previous['slot'] || $current['result'] !== $previous['result']) {
+                throw new \RuntimeException('Creation result arrived during task renewal.');
+            }
+            $previousBody = json_decode($current['body'], true, 32, JSON_THROW_ON_ERROR);
+            if ($previousBody['kind'] === 'create' && $kind === 'create'
+                && ($current['state'] !== 'accepted' || $current['result'] !== '{}')) {
+                throw new \RuntimeException('A delivered create cannot be republished.');
+            }
+            self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $previous['id'], 'slot' => $previous['slot']]));
+            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Creation task ownership changed.'); }
+            self::write($DB->insert(self::TABLE, ['id' => $body['id'], 'connection_id' => $body['connection_id'], 'slot' => $previous['slot'],
+                'hash' => $body['hash'], 'body' => json_encode($body, JSON_THROW_ON_ERROR), 'state' => 'accepted', 'result' => '{}',
+                'queue_id' => (int) $job['id'], 'job' => json_encode($job, JSON_THROW_ON_ERROR),
+                'context' => json_encode($context, JSON_THROW_ON_ERROR), 'created_at' => time(), 'expires' => $body['expires']]));
+            self::write(AssetSyncQueue::waitForAgent($job));
+            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => $created
+                ? 'Created B asset ' . $created['items_id'] . '; awaiting independent confirmation.'
+                : 'Preparing automatic B creation.'], ['id' => (int) $job['id']]));
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    private static function processCreation(array $job, array $task): void
+    {
+        global $DB;
+        try {
+            if ((int) $task['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Creation queue changed.'); }
+            $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $scope = self::matchContext($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id']);
+            if (!self::sameMatchScope($scope, $expected['scope']) || self::creationSource($job, $scope) !== $expected['source']) {
+                throw new \RuntimeException('Creation source or mapping changed; retained operation requires review.');
+            }
+            if ($body['kind'] !== 'create' && (int) $task['expires'] < time()) {
+                // Read-only evidence expires even when its successful result arrived before the worker.
+                self::publishCreation($job, $scope, $task, $body['kind'], $expected['source'], '', $expected['created']);
+                return;
+            }
+            if ($task['result'] === '{}') {
+                if ((int) $task['expires'] < time()) {
+                    if ($body['kind'] !== 'create' || $task['state'] === 'accepted') {
+                        self::publishCreation($job, $scope, $task, $body['kind'], $expected['source'], $body['prerequisites'], $expected['created']);
+                        return;
+                    }
+                    throw new \RuntimeException('Creation task expired; retained operation awaits evidence or review.');
+                }
+                self::park($job, $task);
+                return;
+            }
+            $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+            self::validateResult($body, $result);
+            if (($result['existing'] ?? false) === true) {
+                $choice = self::chooseMatch($scope['identity'], $result['evidence']);
+                if (!isset($choice['candidate'])) { throw new \RuntimeException('Identity appeared before creation but is not uniquely matchable.'); }
+                self::publishMatch($job, $scope, $task, $choice['candidate']);
+                return;
+            }
+            if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) {
+                throw new \RuntimeException('Creation ' . $result['outcome'] . '; retained operation requires review.');
+            }
+            if ($body['kind'] === 'prepare_create') {
+                self::publishCreation($job, $scope, $task, 'create', $expected['source'], $result['prerequisites']);
+            } elseif ($body['kind'] === 'create') {
+                // Retained committed creation evidence survives expiry; it never authorizes another add.
+                self::publishCreation($job, $scope, $task, 'confirm_create', $expected['source'], '',
+                    ['task_id' => $body['id'], 'items_id' => $result['created_id']]);
+            } else {
+                if ((int) $task['expires'] < time()) {
+                    self::publishCreation($job, $scope, $task, 'confirm_create', $expected['source'], '', $expected['created']);
+                    return;
+                }
+                $choice = self::chooseMatch($scope['identity'], $result['evidence']);
+                if (!isset($choice['candidate']) || $choice['candidate']['items_id'] !== $expected['created']['items_id']
+                    || self::identity($choice['candidate']) !== $scope['identity']
+                    || self::identity($result['snapshot']) !== $scope['identity']) {
+                    throw new \RuntimeException('Created B identity could not be independently confirmed.');
+                }
+                self::confirmMatch($job, $task, $scope, $choice, $result['snapshot']);
+            }
+        } catch (\Throwable $error) {
+            // Every v5 chain retains its slot, including source changes after a successful add.
+            // No expiry, scanner pass or failure can manufacture a second creation intent.
+            AgentInbox::sql('START TRANSACTION');
+            try {
+                $current = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' FOR UPDATE');
+                if ($current && $current['slot'] === $task['slot'] && AssetSyncQueue::owns($job)) {
+                    self::write(AssetSyncQueue::waitForAgent($job));
+                    if ($current['result'] !== '{}' && $current['result'] !== $task['result']) {
+                        // Receipt either wins this lock and wakes us now, or wakes the parked queue later.
+                        self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $job['id'], 'status' => 'waiting_agent']));
+                    } else {
+                        $state = in_array($current['state'], ['executing', 'uncertain'], true) ? 'uncertain' : 'blocked';
+                        self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $current['id']]));
+                    }
+                    self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => $error->getMessage()], ['id' => (int) $job['id']]));
+                }
+                AgentInbox::sql('COMMIT');
+            } catch (\Throwable $storageError) { $DB->doQuery('ROLLBACK'); throw $storageError; }
+        }
     }
 
     public static function process(array $job, callable $applyLocal): void

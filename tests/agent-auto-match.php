@@ -200,6 +200,12 @@ foreach (['local_duplicate', 'remote_duplicate', 'no_match', 'permission', 'gran
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     $next = AgentTask::matchTask('b', 'Computer', 101);
     if ($next) {
+        if (json_decode($next['body'], true)['version'] === 5) {
+            scalarCheck(in_array($scenario, ['no_match', 'cross_entity', 'deleted'], true), 'Only complete scoped no-match starts creation prerequisites.');
+            scalarCheck(AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'] === null, 'V4 agent waits for upgrade before creation.');
+            scalarCheck(AgentTask::pair('b') === null && Computer::$adds === 0, 'No pair or add during upgrade wait.');
+            continue;
+        }
         if ($scenario === 'changed_b') { $DB->update('glpi_computers', ['serial' => 'new serial'], ['id' => 201]); }
         $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
         scalarReceipt($request, $token, $task, TaskExecutor::execute($task, $settings));
