@@ -116,7 +116,8 @@ namespace {
             $db->queries = [];
             $summary = AssetSyncQueue::metricsSnapshot();
             queueMetricsCheck(count($db->queries) === 1 && $summary['available'], 'Each snapshot must use one aggregate query.');
-            queueMetricsCheck(str_contains($db->queries[0], "WHERE `status` IN ('pending', 'retry', 'running', 'blocked')"), 'The query must exclude historical done rows with a status filter.');
+            queueMetricsCheck(str_contains($db->queries[0], "WHERE `status` IN ('pending', 'retry', 'running', 'blocked', 'waiting_agent')"), 'The query must exclude historical done rows while including agent waits.');
+            queueMetricsCheck($summary['waiting_agent'] === ['count' => 0], 'Agent wait count must be explicit even when empty.');
             queueMetricsCheck($summary['pending'] === ['count' => 6, 'oldest_wait_s' => 30, 'unknown_age' => 2], 'Pending age must include dirty terminals and use current notification time, disclosing missing/future dates.');
             queueMetricsCheck($summary['retry_due'] === ['count' => 8, 'oldest_overdue_s' => 180, 'unknown_age' => 4], 'Retry overdue must start at finished plus backoff, ignoring available when finished exists.');
             queueMetricsCheck($summary['retry_waiting'] === ['count' => 47], 'Delayed retry classification must use the exact existing due predicate.');

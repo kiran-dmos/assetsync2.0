@@ -443,7 +443,7 @@ namespace {
     }
     $dirty = new SyncActivity($dirtyDB);
     $dirtyList = $dirty->listing($filters);
-    check($dirtyList['counts'] === ['pending' => 3, 'running' => 1, 'retry' => 1, 'blocked' => 1, 'done' => 1], 'Dirty terminal counts were not waiting work.');
+    check($dirtyList['counts'] === ['pending' => 3, 'waiting_agent' => 0, 'running' => 1, 'retry' => 1, 'blocked' => 1, 'done' => 1], 'Dirty terminal counts were not waiting work.');
     check(array_column($dirty->listing(SyncActivity::filters(['state' => 'pending']))['rows'], 'id') === [3, 2, 1], 'Waiting filter omitted dirty terminal rows.');
     check(array_column($dirty->listing(SyncActivity::filters(['state' => 'done']))['rows'], 'id') === [4]
         && array_column($dirty->listing(SyncActivity::filters(['state' => 'blocked']))['rows'], 'id') === [5], 'Terminal filter included dirty waiting work.');
@@ -481,7 +481,7 @@ namespace {
     }
     $legacy = new SyncActivity($legacyDB);
     $legacyList = $legacy->listing(SyncActivity::filters([]));
-    check($legacyList['recheck'] === null && $legacyList['counts'] === ['pending' => 1, 'running' => 0, 'retry' => 0, 'blocked' => 1, 'done' => 1], 'Legacy recheck evidence or raw state was invented.');
+    check($legacyList['recheck'] === null && $legacyList['counts'] === ['pending' => 1, 'waiting_agent' => 0, 'running' => 0, 'retry' => 0, 'blocked' => 1, 'done' => 1], 'Legacy recheck evidence or raw state was invented.');
     check(array_column($legacy->listing(SyncActivity::filters(['state' => 'pending']))['rows'], 'id') === [3]
         && array_column($legacy->listing(SyncActivity::filters(['state' => 'done']))['rows'], 'id') === [1]
         && array_column($legacy->listing(SyncActivity::filters(['state' => 'blocked']))['rows'], 'id') === [2], 'Legacy status filters changed the stored state.');

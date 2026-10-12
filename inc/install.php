@@ -19,7 +19,7 @@ function plugin_assetsync20_install(): bool
     EntitySyncRoute::install();
 
     if (!AssetSyncLink::install() || !AssetSyncQueue::install() || !AssetUuidOperation::install()
-        || !\GlpiPlugin\Assetsync20\AgentInbox::install()) {
+        || !\GlpiPlugin\Assetsync20\AgentInbox::install() || !\GlpiPlugin\Assetsync20\AgentTask::install()) {
         return false;
     }
 

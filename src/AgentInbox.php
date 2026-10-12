@@ -42,6 +42,9 @@ final class AgentInbox
 
     public static function identity(array $connection): string
     {
+        if (GlpiBConnection::isAgent($connection)) {
+            return hash('sha256', json_encode(['agent', $connection['id'], rtrim($connection['base_url'], '/')], JSON_THROW_ON_ERROR));
+        }
         return hash('sha256', json_encode([$connection['id'], rtrim($connection['base_url'], '/'),
             $connection['app_token'], $connection['user_token']], JSON_THROW_ON_ERROR));
     }
@@ -95,6 +98,9 @@ final class AgentInbox
     /** Verify one saved pair without running mappings, billing, discovery or remote writes. */
     public static function verifySavedPair(array $registration, int $localId): void
     {
+        if (GlpiBConnection::isAgent(self::connection($registration['connection_id']) ?? [])) {
+            throw new \RuntimeException('Confirm the independent agent inspection on the Agent Pair page.');
+        }
         global $DB;
         $item = new \Computer();
         if ($localId <= 0 || !$item->can($localId, READ)) {
@@ -152,7 +158,7 @@ final class AgentInbox
         });
     }
 
-    private static function routeIdentity(array $route): string
+    public static function routeIdentity(array $route): string
     {
         return hash('sha256', json_encode([$route['id'], $route['glpi_b_connection_id'],
             $route['glpi_a_source_entity_id'], $route['include_child_entities'], $route['glpi_b_target_entity_id'],
@@ -298,6 +304,13 @@ final class AgentInbox
         $connection = self::connection($registration['connection_id']);
         if (!$registration['active'] || !$connection || self::identity($connection) !== $registration['connection_identity']) {
             return null;
+        }
+        if (GlpiBConnection::isAgent($connection)) {
+            try {
+                $agentPair = AgentTask::pair($connection['id']);
+                if (!$agentPair || $agentPair['registration'] !== $registration['id'] || (int) $agentPair['computer_id'] !== $remoteId) { return null; }
+                AgentTask::scope($agentPair);
+            } catch (\Throwable) { return null; }
         }
         $links = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
             'itemtype' => 'Computer', 'glpi_b_connection_id' => $registration['connection_id'],

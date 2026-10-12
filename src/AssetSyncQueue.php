@@ -13,6 +13,7 @@ final class AssetSyncQueue
     public const STATUS_RETRY = 'retry';
     public const STATUS_DONE = 'done';
     public const STATUS_BLOCKED = 'blocked';
+    public const STATUS_WAITING_AGENT = 'waiting_agent';
 
     public static function install(): bool
     {
@@ -84,7 +85,7 @@ final class AssetSyncQueue
         }
 
         $existing = self::findForAsset($itemtype, $itemsId, $connectionId);
-        if ($existing !== null && (string) ($existing['status'] ?? '') === self::STATUS_RUNNING) {
+        if ($existing !== null && in_array((string) ($existing['status'] ?? ''), [self::STATUS_RUNNING, self::STATUS_WAITING_AGENT], true)) {
             return false;
         }
 
@@ -346,6 +347,7 @@ FROM (
                WHEN `status` = 'retry' THEN 'retry_waiting'
                WHEN `status` = 'running' AND {$due} THEN 'running_reclaimable'
                WHEN `status` = 'running' THEN 'running_active'
+               WHEN `status` = 'waiting_agent' THEN 'waiting_agent'
                ELSE 'blocked'
            END AS category,
            CASE
@@ -354,7 +356,7 @@ FROM (
                WHEN `status` = 'running' THEN {$running}
            END AS age_epoch
     FROM `glpi_plugin_assetsync20_syncqueue`
-    WHERE `status` IN ('pending', 'retry', 'running', 'blocked') OR (`status` = 'done' AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`))
+    WHERE `status` IN ('pending', 'retry', 'running', 'blocked', 'waiting_agent') OR (`status` = 'done' AND (`needs_recheck` = 1 OR `agent_requested` > `agent_completed`))
 ) AS queue_metrics
 GROUP BY category
 SQL;
@@ -372,6 +374,7 @@ SQL;
                 'running_reclaimable' => 'oldest_job_age_s',
                 'running_active' => 'oldest_job_age_s',
                 'blocked' => null,
+                'waiting_agent' => null,
             ];
             foreach ($ageKeys as $category => $ageKey) {
                 $summary[$category] = ['count' => 0];
@@ -401,6 +404,16 @@ SQL;
     public static function finish(array $job, string $message = '', ?int $remoteItemsId = null): bool
     {
         return self::updateStatus($job, self::STATUS_DONE, null, $message, $remoteItemsId);
+    }
+
+    /** Called inside task publication's transaction; never consumes notification revisions. */
+    public static function waitForAgent(array $job): bool
+    {
+        $db = self::db();
+        $where = self::ownerWhere($job);
+        return $db !== null && $where !== null && AssetSyncDbTime::write($db, static fn (): bool =>
+            $db->update(self::TABLE, ['status' => self::STATUS_WAITING_AGENT, 'claim_token' => '', 'started_at' => null], $where)
+            && $db->affectedRows() === 1);
     }
 
     public static function block(array $job, string $message, ?int $remoteItemsId = null): bool

@@ -2,7 +2,18 @@
 
 GLPI 11 asset synchronization controller, with an optional lightweight Computer
 notification agent for GLPI B. The controller owns mappings, routes, comparison,
-billing and UUID reconciliation. The agent only observes B and notifies A.
+billing and UUID reconciliation. REST remains the default. The optional bounded
+agent mode pulls text-only tasks over HTTPS without B REST credentials or calls.
+
+## Bounded Agent Mode
+
+Controller 0.3.0 / agent 0.2.0 adds one independently confirmed existing Computer
+pair per connection, exact nonrecursive scope, Name/Comments and existing custom
+text rows, with one-way A or B authority per mapping. Creation, Both, UUID work,
+other assets, other native columns and non-text mappings are explicitly unsupported.
+See [agent-only setup and limits](README-agent.md#bounded-agent-only-mode).
+The implementation is awaiting independent verification; do not infer production
+qualification from the earlier notification-prototype evidence below.
 
 ## Local plugin key
 

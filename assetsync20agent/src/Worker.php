@@ -17,6 +17,10 @@ final class Worker
         }
         try {
             $deadline = hrtime(true) + 20_000_000_000;
+            $settings = Settings::load();
+            if (($settings['mode'] ?? 'rest') === 'agent') {
+                TaskJournal::cycle($settings, $deadline);
+            }
             try {
                 $this->reconcile();
             } catch (\Throwable) {
@@ -49,6 +53,11 @@ final class Worker
                 if ($sent === null) {
                     break;
                 }
+                if (($settings['mode'] ?? 'rest') === 'agent' && (int) $sent['computer_id'] !== (int) $settings['computer_id']) {
+                    Outbox::retry($sent, 'blocked');
+                    $count++;
+                    continue;
+                }
                 $sent['computer_id'] = (int) $sent['computer_id'];
                 $sent['revision'] = (int) $sent['revision'];
                 $response = self::send($settings, $sent, $deadline);
@@ -69,6 +78,13 @@ final class Worker
     {
         global $DB;
         $state = \Config::getConfigurationValues(Settings::CONTEXT);
+        if (($state['mode'] ?? 'rest') === 'agent') {
+            $id = (int) ($state['computer_id'] ?? 0);
+            if ($id <= 0) { throw new \RuntimeException('Agent pair is not configured.'); }
+            Outbox::observe($id, Snapshot::read($id), true, Outbox::find($id));
+            \Config::setConfigurationValues(Settings::CONTEXT, ['reconcile_status' => 'ok']);
+            return 1;
+        }
         $deadline = hrtime(true) + 2_000_000_000;
         $count = 0;
         foreach (['scan_cursor' => 'glpi_computers', 'purge_cursor' => Outbox::TABLE] as $key => $table) {

@@ -21,7 +21,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         Settings::save($_POST);
         $message = 'Agent settings saved.';
     } catch (Throwable) {
-        $message = 'Settings rejected. Check HTTPS URL, registration, generation and token.';
+        $message = 'Settings rejected. Check HTTPS URL, registration, generation and token. In agent mode also check the connection ID, Computer/entity IDs, service user/login, profile and password.';
     }
 }
 $settings = Settings::load();
@@ -35,10 +35,23 @@ try {
 }
 $html = static fn ($text): string => htmlspecialchars((string) $text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 echo '<h2>AssetSync2.0 Agent</h2><p>' . $html($message) . '</p><form method="post"><table class="tab_cadre_fixe">';
+echo '<tr><th>Installation identity</th><td>' . $html($settings['installation'] ?? 'Install the plugin update first') . '</td></tr>';
+echo '<tr><th><label for="mode">Mode</label></th><td><select id="mode" name="mode">';
+foreach (['rest' => 'Notifications for REST', 'agent' => 'Bounded agent tasks'] as $value => $label) {
+    echo '<option value="' . $value . '"' . (($settings['mode'] ?? 'rest') === $value ? ' selected' : '') . '>' . $label . '</option>';
+}
+echo '</select></td></tr>';
 foreach (['endpoint' => 'GLPI A HTTPS receiver URL', 'registration' => 'Registration', 'generation' => 'Generation', 'token' => 'Token (blank keeps current)'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
         . '" type="' . ($key === 'token' ? 'password' : 'text') . '" autocomplete="off" size="72" value="'
         . ($key === 'token' ? '' : $html($settings[$key] ?? '')) . '"></td></tr>';
+}
+foreach (['connection_id' => 'A connection ID', 'computer_id' => 'Existing B Computer ID', 'entity_id' => 'Exact B entity ID',
+    'service_user' => 'Dedicated service user ID', 'service_name' => 'Service login name', 'service_profile' => 'Direct service profile ID',
+    'service_password' => 'Service password (blank keeps current)'] as $key => $label) {
+    echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
+        . '" type="' . ($key === 'service_password' ? 'password' : 'text') . '" autocomplete="new-password" size="60" value="'
+        . ($key === 'service_password' ? '' : $html($settings[$key] ?? '')) . '"></td></tr>';
 }
 echo '</table><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" class="submit">Save</button></form>';
 echo '<p>Last worker cycle: ' . (!empty($settings['worker_seen']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['worker_seen'])) . ' UTC' : 'Never') . '</p>';

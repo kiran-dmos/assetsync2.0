@@ -40,6 +40,8 @@ final class ChangeHook
                 return;
             }
             if ($id > 0) {
+                $settings = Settings::load();
+                if (($settings['mode'] ?? 'rest') === 'agent' && $id !== (int) ($settings['computer_id'] ?? 0)) { return; }
                 $snapshot = $purged ? ['fingerprint' => hash('sha256', 'purged'), 'lifecycle' => 'purged'] : Snapshot::read($id);
                 Outbox::observe($id, $snapshot, false);
             }

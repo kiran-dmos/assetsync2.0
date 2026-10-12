@@ -9,7 +9,7 @@ use Glpi\DBAL\QueryExpression;
 final class SyncActivity
 {
     public const PAGE_SIZE = 50;
-    public const STATES = ['pending' => 'Waiting', 'running' => 'Marked as running', 'retry' => 'Retry pending', 'blocked' => 'Blocked', 'done' => 'Done'];
+    public const STATES = ['pending' => 'Waiting', 'waiting_agent' => 'Waiting for B agent', 'running' => 'Marked as running', 'retry' => 'Retry pending', 'blocked' => 'Blocked', 'done' => 'Done'];
     private const ASSETS = [
         'Computer' => 'glpi_computers',
         'Monitor' => 'glpi_monitors',
@@ -425,6 +425,7 @@ final class SyncActivity
         }
         switch ($row['status']) {
             case 'pending': return 'Waiting for a sync check. No transfer is confirmed by this queue row.';
+            case 'waiting_agent': return 'A durable task is waiting for B or its result. No field change is confirmed by this queue row.';
             case 'running': return 'Marked as running; current worker activity is not verified. Its saved result does not confirm whether any fields changed.';
             case 'retry': return 'Waiting for another scheduled attempt. Some values may already have changed; this row does not record individual field results.';
             case 'done': return 'This job finished. It may have found equal values or an asset outside its route; completion does not prove that fields changed.';

@@ -162,12 +162,17 @@ final class GlpiBConnection
             $userToken = $current['user_token'];
         }
 
+        $mode = (string) ($input['mode'] ?? $current['mode'] ?? 'rest');
+        if (!in_array($mode, ['rest', 'agent'], true)) {
+            throw new \InvalidArgumentException('Unsupported connection mode.');
+        }
         return [
+            'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
             'base_url'   => self::cleanBaseUrl((string) ($input['base_url'] ?? '')),
-            'app_token'  => $appToken,
-            'user_token' => $userToken,
+            'app_token'  => $mode === 'agent' ? '' : $appToken,
+            'user_token' => $mode === 'agent' ? '' : $userToken,
             'active'     => !empty($input['active']),
         ];
     }
@@ -274,6 +279,9 @@ final class GlpiBConnection
      */
     public static function test(array $connection): array
     {
+        if (self::isAgent($connection)) {
+            return ['success' => false, 'message' => 'Use Agent Pair inspection to verify this connection. No REST request was made.'];
+        }
         return self::withSession($connection, static function (string $sessionToken) use ($connection): array {
             $fullSession = self::request('GET', self::apiUrl($connection['base_url'], 'getFullSession'), [
                 'App-Token: ' . $connection['app_token'],
@@ -292,6 +300,9 @@ final class GlpiBConnection
      */
     public static function fetchNativeFields(array $connection, string $itemtype): array
     {
+        if (self::isAgent($connection)) {
+            return AgentTask::catalog($connection['id'], $itemtype);
+        }
         $result = self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype): array {
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $sessionToken];
             $fieldsResponse = self::request('GET', self::apiUrl($connection['base_url'], 'listSearchOptions/' . rawurlencode($itemtype)), $headers);
@@ -321,6 +332,7 @@ final class GlpiBConnection
      */
     public static function searchBySerial(array $connection, string $itemtype, string $serial): array
     {
+        self::requireRest($connection);
         $serial = trim($serial);
         if ($serial === '') {
             return [
@@ -398,6 +410,7 @@ final class GlpiBConnection
      */
     public static function getItem(array $connection, string $itemtype, int $itemsId, bool $needsDateModTimezone = true): array
     {
+        self::requireRest($connection);
         if ($itemsId <= 0) {
             return [
                 'success'   => false,
@@ -449,6 +462,7 @@ final class GlpiBConnection
      */
     public static function createItem(array $connection, string $itemtype, array $input): array
     {
+        self::requireRest($connection);
         return self::withSession($connection, static function (string $sessionToken) use ($connection, $itemtype, $input): array {
             $response = self::request(
                 'POST',
@@ -497,6 +511,7 @@ final class GlpiBConnection
      */
     public static function updateItem(array $connection, string $itemtype, int $itemsId, array $input): array
     {
+        self::requireRest($connection);
         if ($itemsId <= 0) {
             return [
                 'success'   => false,
@@ -548,6 +563,7 @@ final class GlpiBConnection
     /** Raw native UUID reads/writes deliberately do not depend on a search option. */
     public static function uuidSnapshot(array $connection, string $itemtype, int $id, int $entityId, bool $writing = false, ?string $expectedUuid = null, ?string $newUuid = null, bool $withHistory = true): array
     {
+        self::requireRest($connection);
         if (!isset(FieldMapping::assetTypes()[$itemtype]) || $id <= 0 || empty($connection['active'])) {
             return ['success' => false, 'outcome' => 'unknown'];
         }
@@ -663,6 +679,7 @@ final class GlpiBConnection
     /** Fresh metadata and complete reference catalogs for one asset operation. */
     public static function nativeMappingContext(array $connection, string $itemtype, array $keys, int $entityId): array
     {
+        self::requireRest($connection);
         if ($keys === []) {
             return ['success' => true, 'fields' => [], 'catalogs' => []];
         }
@@ -699,6 +716,7 @@ final class GlpiBConnection
 
     public static function nativeStateCatalog(array $connection, string $itemtype, array $rows, mixed $sourceId, array $labels, array $entityPath): array
     {
+        self::requireRest($connection);
         return self::withSession($connection, static function (string $token) use ($connection, $itemtype, $rows, $sourceId, $labels, $entityPath): array {
             $headers = ['App-Token: ' . $connection['app_token'], 'Session-Token: ' . $token];
             $sourceId = NativeField::referenceId($sourceId);
@@ -747,6 +765,7 @@ final class GlpiBConnection
     /** Read and optionally write mapped Fields-plugin values through child-row REST endpoints. */
     public static function customTextValues(array $connection, string $itemtype, int $itemsId, array $keys, array $changes = [], array $expectedTypes = [], bool $allowReadonly = false, bool $dryRun = false, ?int $targetEntityId = null, array $preparedMetadata = []): array
     {
+        self::requireRest($connection);
         $keys = array_values(array_filter(array_unique($keys), [FieldsText::class, 'isCustom']));
         if ($keys === []) {
             return ['success' => true, 'item' => [], 'history_option_ids' => [], 'history_refs' => []];
@@ -1152,6 +1171,7 @@ final class GlpiBConnection
      */
     public static function customHistoryDates(array $connection, string $itemtype, int $itemsId, array $historyRefs): array
     {
+        self::requireRest($connection);
         $historyRefs = self::cleanHistoryRefs($historyRefs);
         if ($itemsId <= 0 || $historyRefs === []) {
             return [
@@ -1442,6 +1462,7 @@ final class GlpiBConnection
     private static function emptyConnection(): array
     {
         return [
+            'mode'       => 'rest',
             'id'         => self::connectionId(''),
             'name'       => '',
             'base_url'   => '',
@@ -1506,11 +1527,12 @@ final class GlpiBConnection
             }
 
             $connections[] = [
+                'mode'       => (string) ($savedConnection['mode'] ?? 'rest'),
                 'id'         => self::connectionId((string) ($savedConnection['id'] ?? '')),
                 'name'       => (string) ($savedConnection['name'] ?? ''),
                 'base_url'   => (string) ($savedConnection['base_url'] ?? ''),
-                'app_token'  => self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
-                'user_token' => self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
+                'app_token'  => ($savedConnection['mode'] ?? 'rest') === 'agent' ? '' : self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
+                'user_token' => ($savedConnection['mode'] ?? 'rest') === 'agent' ? '' : self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
                 'active'     => !empty($savedConnection['active']),
             ];
         }
@@ -1528,6 +1550,7 @@ final class GlpiBConnection
 
         foreach ($connections as $connection) {
             $savedConnections[] = [
+                'mode'       => (string) ($connection['mode'] ?? 'rest'),
                 'id'         => self::connectionId($connection['id']),
                 'name'       => $connection['name'],
                 'base_url'   => self::cleanBaseUrl($connection['base_url']),
@@ -1570,6 +1593,7 @@ final class GlpiBConnection
      */
     private static function withSession(array $connection, callable $callback, bool $needsDateModTimezone = false): array
     {
+        self::requireRest($connection);
         if ($connection['base_url'] === '' || $connection['app_token'] === '' || $connection['user_token'] === '') {
             return [
                 'success'   => false,
@@ -1667,6 +1691,27 @@ final class GlpiBConnection
         }
 
         return self::sessionTimezone($fullSession['body']);
+    }
+
+    public static function isAgent(array $connection): bool
+    {
+        return ($connection['mode'] ?? 'rest') === 'agent';
+    }
+
+    public static function isAgentConnection(string $id): bool
+    {
+        // A mapping read must not trigger legacy connection migration or any configuration writes.
+        foreach (self::decodeConnections() as $connection) {
+            if ($connection['id'] === $id) { return self::isAgent($connection); }
+        }
+        return false;
+    }
+
+    private static function requireRest(array $connection): void
+    {
+        if (($connection['mode'] ?? 'rest') !== 'rest') {
+            throw new \RuntimeException('This connection requires B-pulled agent tasks; REST is disabled.');
+        }
     }
 
     /**

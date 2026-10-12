@@ -61,8 +61,9 @@ final class Outbox
         global $DB;
         $generation = $DB->quote($settings['generation']);
         $now = time();
+        $scope = ($settings['mode'] ?? 'rest') === 'agent' ? ' AND `computer_id` = ' . (int) ($settings['computer_id'] ?? 0) : '';
         $row = self::one('SELECT * FROM `' . self::TABLE . "` WHERE (`revision` > `acked_revision` OR (`revision` > 0 AND `generation` <> {$generation}))"
-            . " AND `lease_until` <= {$now} AND (`next_attempt` <= {$now} OR `generation` <> {$generation}) ORDER BY `next_attempt`, `computer_id` LIMIT 1");
+            . " AND `lease_until` <= {$now} AND (`next_attempt` <= {$now} OR `generation` <> {$generation})" . $scope . ' ORDER BY `next_attempt`, `computer_id` LIMIT 1');
         if (!$row) {
             return null;
         }

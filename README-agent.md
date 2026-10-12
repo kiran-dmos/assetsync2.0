@@ -1,15 +1,103 @@
-# GLPI B Agent Prototype
+# GLPI B Agent
 
-This branch adds a separate `assetsync20agent` plugin for GLPI B. Install the
+This branch provides a separate `assetsync20agent` plugin for GLPI B. Install the
 controller (`assetsync20`) only on A. B stores Computer fingerprints and a durable
-outbox; it has no mappings and cannot run the controller. A remains responsible
+outbox; it has no mappings and cannot run the controller. In default REST mode A remains responsible
 for native/Fields metadata, mappings, permissions, Both/source-of-truth policy,
 native UUID handling and billing. The prototype has passed the isolated checks
 listed below; this is not a production rollout or scale qualification.
 
-## Install and Configure
+## Bounded Agent-Only Mode
 
-1. Upgrade/install controller version **0.2.0** as `plugins/assetsync20` on A using GLPI's
+Upgrade A to 0.3.0 and B to 0.2.0 through GLPI's plugin Update action while workers
+are stopped. New task/pair/journal tables and columns are additive. Existing
+connections default to REST and retain their existing behavior.
+
+1. Select **agent** for the A connection. B REST tokens are not saved in this mode.
+2. On B's agent configuration, obtain its persisted installation identity. This
+   identifies the installation, not the Computer UUID.
+3. Open **Agent Pair** on A. Declare the installation identity, existing A/B
+   Computer IDs and exact B entity. A Computer must already have a serial. This
+   initial inspection does not require a saved route or mapping catalog.
+4. Enter the once-displayed registration/generation/token and connection ID on B.
+   Select agent mode, the same Computer/entity and a dedicated active GLPI service
+   account/profile with a direct nonrecursive entity assignment, Computer READ
+   and UPDATE, and applicable Fields container rights. Its password is encrypted
+   using GLPIKey on B only. Set the direct HTTPS notification URL described below.
+5. Run B's worker to independently read its identity, serial, entity and metadata.
+   Add an exact nonrecursive Computer-only route on A. Confirm the pair through
+   the protected Agent Pair POST. Fresh A reads, matching serial/entity, route
+   authorization and reverse uniqueness are required. Existing REST confirmation
+   is not agent confirmation. No asset is created, moved or relinked.
+6. Map Name, Comments or existing custom **text** fields. Each mapping must use
+   `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
+   stored B observation; explicit refresh queues a fresh inspection without REST.
+   Run A and B workers independently using the commands below.
+
+B pulls tasks from the separate `front/agent-task.php` HTTPS endpoint and reports
+durable results before ACK. A retains immutable task IDs, bindings, expected
+values, policy/metadata fingerprints and captured queue revisions; B journals
+before execution. A releases its claim while `waiting_agent`. New notifications
+remain pending across results; old results cannot complete a newer claim. B's
+notifier and reconciliation are restricted to the owned Computer. Unchanged A
+backfill converges using an A-side fingerprint; an hourly safety-net inspection
+or explicit force obtains new B evidence rather than trusting cached B values.
+
+B uses real Auth login and Session profile/entity selection, fresh direct grants
+and model permissions, Computer search-cache clearing before/after contexts, and
+official Computer/Fields model writes. Existing parent/child rows are locked on
+InnoDB through each write and readback. Named official parent history is checked.
+Readonly Fields text still requires ordinary parent/container authorization; its
+definition is not changed. A keeps billing calculations after verified inbound
+work, guards existing billing child rows and schedules a recheck for derived changes.
+
+Accepted/executing/waiting are not success. Verified/unchanged require supported
+readback, and changed B fields require named history evidence. Stale, blocked,
+partial and uncertain are retained explicitly. A possible write followed by a
+crash is never blindly rerun. Late evidence is retained but is not fresh input.
+Only confirmed no-write stale operations offer an administrator retry. Scope
+failure before task publication retains revisions with bounded retry backoff.
+
+Creation, other asset types, recursive/inherited-only grants, non-text mappings,
+other native fields and UUID mutation are unsupported. The separate UUID service
+returns `unsupported_agent` before any mutation/REST for agent participation,
+including mixed REST/agent participant sets. Ordinary supported text work remains
+available. REST entry points are fenced against agent fallback.
+
+There is no pruning. A task/pair records and B journal survive uninstall, including
+unresolved evidence. Keep credentials private and do not reset/reuse generations.
+Task expiry is five minutes; slow/offline work can require fresh inspection.
+Keep A and B clocks synchronized. Pair confirmation requires an observation no
+older than five minutes; the mapping catalog can display observations up to one
+hour old. Receiving delayed evidence does not refresh its observation time.
+
+The bounded snapshot permits at most 32 total eligible fields, including Name and
+Comments, even when some fields are unmapped. It is limited to 48 KiB of encoded
+JSON. Individual text values are limited to 16 KiB and complete task/result HTTPS
+envelopes to 64 KiB; JSON escaping and metadata count toward these byte limits.
+Oversized work fails closed and needs smaller values or a narrower eligible scope.
+The endpoints require
+direct HTTPS and normal CA validation, without redirects or insecure overrides.
+
+Agent Pair offers token rotation for both unconfirmed candidates and confirmed
+pairs. Rotation preserves task bindings and shows the replacement token once;
+update B's token. If initial inspection publication fails, the candidate and its
+credentials are still returned; use Refresh observation when storage is available.
+Recent task outcomes remain visible after an inspection releases its slot.
+Releasing a no-write setup task does not itself queue an inspection: use Refresh
+observation. Partial and uncertain tasks remain retained for investigation.
+
+Limits: no distributed transaction across A/B, no atomic protection against every
+human policy/metadata edit, and no production, scale, browser/accessibility, inventory
+ingress or storage power-loss qualification. Row locks protect existing asset rows,
+not all GLPI policy tables. Isolated GLPI 11.0.7 / Fields 1.24.5 / PHP 8.5.7 evidence
+and host PHP 8.2 regressions are prepared for independent review, not an approval.
+Focused suites: `tests/agent-tasks.php`, `tests/agent-task-reporting.php` and
+`tests/agent-http.php`. The latter uses mocked HTTP, not live traffic measurement.
+
+## REST Notification Mode Setup
+
+1. Upgrade/install controller version **0.3.0** as `plugins/assetsync20` on A using GLPI's
    plugin installer. This adds registration/receipt tables, confirmed-link
    evidence, queue revision counters and claim tokens. Stop workers during the
    schema upgrade, including cron, and run GLPI's plugin **Update** action (not

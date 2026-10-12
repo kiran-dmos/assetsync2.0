@@ -40,6 +40,13 @@ $glpiBFieldsLoaded = false;
 $glpiBFieldsMessage = null;
 
 if ($selectedConnection !== null) {
+    if (GlpiBConnection::isAgent($selectedConnection) && isset($_POST['refresh_agent'])) {
+        Session::checkRight('config', UPDATE);
+        try {
+            \GlpiPlugin\Assetsync20\AgentTask::inspect($selectedConnectionId);
+            $message = 'Inspection queued; awaiting B agent.';
+        } catch (Throwable $error) { $message = $error->getMessage(); $messageClass = 'warning'; }
+    }
     $glpiBFieldsResult = GlpiBConnection::fetchNativeFields($selectedConnection, $selectedItemtype);
     $glpiBFieldsLoaded = $glpiBFieldsResult['success'];
     $glpiBFields = $glpiBFieldsResult['fields'];
@@ -50,7 +57,7 @@ if ($selectedConnection !== null) {
 }
 
 $savedMappings = [];
-$posted = $_SERVER['REQUEST_METHOD'] === 'POST';
+$posted = $_SERVER['REQUEST_METHOD'] === 'POST' && !isset($_POST['refresh_agent']);
 try {
     $savedMappings = $selectedConnectionId !== '' ? FieldMapping::load($selectedConnectionId, $selectedItemtype) : [];
     if ($posted) {
@@ -82,6 +89,11 @@ try {
     $messageClass = 'warning';
 }
 $fields = FieldMapping::fieldsFor($selectedItemtype);
+if ($selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection)) {
+    $sourceOptions = array_intersect_key($sourceOptions, array_flip(['glpi_a', 'glpi_b']));
+    $fields = array_values(array_filter($fields, static fn (array $field): bool => in_array($field['key'], ['name', 'comment'], true)
+        || ($field['group'] === 'Custom' && $field['type'] === 'text')));
+}
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
     Html::header(Plugin::NAME, $_SERVER['PHP_SELF'], 'config', 'Plugin');
@@ -95,6 +107,11 @@ echo '<link rel="stylesheet" href="' . $html($stylesheet) . '">';
 
 echo '<div class="assetsync-page assetsync-mapping">';
 echo '<h2>Field Mapping</h2>';
+if ($selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection)) {
+    echo '<form method="post"><input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">'
+        . '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">'
+        . '<button class="submit" name="refresh_agent" value="1">Refresh B observation</button></form>';
+}
 
 if ($selectedConnection !== null) {
     echo '<p class="assetsync-actions"><a class="submit" href="' . $html($urlWithQuery(Menu::configUrl(), [

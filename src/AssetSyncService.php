@@ -358,6 +358,16 @@ final class AssetSyncService
 
     private function prepareAndQueueLockedAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline, ?float $scanDeadline): ?bool
     {
+        if (GlpiBConnection::isAgent($this->activeConnection($connectionId) ?? [])) {
+            $pair = AgentTask::pair($connectionId);
+            if ($itemtype !== 'Computer' || !$pair || (int) $pair['local_id'] !== $itemsId || !$pair['confirmed']) {
+                return false;
+            }
+            try {
+                if (!AgentTask::needsInspection($pair, $forceInboundRecheck)) { return false; }
+            } catch (\Throwable) { return false; }
+            return AssetSyncQueue::notify($itemtype, $itemsId, $connectionId);
+        }
         $asset = $this->loadLocalAsset($itemtype, $itemsId);
         if ($asset === null) {
             return false;
@@ -552,6 +562,22 @@ final class AssetSyncService
         }
         if (!AssetSyncQueue::owns($job)) {
             $this->recordJobOutcome('skipped', false);
+            return;
+        }
+
+        $agentConnection = $this->activeConnection($connectionId);
+        if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {
+            AgentTask::process($job, function (array $changes, array $mappings) use ($itemsId): bool {
+                return AssetChangeHook::withoutQueue(function () use ($itemsId, $changes, $mappings): bool {
+                    if ($changes !== [] && !$this->updateLocalAsset('Computer', $itemsId, $changes)) {
+                        throw new \RuntimeException('Agent inbound local update failed.');
+                    }
+                    $asset = $this->loadLocalAsset('Computer', $itemsId);
+                    if ($asset === null) { throw new \RuntimeException('Local Computer disappeared.'); }
+                    $prepared = $this->prepareAssetForSync('Computer', $itemsId, $asset, $mappings, FieldMapping::expectedCustomTypes('Computer', $mappings));
+                    return $prepared['billing_changed'];
+                });
+            });
             return;
         }
 

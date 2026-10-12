@@ -63,6 +63,10 @@ final class FieldMapping
         $itemtype = self::validItemtype($itemtype);
         $mappings = [];
 
+        if (GlpiBConnection::isAgentConnection($connectionId)) {
+            AgentTask::validateMappings($itemtype, self::load($connectionId, $itemtype));
+        }
+
         foreach (self::load($connectionId, $itemtype) as $mapping) {
             if (self::isReservedUuidRow($itemtype, $mapping)) {
                 continue;
@@ -203,6 +207,9 @@ final class FieldMapping
             }
         }
         $rows = self::rowsFromScope($rowInput ? ['version' => 2, 'rows' => $fieldMappings] : $fieldMappings);
+        if (GlpiBConnection::isAgentConnection($connectionId)) {
+            AgentTask::validateMappings($itemtype, $rows);
+        }
         $savedRows = [];
         $runtimeRows = [];
         $localTypes = [];

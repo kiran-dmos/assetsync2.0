@@ -20,9 +20,9 @@ final class AgentActivity
             return 'blocked';
         }
         if ((int) $row['work_generation'] > (int) $row['agent_completed']) {
-            return match ($row['queue_status']) {'running' => 'processing', 'retry' => 'retrying', default => 'queued'};
+            return match ($row['queue_status']) {'running' => 'processing', 'retry' => 'retrying', 'waiting_agent' => 'waiting_agent', 'pending', 'done' => 'queued', 'blocked' => 'blocked', default => 'unknown'};
         }
-        return in_array($row['outcome'], ['received', 'queued', 'unchanged', 'synchronized', 'retrying', 'blocked'], true)
+        return in_array($row['outcome'], ['received', 'queued', 'unchanged', 'synchronized', 'retrying', 'blocked', 'verified', 'partial', 'uncertain', 'stale'], true)
             ? $row['outcome'] : 'received';
     }
 
@@ -55,6 +55,24 @@ final class AgentActivity
         }
         if ($rows === []) {
             echo '<tr><td colspan="5">No agent work for visible Computers.</td></tr>';
+        }
+        echo '</table>';
+        self::renderTasks($entities, $html);
+    }
+
+    private static function renderTasks(array $entities, callable $html): void
+    {
+        global $DB;
+        if (!$DB->tableExists(AgentTask::TABLE)) { return; }
+        echo '<h3>Agent Tasks</h3><table class="tab_cadre_fixe"><tr><th>Task</th><th>Computer</th><th>Outcome</th><th>Created (UTC)</th></tr>';
+        foreach ($DB->request(['FROM' => AgentTask::TABLE, 'ORDER' => 'created_at DESC', 'LIMIT' => 100]) as $task) {
+            $pair = AgentTask::pair($task['connection_id']);
+            $item = new \Computer();
+            if (!$pair || !in_array((int) $pair['local_entity'], $entities, true) || !$item->can((int) $pair['local_id'], READ)) { continue; }
+            $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
+            echo '<tr><td>' . $html($task['id']) . '</td><td>#' . (int) $pair['local_id'] . '</td><td>'
+                . $html(in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown') . '</td><td>'
+                . $html(gmdate('Y-m-d H:i:s', (int) $task['created_at'])) . '</td></tr>';
         }
         echo '</table>';
     }

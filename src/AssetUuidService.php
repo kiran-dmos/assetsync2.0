@@ -10,6 +10,7 @@ final class AssetUuidService
     private array $remoteFailures = [];
 
     public const OUTCOMES = [
+        'unsupported_agent' => 'UUID reconciliation is unsupported for agent participants; no UUID was changed',
         'upgrade_required' => 'Plugin update required to install UUID operation storage',
         'pending' => 'Waiting for UUID reconciliation', 'running' => 'UUID reconciliation running',
         'equal' => 'UUID already equal', 'verified' => 'UUID readback verified',
@@ -329,6 +330,12 @@ final class AssetUuidService
         }
         EntitySyncRoute::loadAll(true);
         $matched = EntitySyncRoute::matchAsset($type, (string) $asset['entities_id']);
+        // Detect every agent participant before any REST read or UUID mutation, including mixed routes.
+        foreach (array_merge($matched['matches'], $matched['conflicts']) as $match) {
+            if (GlpiBConnection::isAgent($connections[$match['glpi_b_connection_id']] ?? [])) {
+                return ['outcome' => 'unsupported_agent'];
+            }
+        }
         foreach ($matched['conflicts'] as $conflict) {
             if (isset($connections[$conflict['glpi_b_connection_id']])) {
                 return ['outcome' => 'unknown'];

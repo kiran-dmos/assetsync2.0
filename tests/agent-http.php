@@ -74,9 +74,11 @@ namespace {
     require __DIR__ . '/../setup.php';
     plugin_init_assetsync20();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
-        $check(preg_match($pattern, '/front/agent-notify.php') === 1 && preg_match($pattern, '/front/agents.php') === 0
+        $check((preg_match($pattern, '/front/agent-notify.php') === 1 || preg_match($pattern, '/front/agent-task.php') === 1) && preg_match($pattern, '/front/agents.php') === 0
             && preg_match($pattern, '/front/agent-notify.php/other') === 0 && preg_match($pattern, '/front/agent-notify.phpx') === 0,
-            'Actual GLPI stateless/firewall patterns exempt only the exact endpoint.');
+            'Actual GLPI stateless/firewall patterns exempt only the two exact machine endpoints.');
+        $check(preg_match($pattern, '/front/agent-task.php/other') === 0 && preg_match($pattern, '/front/agent-task.phpx') === 0
+            && preg_match($pattern, '/front/agent-pair.php') === 0, 'Task endpoint exemption excludes suffixes and protected pairing.');
     }
     $endpoint = file_get_contents(__DIR__ . '/../front/agent-notify.php');
     $check(str_contains($endpoint, "\$_SERVER['HTTPS']") && !str_contains($endpoint, 'FORWARDED'), 'Receiver does not trust forwarded protocol headers.');
@@ -90,5 +92,22 @@ namespace {
         'Registration page supports GLPI scoped inclusion and explicit access denial.');
     $agentConfig = file_get_contents(__DIR__ . '/../assetsync20agent/front/config.php');
     $check(str_contains($agentConfig, 'global $DB;'), 'B configuration page imports DB for GLPI legacy controller scoped inclusion.');
+    $settings += ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32),
+        'installation' => str_repeat('d', 32), 'connection_id' => 'b'];
+    AgentTransport::$body = '{"task":null}';
+    \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000);
+    $options = AgentTransport::$options;
+    $check($options[CURLOPT_SSL_VERIFYPEER] && $options[CURLOPT_SSL_VERIFYHOST] === 2
+        && !$options[CURLOPT_FOLLOWLOCATION] && $options[CURLOPT_PROTOCOLS] === CURLPROTO_HTTPS, 'Task transport also requires strict HTTPS with no redirect.');
+    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull'] + array_intersect_key($settings,
+        array_flip(['registration', 'generation', 'installation', 'connection_id'])), 'Task request includes its complete binding, not service credentials.');
+    AgentTransport::$body = str_repeat('x', 65537);
+    $check(\GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000)['status'] === 0,
+        'Task response is capped at 64 KiB.');
+    $calls = AgentTransport::$calls;
+    try {
+        \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'result', 'result' => str_repeat('x', 65536)], hrtime(true) + 1_000_000_000);
+        throw new LogicException('Oversized result accepted');
+    } catch (RuntimeException) { $check(AgentTransport::$calls === $calls, 'Oversized task result is rejected before HTTP.'); }
     echo "Agent HTTP/security tests passed ($checks checks; transport entirely mocked).\n";
 }
