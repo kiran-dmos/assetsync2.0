@@ -1,7 +1,7 @@
 # GLPI B Agent
 
 This branch provides a separate `assetsync20agent` plugin for GLPI B. Install the
-controller (`assetsync20`) only on A. B stores Computer fingerprints and a durable
+controller (`assetsync20`) only on A. B stores typed asset fingerprints and a durable
 outbox; it has no mappings and cannot run the controller. In default REST mode A remains responsible
 for native/Fields metadata, mappings, permissions, Both/source-of-truth policy,
 native UUID handling and billing. The prototype has passed the isolated checks
@@ -10,18 +10,17 @@ listed below; this is not a production rollout or scale qualification.
 ## Bounded Agent-Only Mode
 
 Stop both workers, including scheduled runs, before upgrading AssetSync. Install
-the scalar-capable B agent code first (0.2.0), then the A controller code (0.3.0),
+the multi-asset B agent code first (0.3.0), then the A controller code (0.4.0),
 using GLPI's plugin Update action when upgrading from older installed versions.
 New task/pair/journal tables and columns are additive. Existing connections default
 to REST and retain their existing behavior. This is an AssetSync upgrade only;
 do not upgrade official GLPI or Fields as part of this procedure. Resume workers
 only after both code updates and any required additive migrations succeed.
 
-The scalar extension publishes task version 2 with an explicit `type` on each
-change. Deploy this revision of B before A even when the displayed plugin versions
-already match: an older text-only B rejects version 2. There is no protocol
-downgrade or REST fallback. Version 1 tasks still execute with their original
-text-only snapshot shape and string values. Existing task bodies, hashes, saved
+The controller publishes task version 3 with immutable pair ID, item type, item ID
+and exact entity, plus the scalar `type` on each change. Install B before A: older
+agents reject version 3. There is no protocol downgrade or REST fallback.
+Versions 1 and 2 retain their original wire and snapshot shapes. Existing task bodies, hashes, saved
 results and journal replay are preserved, including expired tasks with durable
 results; do not rewrite, delete or reset them during an upgrade. B validates the
 original wire hash before checking scalar values. Refresh observation after the
@@ -30,20 +29,34 @@ upgrade to expose Yes/No and Date fields in the mapping catalog.
 1. Select **agent** for the A connection. B REST tokens are not saved in this mode.
 2. On B's agent configuration, obtain its persisted installation identity. This
    identifies the installation, not the Computer UUID.
-3. Open **Agent Pair** on A. Declare the installation identity, existing A/B
-   Computer IDs and exact B entity. A Computer must already have a serial. This
-   initial inspection does not require a saved route or mapping catalog.
+3. Open **Agent Pair** on A and register the installation identity. Registration
+   needs no asset pair, route, mapping, REST token or connection test.
 4. Enter the once-displayed registration/generation/token and connection ID on B.
-   Select agent mode, the same Computer/entity and a dedicated active GLPI service
-   account/profile with a direct nonrecursive entity assignment, Computer READ
+   Select agent mode and a dedicated active GLPI service account using the native
+   searchable account selector. Select a permitted profile with direct nonrecursive
+   entity assignments, selected asset type READ
    and UPDATE, and applicable Fields container rights. Its password is encrypted
    using GLPIKey on B only. Set the direct HTTPS notification URL described below.
-5. Run B's worker to independently read its identity, serial, entity and metadata.
-   Add an exact nonrecursive Computer-only route on A. Confirm the pair through
+5. A exclusively owns type selection, asset scope, routes, mappings and pair management.
+   B setup contains only transport binding and service identity/permissions, with
+   read-only permitted entity information. B has no asset-scope editor. Migration
+   enrolls nothing; old configured Computer/entity settings remain solely for
+   v1/v2 compatibility. Inventory, links and outbox rows never enroll subscriptions.
+6. Request B discovery on A's existing Agent Pair page, then run B's worker.
+   The readonly HTTPS task returns at most 50 summaries, a cursor and its original
+   observation time. Pending, empty, stale and error are distinct. Choose A and B
+   independently by name, type, serial and entity. A checkboxes select only the
+   displayed page (at most 50); save page selection to retain explicit choices across
+   pages in a cart capped at 200. Each selected A asset needs its own independent B
+   choice from a fresh discovery page. Save chosen candidates, then confirm selected
+   pairs with individual routes and per-row results (at most 50 per request).
+   Candidate selection does not infer positional/name/UUID matches. Refresh its
+   independent inspection. Add an exact single-type nonrecursive route on A using
+   the B entity selector populated by discovery. Confirm the pair through
    the protected Agent Pair POST. Fresh A reads, matching serial/entity, route
    authorization and reverse uniqueness are required. Existing REST confirmation
    is not agent confirmation. No asset is created, moved or relinked.
-6. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
+7. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
    Custom endpoint types must match. Each mapping must use
    `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
    stored B observation; explicit refresh queues a fresh inspection without REST.
@@ -54,13 +67,13 @@ durable results before ACK. A retains immutable task IDs, bindings, expected
 values, policy/metadata fingerprints and captured queue revisions; B journals
 before execution. A releases its claim while `waiting_agent`. New notifications
 remain pending across results; old results cannot complete a newer claim. B's
-notifier and reconciliation are restricted to the owned Computer. Unchanged A
+notifier and reconciliation are restricted to noneditable A-issued typed subscriptions. Unchanged A
 backfill converges using an A-side fingerprint; an hourly safety-net inspection
 or explicit force obtains new B evidence rather than trusting cached B values.
 
 B uses real Auth login and Session profile/entity selection, fresh direct grants
-and model permissions, Computer search-cache clearing before/after contexts, and
-official Computer/Fields model writes. Existing parent/child rows are locked on
+and model permissions, selected-type search-cache clearing before/after contexts, and
+official Computer/Printer/Fields model writes. Existing parent/child rows are locked on
 InnoDB through each write and readback. Named official parent history is checked.
 Readonly Fields scalars still require ordinary parent/container authorization; their
 definition is not changed. A keeps billing calculations after verified inbound
@@ -91,12 +104,45 @@ an old database NULL has blank history text. A reuses FieldsText
 normalization and its existing model writer. Both writers preserve NULL-to-zero
 Yes/No updates despite GLPI's loose comparison.
 
-Creation, other asset types, recursive/inherited-only grants, Both, dropdowns,
+Creation, types other than Computer and Printer, recursive/inherited-only grants, Both, dropdowns,
 textarea, number, datetime, other native fields and UUID mutation are unsupported
 in agent-only mode. The separate UUID service
 returns `unsupported_agent` before any mutation/REST for agent participation,
 including mixed REST/agent participant sets. Supported scalar work remains
 available. REST entry points are fenced against agent fallback.
+
+The installation authenticates independently of its pairs. Each pair has its own
+outstanding slot; discovery has a separate installation slot. Retained uncertainty
+on one pair does not block another. Legacy connection slots resolve only to their
+original Computer and are never released or rewritten by migration. Typed unique
+keys isolate equal numeric Computer/Printer IDs in pairs, receipts and outbox.
+Route approval is appended when confirming another pair. A checks confirmed pair
+authorization before issuing/delivering apply tasks; B independently authenticates
+the service account and freshly checks exact grants, asset and container rights.
+Subscriptions are notification state, never write authority. Discovery and candidate
+inspection require fresh permissions but do not require or create subscriptions.
+Durable results still replay under their original registration after task expiry or
+subscription revocation, without model execution.
+
+Each subscription binds installation, registration/generation, connection, immutable
+pair ID and typed target/entity. A issues ordered revisions and fixed 15-minute
+leases, refreshing active leases after ten minutes. B rejects conflicting/older
+state without extending replayed expiry; omitted pages never revoke other pairs.
+Unconfirming a pair or losing its route authorization produces an explicit revocation.
+An independent bounded subscription-only pull precedes result reporting each worker
+cycle, so task uncertainty, large tasks and lost report ACKs cannot pin subscription
+progress. Each page has at most 50 updates; piggyback updates use only remaining
+bytes and every total HTTPS envelope remains at most 64 KiB. Hooks mark subscribed
+targets dirty without reading values. The worker uses fresh service authorization
+for fingerprints and notification claims. Expiry/revocation/permission failures do
+not reset old outbox revisions, fingerprints or acknowledgement watermarks.
+
+Types come from each installation's trusted GLPI inventory capabilities. Only
+Computer and Printer are implemented in this bounded version; other installed
+types display an unsupported reason. No arbitrary PHP class comes from form input.
+GET setup/route/mapping pages do not enqueue or execute work or call B REST. Discovery
+requires a protected POST and the existing B-pulled task transport. Its summaries
+are limited by the existing 48 KiB snapshot / 64 KiB envelope limits.
 
 There is no pruning. A task/pair records and B journal survive uninstall, including
 unresolved evidence. Keep credentials private and do not reset/reuse generations.
@@ -127,7 +173,7 @@ ingress or storage power-loss qualification. Row locks protect existing asset ro
 not all GLPI policy tables. Isolated GLPI 11.0.7 / Fields 1.24.5 / PHP 8.5.7 evidence
 and host PHP 8.2 regressions are prepared for independent review, not an approval.
 Focused suites: `tests/agent-tasks.php`, `tests/agent-scalars.php`,
-`tests/agent-task-reporting.php` and `tests/agent-http.php`. Scalar tests use host
+`tests/agent-multi.php`, `tests/agent-task-reporting.php` and `tests/agent-http.php`. Scalar tests use host
 model doubles and SQLite for normalization parity, both authorities, raw history,
 readback failures, stale/no-op behavior and immutable v1/v2 replay. HTTP tests use
 mocked transport, not live traffic measurement. These tests do not certify live
@@ -137,7 +183,7 @@ independent verification on those installed versions remains required.
 
 ## REST Notification Mode Setup
 
-1. Upgrade/install controller version **0.3.0** as `plugins/assetsync20` on A using GLPI's
+1. Upgrade/install controller version **0.4.0** as `plugins/assetsync20` on A using GLPI's
    plugin installer. This adds registration/receipt tables, confirmed-link
    evidence, queue revision counters and claim tokens. Stop workers during the
    schema upgrade, including cron, and run GLPI's plugin **Update** action (not

@@ -7,7 +7,8 @@ require_once __DIR__ . '/src/autoload.php';
 function plugin_assetsync20agent_install(): bool
 {
     \GlpiPlugin\Assetsync20agent\Settings::install();
-    return \GlpiPlugin\Assetsync20agent\Outbox::install() && \GlpiPlugin\Assetsync20agent\TaskJournal::install();
+    return \GlpiPlugin\Assetsync20agent\Outbox::install() && \GlpiPlugin\Assetsync20agent\TaskJournal::install()
+        && \GlpiPlugin\Assetsync20agent\TargetScope::install();
 }
 
 function plugin_assetsync20agent_uninstall(): bool

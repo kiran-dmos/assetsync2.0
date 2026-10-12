@@ -43,7 +43,12 @@ if ($selectedConnection !== null) {
     if (GlpiBConnection::isAgent($selectedConnection) && isset($_POST['refresh_agent'])) {
         Session::checkRight('config', UPDATE);
         try {
-            \GlpiPlugin\Assetsync20\AgentTask::inspect($selectedConnectionId);
+            global $DB;
+            foreach ($DB->request(['FROM' => \GlpiPlugin\Assetsync20\AgentTask::PAIRS,
+                'WHERE' => ['connection_id' => $selectedConnectionId, 'itemtype' => $selectedItemtype], 'ORDER' => 'local_id ASC', 'LIMIT' => 1]) as $pair) {
+                if (!\GlpiPlugin\Assetsync20\AgentTask::model($selectedItemtype)->can((int) $pair['local_id'], READ)) { throw new RuntimeException('Asset unavailable.'); }
+                \GlpiPlugin\Assetsync20\AgentTask::inspect($selectedConnectionId, $pair['id']);
+            }
             $message = 'Inspection queued; awaiting B agent.';
         } catch (Throwable $error) { $message = $error->getMessage(); $messageClass = 'warning'; }
     }

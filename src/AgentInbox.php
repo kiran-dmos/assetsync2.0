@@ -21,12 +21,13 @@ final class AgentInbox
             && (bool) $DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::RECEIPTS . '` (
             `id` INT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
             `registration_id` CHAR(32) NOT NULL, `computer_id` INT UNSIGNED NOT NULL,
+            `itemtype` VARCHAR(100) NOT NULL DEFAULT \'Computer\',
             `received_revision` BIGINT NOT NULL DEFAULT 0, `admitted_revision` BIGINT NOT NULL DEFAULT 0,
             `completed_revision` BIGINT NOT NULL DEFAULT 0, `work_generation` BIGINT NOT NULL DEFAULT 0,
             `queue_id` INT UNSIGNED DEFAULT NULL, `lifecycle` VARCHAR(12) NOT NULL DEFAULT \'present\',
             `outcome` VARCHAR(20) NOT NULL DEFAULT \'received\', `received_at` BIGINT NOT NULL DEFAULT 0,
             `outcome_at` BIGINT NOT NULL DEFAULT 0,
-            UNIQUE KEY `agent_computer` (`registration_id`, `computer_id`), KEY `queue_lookup` (`queue_id`)
+            UNIQUE KEY `agent_computer` (`registration_id`, `itemtype`, `computer_id`), KEY `queue_lookup` (`queue_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
         if (!$installed) {
             return false;
@@ -37,7 +38,10 @@ final class AgentInbox
                 return false;
             }
         }
-        return true;
+        if (!$DB->fieldExists(self::RECEIPTS, 'itemtype') && !$DB->doQuery('ALTER TABLE `' . self::RECEIPTS . '` ADD `itemtype` VARCHAR(100) NOT NULL DEFAULT \'Computer\'')) { return false; }
+        $index = self::one('SHOW INDEX FROM `' . self::RECEIPTS . '` WHERE Key_name = \'agent_computer\' AND Seq_in_index = 2');
+        return ($index['Column_name'] ?? '') === 'itemtype'
+            || (bool) $DB->doQuery('ALTER TABLE `' . self::RECEIPTS . '` DROP INDEX `agent_computer`, ADD UNIQUE KEY `agent_computer` (`registration_id`, `itemtype`, `computer_id`)');
     }
 
     public static function identity(array $connection): string
@@ -64,6 +68,7 @@ final class AgentInbox
     {
         global $DB;
         $connection = self::connection($connectionId);
+        if ($connection && GlpiBConnection::isAgent($connection)) { throw new \RuntimeException('Use Agent Pair to register this installation.'); }
         $approved = [];
         foreach (EntitySyncRoute::loadAll() as $route) {
             if (in_array($route['id'], $routeIds, true) && $route['glpi_b_connection_id'] === $connectionId
@@ -188,6 +193,11 @@ final class AgentInbox
         }
         $actual = array_keys($event);
         sort($actual);
+        if (isset($event['itemtype'])) {
+            if (!in_array($event['itemtype'], ['Computer', 'Printer'], true)) { throw new \InvalidArgumentException('Unsupported notification type.'); }
+            $keys[] = 'itemtype';
+            sort($keys);
+        }
         if (($event['kind'] ?? '') === 'health') {
             if ($actual !== ['generation', 'kind', 'reconcile_status', 'registration']
                 || !is_string($event['registration']) || !preg_match('/^[a-f0-9]{32}$/D', $event['registration'])
@@ -243,9 +253,12 @@ final class AgentInbox
             }
             $reg = $DB->quote($registration['id']);
             $id = $event['computer_id'];
+            $type = $event['itemtype'] ?? 'Computer';
+            if (!GlpiBConnection::isAgent($connection) && $type !== 'Computer') { throw new \RuntimeException('Unsupported REST notification type.'); }
+            $quotedType = $DB->quote($type);
             $revision = $event['revision'];
-            $receipt = self::one('SELECT * FROM `' . self::RECEIPTS . "` WHERE `registration_id` = {$reg} AND `computer_id` = {$id} FOR UPDATE");
-            $where = ['registration_id' => $registration['id'], 'computer_id' => $id];
+            $receipt = self::one('SELECT * FROM `' . self::RECEIPTS . "` WHERE `registration_id` = {$reg} AND `computer_id` = {$id} AND `itemtype` = {$quotedType} FOR UPDATE");
+            $where = ['registration_id' => $registration['id'], 'computer_id' => $id, 'itemtype' => $type];
             if ($receipt === null) {
                 self::written($DB->insert(self::RECEIPTS, $where));
                 $receipt = ['received_revision' => 0, 'admitted_revision' => 0];
@@ -261,7 +274,7 @@ final class AgentInbox
                 self::sql('COMMIT');
                 return self::ack($event);
             }
-            $pair = self::pair($registration, $id);
+            $pair = self::pair($registration, $id, $type);
             if ($event['lifecycle'] !== 'present' || $revision < (int) $receipt['received_revision'] || $pair === null) {
                 self::written($DB->update(self::RECEIPTS, ['outcome' => 'blocked', 'outcome_at' => time()], $where));
                 self::sql('COMMIT');
@@ -272,14 +285,14 @@ final class AgentInbox
             $route = $DB->quote($pair['route_id']);
             // Receipt admission increments a dedicated counter, leaving lease/backoff and needs_recheck intact.
             self::sql('INSERT INTO `' . AssetSyncQueue::TABLE . '` (`itemtype`,`items_id`,`glpi_b_connection_id`,`route_id`,`remote_items_id`,`agent_requested`,`date_creation`,`date_mod`)'
-                . " VALUES ('Computer',{$local},{$conn},{$route},{$id},1,NOW(),NOW()) ON DUPLICATE KEY UPDATE `agent_requested` = `agent_requested` + 1");
-            $queue = self::one('SELECT * FROM `' . AssetSyncQueue::TABLE . "` WHERE `itemtype` = 'Computer' AND `items_id` = {$local} AND `glpi_b_connection_id` = {$conn} FOR UPDATE");
+                . " VALUES ({$quotedType},{$local},{$conn},{$route},{$id},1,NOW(),NOW()) ON DUPLICATE KEY UPDATE `agent_requested` = `agent_requested` + 1");
+            $queue = self::one('SELECT * FROM `' . AssetSyncQueue::TABLE . "` WHERE `itemtype` = {$quotedType} AND `items_id` = {$local} AND `glpi_b_connection_id` = {$conn} FOR UPDATE");
             if (!$queue || (int) $queue['agent_requested'] <= (int) $queue['agent_completed']) {
                 throw new \RuntimeException('Queue admission failed.');
             }
             self::written($DB->update(self::RECEIPTS, ['admitted_revision' => $revision, 'queue_id' => (int) $queue['id'],
                 'work_generation' => (int) $queue['agent_requested'], 'outcome' => 'queued', 'outcome_at' => time()], $where));
-            $readback = self::one('SELECT * FROM `' . self::RECEIPTS . "` WHERE `registration_id` = {$reg} AND `computer_id` = {$id}");
+            $readback = self::one('SELECT * FROM `' . self::RECEIPTS . "` WHERE `registration_id` = {$reg} AND `computer_id` = {$id} AND `itemtype` = {$quotedType}");
             if (!$readback || (int) $readback['admitted_revision'] !== $revision || (int) $readback['queue_id'] !== (int) $queue['id']) {
                 throw new \RuntimeException('Receipt admission failed.');
             }
@@ -293,12 +306,14 @@ final class AgentInbox
 
     private static function ack(array $event): array
     {
-        return ['status' => 200, 'accepted' => true, 'registration' => $event['registration'],
+        $ack = ['status' => 200, 'accepted' => true, 'registration' => $event['registration'],
             'generation' => $event['generation'], 'computer_id' => $event['computer_id'], 'revision' => $event['revision']];
+        if (isset($event['itemtype'])) { $ack['itemtype'] = $event['itemtype']; }
+        return $ack;
     }
 
     /** Exactly one confirmed reverse link, still on an enabled approved route. */
-    public static function pair(array $registration, int $remoteId): ?array
+    public static function pair(array $registration, int $remoteId, string $type = 'Computer'): ?array
     {
         global $DB;
         $connection = self::connection($registration['connection_id']);
@@ -307,13 +322,14 @@ final class AgentInbox
         }
         if (GlpiBConnection::isAgent($connection)) {
             try {
-                $agentPair = AgentTask::pair($connection['id']);
+                $agentPair = self::one('SELECT * FROM `' . AgentTask::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($connection['id'])
+                    . ' AND `itemtype` = ' . $DB->quote($type) . ' AND `computer_id` = ' . $remoteId);
                 if (!$agentPair || $agentPair['registration'] !== $registration['id'] || (int) $agentPair['computer_id'] !== $remoteId) { return null; }
                 AgentTask::scope($agentPair);
             } catch (\Throwable) { return null; }
         }
         $links = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
-            'itemtype' => 'Computer', 'glpi_b_connection_id' => $registration['connection_id'],
+            'itemtype' => $type, 'glpi_b_connection_id' => $registration['connection_id'],
             'remote_items_id' => $remoteId], 'LIMIT' => 2]));
         if (count($links) !== 1) {
             return null;
@@ -322,12 +338,14 @@ final class AgentInbox
         if ((int) $link['confirmed_remote_id'] !== $remoteId || $link['confirmed_identity'] !== $registration['connection_identity']) {
             return null;
         }
-        $asset = self::one('SELECT * FROM `glpi_computers` WHERE `id` = ' . (int) $link['items_id']);
+        if (!in_array($type, ['Computer', 'Printer'], true)) { return null; }
+        $table = $type === 'Computer' ? 'glpi_computers' : 'glpi_printers';
+        $asset = self::one('SELECT * FROM `' . $table . '` WHERE `id` = ' . (int) $link['items_id']);
         if (!$asset || $asset['is_deleted'] || $asset['is_template']) {
             return null;
         }
         EntitySyncRoute::loadAll(true);
-        $scope = EntitySyncRoute::matchAsset('Computer', (string) $asset['entities_id'], [], $registration['connection_id']);
+        $scope = EntitySyncRoute::matchAsset($type, (string) $asset['entities_id'], [], $registration['connection_id']);
         if ($scope['conflicts'] !== [] || count($scope['matches']) !== 1) {
             return null;
         }
@@ -352,9 +370,9 @@ final class AgentInbox
                 continue;
             }
             $registration = self::one('SELECT * FROM `' . self::REGISTRATIONS . '` WHERE `id` = ' . $DB->quote($receipt['registration_id']));
-            $found = $registration ? self::pair($registration, (int) $receipt['computer_id']) : null;
+            $found = $registration ? self::pair($registration, (int) $receipt['computer_id'], $receipt['itemtype']) : null;
             if (!$found || $receipt['lifecycle'] !== 'present' || (int) $receipt['received_revision'] > (int) $receipt['admitted_revision']
-                || (int) $found['items_id'] !== (int) $job['items_id'] || ($pair && $pair['id'] !== $found['id'])) {
+                || $found['itemtype'] !== $job['itemtype'] || (int) $found['items_id'] !== (int) $job['items_id'] || ($pair && $pair['id'] !== $found['id'])) {
                 return null;
             }
             $pair = $found;

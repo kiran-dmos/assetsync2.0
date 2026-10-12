@@ -46,15 +46,22 @@ final class Settings
         }
         // The generation is part of each outbox claim; old requests cannot acknowledge a reset.
         if ($settings['mode'] === 'agent') {
-            foreach (['connection_id', 'computer_id', 'entity_id', 'service_user', 'service_profile', 'service_name'] as $key) {
+            foreach (['connection_id', 'service_user', 'service_profile'] as $key) {
                 $settings[$key] = trim((string) ($input[$key] ?? $old[$key] ?? ''));
             }
-            foreach (['computer_id', 'service_user', 'service_profile'] as $key) {
+            foreach (['service_user', 'service_profile'] as $key) {
                 if (!ctype_digit($settings[$key]) || (int) $settings[$key] <= 0) { throw new \RuntimeException('Invalid service scope.'); }
             }
-            if (!ctype_digit($settings['entity_id']) || $settings['connection_id'] === '' || $settings['service_name'] === '') {
-                throw new \RuntimeException('An exact entity and connection binding are required.');
+            if ($settings['connection_id'] === '' || strlen($settings['connection_id']) > 255) {
+                throw new \RuntimeException('A connection binding is required.');
             }
+            ServiceContext::account((int) $settings['service_user']);
+            if (self::entities((int) $settings['service_user'], (int) $settings['service_profile']) === []) {
+                throw new \RuntimeException('Select a profile with a direct nonrecursive entity grant.');
+            }
+            $user = new \User();
+            $user->getFromDB((int) $settings['service_user']);
+            $settings['service_name'] = (string) $user->fields['name'];
             $password = (string) ($input['service_password'] ?? '');
             if ($password === '' && $settings['service_name'] === ($old['service_name'] ?? '')) { $password = $old['service_password']; }
             if ($password === '') { throw new \RuntimeException('A dedicated service login is required.'); }
@@ -70,5 +77,19 @@ final class Settings
         if (empty($settings['installation'])) {
             \Config::setConfigurationValues(self::CONTEXT, ['installation' => bin2hex(random_bytes(16))]);
         }
+    }
+
+    public static function entities(int $user, int $profile): array
+    {
+        global $DB;
+        $result = [];
+        $rows = Outbox::sql('SELECT DISTINCT `entities_id` FROM `glpi_profiles_users` WHERE `users_id` = ' . $user
+            . ' AND `profiles_id` = ' . $profile . ' AND `is_recursive` = 0 ORDER BY `entities_id` LIMIT 51');
+        while ($grant = $DB->fetchAssoc($rows)) {
+            $id = (int) $grant['entities_id'];
+            $result[$id] = \Dropdown::getDropdownName('glpi_entities', $id);
+        }
+        if (count($result) > 50) { throw new \RuntimeException('Service scope exceeds 50 exact entities. Use a narrower profile.'); }
+        return $result;
     }
 }

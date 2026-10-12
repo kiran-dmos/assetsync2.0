@@ -300,7 +300,7 @@ echo '<td><input type="text" id="name" name="name" value="' . $html($connection[
 echo '<tr><td><label for="base_url">Base URL</label></td>';
 echo '<td><input type="url" id="base_url" name="base_url" value="' . $html($connection['base_url']) . '" size="60" placeholder="https://glpi-b.example.com"></td></tr>';
 echo '<tr><td><label for="mode">Connection mode</label></td><td><select id="mode" name="mode">';
-foreach (['rest' => 'REST', 'agent' => 'B agent (bounded Computer pair)'] as $mode => $label) {
+foreach (['rest' => 'REST', 'agent' => 'B agent (Computer and Printer pairs)'] as $mode => $label) {
     echo '<option value="' . $mode . '"' . (($connection['mode'] ?? 'rest') === $mode ? ' selected' : '') . '>' . $label . '</option>';
 }
 echo '</select> <a href="' . $html(dirname(Menu::configUrl()) . '/agent-pair.php') . '">Agent Pair</a></td></tr>';

@@ -95,7 +95,7 @@ class Profile
 {
     public array $fields = [];
     public static int $rights = READ | UPDATE;
-    public function getFromDB($id): bool { $this->fields = ['computer' => self::$rights]; return true; }
+    public function getFromDB($id): bool { $this->fields = ['computer' => self::$rights, 'printer' => self::$rights]; return true; }
 }
 class Profile_User
 {
@@ -104,15 +104,17 @@ class Profile_User
 }
 class Dropdown
 {
+    public static function getDropdownName($table, $id): string { return 'Entity ' . $id; }
     public static function getYesNo($value): string { return $value ? 'Oui' : 'Non'; }
 }
 class Search
 {
     public static array $options = [];
+    public static array $typedOptions = [];
     public static int $clears = 0;
     public static ?Closure $onClear = null;
-    public static function getOptions($type): array { return self::$options; }
-    public static function getOptionsForItemtype($type): array { return self::$options; }
+    public static function getOptions($type): array { return self::$typedOptions[$type] ?? self::$options; }
+    public static function getOptionsForItemtype($type): array { return self::getOptions($type); }
     public static function clearSearchOptionCache($type): void
     {
         self::$clears++;
@@ -123,12 +125,13 @@ class_alias(Search::class, 'Glpi\\Search\\SearchOption');
 
 class Computer
 {
+    public static function getTable(): string { return 'glpi_computers'; }
     public array $fields = [];
     public static bool $allowUpdate = true;
     public function getFromDB($id): bool
     {
         global $DB;
-        $this->fields = $DB->firstRow('glpi_computers', ['id' => $id]) ?? [];
+        $this->fields = $DB->firstRow(static::getTable(), ['id' => $id]) ?? [];
         return $this->fields !== [];
     }
     public function can($id, $right): bool { return ($right !== UPDATE || self::$allowUpdate) && $this->getFromDB($id); }
@@ -137,16 +140,16 @@ class Computer
         global $DB;
         $id = $input['id'];
         foreach (array_diff_key($input, ['id' => true]) as $column => $value) {
-            $old = $DB->firstRow('glpi_computers', ['id' => $id])[$column];
-            $DB->update('glpi_computers', [$column => $value], ['id' => $id]);
-            Log::record($id, $column, $old, $value);
+            $old = $DB->firstRow(static::getTable(), ['id' => $id])[$column];
+            $DB->update(static::getTable(), [$column => $value], ['id' => $id]);
+            Log::record($id, $column, $old, $value, static::class);
         }
         return true;
     }
 }
 
-function getTableForItemType($class): string { return 'glpi_plugin_fields_computerscalars'; }
-function getItemTypeForTable($table): string { return 'PluginFieldsComputerscalar'; }
+function getTableForItemType($class): string { return $class::getTable(); }
+function getItemTypeForTable($table): string { return $table === 'glpi_plugin_fields_printerscalars' ? 'PluginFieldsPrinterscalar' : 'PluginFieldsComputerscalar'; }
 class PluginFieldsProfile
 {
     public static int $right = UPDATE;
@@ -178,10 +181,11 @@ class PluginFieldsContainer
     public static string $fault = '';
     public static int $calls = 0;
     public static array $inputs = [];
-    public static function getClassname($type, $name): string { return 'PluginFieldsComputerscalar'; }
+    public static function getClassname($type, $name): string { return $type === 'Printer' ? 'PluginFieldsPrinterscalar' : 'PluginFieldsComputerscalar'; }
     public static function getAddSearchOptions($type): array
     {
-        return array_filter(Search::$options, static fn ($option) => $option['table'] === PluginFieldsComputerscalar::getTable());
+        $class = self::getClassname($type, 'scalars');
+        return array_filter(Search::getOptions($type), static fn ($option) => $option['table'] === $class::getTable());
     }
     public function getFromDB($id): bool
     {
@@ -203,7 +207,8 @@ class PluginFieldsContainer
         self::$inputs[] = $input;
         if (self::$fault === 'deny' || !self::validateValues($input, $type, $massiveaction)) { return false; }
         if (self::$fault === 'ignore') { return true; }
-        $row = new PluginFieldsComputerscalar();
+        $class = self::getClassname($type, 'scalars');
+        $row = new $class();
         if (!$row->getFromDBByCrit(['items_id' => $input['items_id']])) { throw new LogicException('Unexpected child creation'); }
         return $row->update(['id' => $row->fields['id']] + $input);
     }
@@ -217,15 +222,15 @@ class PluginFieldsComputerscalar
     public function getFromDBByCrit($criteria): bool
     {
         global $DB;
-        $this->fields = $DB->firstRow(self::getTable(), $criteria) ?? [];
+        $this->fields = $DB->firstRow(static::getTable(), $criteria) ?? [];
         return $this->fields !== [];
     }
     public function update(array $input): bool
     {
         global $DB;
         if (self::$ignoreUpdate) { return true; }
-        $before = $DB->firstRow(self::getTable(), ['id' => $input['id']]);
-        foreach ($DB->request(['FROM' => 'glpi_plugin_fields_fields']) as $field) {
+        $before = $DB->firstRow(static::getTable(), ['id' => $input['id']]);
+        foreach ($DB->request(['FROM' => 'glpi_plugin_fields_fields', 'WHERE' => ['plugin_fields_containers_id' => $before['plugin_fields_containers_id']]]) as $field) {
             $column = $field['name'];
             if (!array_key_exists($column, $input)) { continue; }
             $old = $before[$column];
@@ -234,11 +239,11 @@ class PluginFieldsComputerscalar
             $modelValue = $field['type'] === 'date' && $value === '' && self::$dateNullSentinel ? 'NULL' : $value;
             if ($old == $modelValue) { continue; }
             $stored = $modelValue === 'NULL' ? null : $value;
-            $DB->update(self::getTable(), [$column => $stored], ['id' => $before['id']]);
+            $DB->update(static::getTable(), [$column => $stored], ['id' => $before['id']]);
             if (PluginFieldsContainer::$fault !== 'history_missing') {
                 $auditOld = $field['type'] === 'yesno' ? Dropdown::getYesNo($old) : (string) $old;
                 $auditNew = $field['type'] === 'yesno' ? Dropdown::getYesNo($value) : $modelValue;
-                Log::record((int) $before['items_id'], $column, $auditOld, $auditNew);
+                Log::record((int) $before['items_id'], $column, $auditOld, $auditNew, $before['itemtype']);
             }
         }
         return true;
@@ -247,17 +252,17 @@ class PluginFieldsComputerscalar
 }
 class Log
 {
-    public static function record(int $id, string $column, mixed $old, mixed $new): void
+    public static function record(int $id, string $column, mixed $old, mixed $new, string $type = 'Computer'): void
     {
         global $DB;
-        foreach (Search::$options as $optionId => $option) {
+        foreach (Search::getOptions($type) as $optionId => $option) {
             if ($option['field'] !== $column) { continue; }
             foreach (['old', 'new'] as $side) {
                 $value = (string) $$side;
                 $decoded = json_decode($value);
                 $$side = is_array($decoded) || is_object($decoded) ? '' : mb_substr($value, 0, 255);
             }
-            $DB->insert('glpi_logs', ['items_id' => $id, 'itemtype' => 'Computer', 'id_search_option' => $optionId,
+            $DB->insert('glpi_logs', ['items_id' => $id, 'itemtype' => $type, 'id_search_option' => $optionId,
                 'itemtype_link' => '', 'linked_action' => 0, 'field' => $option['name'],
                 'user_name' => User::getNameForLog(Session::getLoginUserID()), 'old_value' => $old,
                 'new_value' => PluginFieldsContainer::$fault === 'history_wrong' ? 'wrong' : $new]);
@@ -266,7 +271,7 @@ class Log
     public static function getHistoryData($computer, $start, $limit): array
     {
         global $DB;
-        return iterator_to_array($DB->request(['FROM' => 'glpi_logs', 'WHERE' => ['items_id' => $computer->fields['id']], 'ORDER' => 'id DESC', 'LIMIT' => $limit]));
+        return iterator_to_array($DB->request(['FROM' => 'glpi_logs', 'WHERE' => ['itemtype' => $computer::class, 'items_id' => $computer->fields['id']], 'ORDER' => 'id DESC', 'LIMIT' => $limit]));
     }
 }
 
@@ -274,7 +279,7 @@ function scalarSetup(): array
 {
     global $DB, $CFG_GLPI;
     $DB = new ScalarDB();
-    $CFG_GLPI = [];
+    $CFG_GLPI = ['inventory_types' => ['Computer', 'Printer']];
     $_SESSION = ['caller' => 'preserved'];
     Config::$values = [];
     User::$active = true;
@@ -289,6 +294,7 @@ function scalarSetup(): array
     PluginFieldsContainer::$inputs = [];
     PluginFieldsStatusOverride::$overrides = [];
     Search::$clears = 0;
+    Search::$typedOptions = [];
     Search::$onClear = null;
     $DB->doQuery('CREATE TABLE glpi_computers (id INTEGER PRIMARY KEY, entities_id INTEGER, name TEXT, comment TEXT,
         serial TEXT, states_id INTEGER DEFAULT 0, is_deleted INTEGER DEFAULT 0, is_template INTEGER DEFAULT 0)');
@@ -322,6 +328,7 @@ function scalarSetup(): array
         'generation' => str_repeat('c', 32), 'connection_id' => 'b', 'computer_id' => 201, 'entity_id' => 100,
         'service_user' => 7, 'service_profile' => 4, 'service_name' => 'scalar', 'service_password' => 'test-only'];
     Config::$values['plugin:assetsync20agent'] = $settings;
+    \GlpiPlugin\Assetsync20agent\TargetScope::install();
     return $settings;
 }
 function scalarKey(string $column): string { return 'Computer.PluginFieldsComputerscalar.' . $column; }

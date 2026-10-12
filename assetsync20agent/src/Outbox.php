@@ -11,24 +11,31 @@ final class Outbox
     public static function install(): bool
     {
         global $DB;
-        return (bool) $DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::TABLE . '` (
-            `computer_id` INT UNSIGNED PRIMARY KEY,
+        $ok = (bool) $DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::TABLE . '` (
+            `computer_id` INT UNSIGNED NOT NULL, `itemtype` VARCHAR(100) NOT NULL DEFAULT \'Computer\',
             `revision` BIGINT NOT NULL DEFAULT 0, `acked_revision` BIGINT NOT NULL DEFAULT 0,
             `fingerprint` CHAR(64) NOT NULL, `lifecycle` VARCHAR(12) NOT NULL DEFAULT \'present\',
             `generation` CHAR(32) NOT NULL DEFAULT \'\', `claim_token` CHAR(32) NOT NULL DEFAULT \'\',
             `lease_until` BIGINT NOT NULL DEFAULT 0, `next_attempt` BIGINT NOT NULL DEFAULT 0,
             `attempts` INT NOT NULL DEFAULT 0, `last_outcome` VARCHAR(20) NOT NULL DEFAULT \'baseline\',
-            `last_ack` BIGINT NOT NULL DEFAULT 0, `changed_at` BIGINT NOT NULL DEFAULT 0
+            `last_ack` BIGINT NOT NULL DEFAULT 0, `changed_at` BIGINT NOT NULL DEFAULT 0,
+            PRIMARY KEY (`itemtype`, `computer_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
+        if (!$ok) { return false; }
+        if (!$DB->fieldExists(self::TABLE, 'itemtype') && !$DB->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `itemtype` VARCHAR(100) NOT NULL DEFAULT \'Computer\'')) { return false; }
+        $index = self::one('SHOW INDEX FROM `' . self::TABLE . '` WHERE Key_name = \'PRIMARY\' AND Seq_in_index = 1');
+        return ($index['Column_name'] ?? '') === 'itemtype'
+            || (bool) $DB->doQuery('ALTER TABLE `' . self::TABLE . '` DROP PRIMARY KEY, ADD PRIMARY KEY (`itemtype`, `computer_id`)');
     }
 
-    public static function find(int $id): ?array
+    public static function find(int $id, string $type = 'Computer'): ?array
     {
-        return self::one('SELECT * FROM `' . self::TABLE . '` WHERE `computer_id` = ' . $id);
+        global $DB;
+        return self::one('SELECT * FROM `' . self::TABLE . '` WHERE `computer_id` = ' . $id . ' AND `itemtype` = ' . $DB->quote($type));
     }
 
     /** baseline=true never clears a hook revision, even if the hook wins the initial insert race. */
-    public static function observe(int $id, array $snapshot, bool $baseline, ?array $before = null): void
+    public static function observe(int $id, array $snapshot, bool $baseline, ?array $before = null, string $type = 'Computer'): void
     {
         global $DB;
         if ($id <= 0) {
@@ -37,8 +44,9 @@ final class Outbox
         $fingerprint = $DB->quote($snapshot['fingerprint']);
         $lifecycle = $DB->quote($snapshot['lifecycle']);
         $now = time();
+        $quotedType = $DB->quote($type);
         if ($baseline && $before === null) {
-            self::sql('INSERT IGNORE INTO `' . self::TABLE . "` (`computer_id`,`fingerprint`,`lifecycle`,`changed_at`) VALUES ({$id},{$fingerprint},{$lifecycle},{$now})");
+            self::sql('INSERT IGNORE INTO `' . self::TABLE . "` (`itemtype`,`computer_id`,`fingerprint`,`lifecycle`,`changed_at`) VALUES ({$quotedType},{$id},{$fingerprint},{$lifecycle},{$now})");
             return;
         }
         if ($baseline) {
@@ -47,11 +55,11 @@ final class Outbox
             }
             // A concurrent hook owns its newer fingerprint and cannot be overwritten by an older scan.
             self::sql('UPDATE `' . self::TABLE . "` SET `revision` = `revision` + 1, `fingerprint` = {$fingerprint}, `lifecycle` = {$lifecycle}, `changed_at` = {$now}"
-                . ' WHERE `computer_id` = ' . $id . ' AND `revision` = ' . (int) $before['revision']
+                . ' WHERE `computer_id` = ' . $id . ' AND `itemtype` = ' . $quotedType . ' AND `revision` = ' . (int) $before['revision']
                 . ' AND `fingerprint` = ' . $DB->quote($before['fingerprint']));
             return;
         }
-        self::sql('INSERT INTO `' . self::TABLE . "` (`computer_id`,`revision`,`fingerprint`,`lifecycle`,`changed_at`,`last_outcome`) VALUES ({$id},1,{$fingerprint},{$lifecycle},{$now},'pending')"
+        self::sql('INSERT INTO `' . self::TABLE . "` (`itemtype`,`computer_id`,`revision`,`fingerprint`,`lifecycle`,`changed_at`,`last_outcome`) VALUES ({$quotedType},{$id},1,{$fingerprint},{$lifecycle},{$now},'pending')"
             . ' ON DUPLICATE KEY UPDATE `revision` = `revision` + IF(`fingerprint` <> VALUES(`fingerprint`) OR `lifecycle` <> VALUES(`lifecycle`), 1, 0),'
             . ' `fingerprint` = VALUES(`fingerprint`), `lifecycle` = VALUES(`lifecycle`), `changed_at` = VALUES(`changed_at`)');
     }
@@ -61,9 +69,35 @@ final class Outbox
         global $DB;
         $generation = $DB->quote($settings['generation']);
         $now = time();
-        $scope = ($settings['mode'] ?? 'rest') === 'agent' ? ' AND `computer_id` = ' . (int) ($settings['computer_id'] ?? 0) : '';
-        $row = self::one('SELECT * FROM `' . self::TABLE . "` WHERE (`revision` > `acked_revision` OR (`revision` > 0 AND `generation` <> {$generation}))"
-            . " AND `lease_until` <= {$now} AND (`next_attempt` <= {$now} OR `generation` <> {$generation})" . $scope . ' ORDER BY `next_attempt`, `computer_id` LIMIT 1');
+        $agent = ($settings['mode'] ?? 'rest') === 'agent';
+        $scope = " AND `itemtype` = 'Computer'";
+        if ($agent) {
+            $scope = ' AND EXISTS (SELECT 1 FROM `' . TargetScope::TABLE . '` s WHERE s.`items_id` = `'
+                . self::TABLE . '`.`computer_id` AND s.`itemtype` = `' . self::TABLE . '`.`itemtype` AND s.`active` = 1 AND s.`expires` > ' . $now;
+            foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
+                $scope .= ' AND s.`' . $key . '` = ' . $DB->quote($settings[$key]);
+            }
+            $scope .= ')';
+        }
+        $rows = self::sql('SELECT * FROM `' . self::TABLE . "` WHERE (`revision` > `acked_revision` OR (`revision` > 0 AND `generation` <> {$generation}))"
+            . " AND `lease_until` <= {$now} AND (`next_attempt` <= {$now} OR `generation` <> {$generation})" . $scope . ' ORDER BY `next_attempt`, `computer_id`, `itemtype` LIMIT 50');
+        $row = null;
+        while ($candidate = $DB->fetchAssoc($rows)) {
+            if ($agent) {
+                try {
+                    $subscription = TargetScope::subscription($candidate['itemtype'], (int) $candidate['computer_id'], $settings);
+                    if (!$subscription) { continue; }
+                    TargetScope::snapshot($subscription, $settings);
+                } catch (\Throwable) {
+                    // Permission failure never resets an existing revision, fingerprint, generation or ACK.
+                    $DB->update(self::TABLE, ['next_attempt' => $now + 60, 'last_outcome' => 'blocked'],
+                        ['itemtype' => $candidate['itemtype'], 'computer_id' => (int) $candidate['computer_id'], 'claim_token' => $candidate['claim_token']]);
+                    continue;
+                }
+            }
+            $row = $candidate;
+            break;
+        }
         if (!$row) {
             return null;
         }
@@ -74,7 +108,7 @@ final class Outbox
         if ($reset) {
             $fields['acked_revision'] = 0;
         }
-        if (!$DB->update(self::TABLE, $fields, ['computer_id' => (int) $row['computer_id'],
+        if (!$DB->update(self::TABLE, $fields, ['itemtype' => $row['itemtype'], 'computer_id' => (int) $row['computer_id'],
             'revision' => (int) $row['revision'], 'claim_token' => $row['claim_token'], 'lease_until' => (int) $row['lease_until']])
             || $DB->affectedRows() !== 1) {
             return null;
@@ -93,6 +127,7 @@ final class Outbox
                 return false;
             }
         }
+        if (isset($sent['itemtype']) && ($ack['itemtype'] ?? 'Computer') !== $sent['itemtype']) { return false; }
         if (($currentSettings['generation'] ?? '') !== $sent['generation'] || ($currentSettings['registration'] ?? '') !== $sent['registration']) {
             return false;
         }
@@ -116,7 +151,7 @@ final class Outbox
         if (!preg_match('/^[a-f0-9]{32}$/D', $sent['claim_token'] ?? '')) {
             throw new \RuntimeException('Missing outbox claim.');
         }
-        return ['computer_id' => (int) $sent['computer_id'], 'generation' => $sent['generation'], 'claim_token' => $sent['claim_token']];
+        return ['itemtype' => $sent['itemtype'] ?? 'Computer', 'computer_id' => (int) $sent['computer_id'], 'generation' => $sent['generation'], 'claim_token' => $sent['claim_token']];
     }
 
     public static function one(string $sql): ?array

@@ -26,6 +26,10 @@ try {
     if (!is_array($request)) { throw new InvalidArgumentException(); }
     $keys = ($request['kind'] ?? '') === 'pull' ? ['kind', 'registration', 'generation', 'installation', 'connection_id']
         : ['kind', 'registration', 'generation', 'installation', 'connection_id', 'id', 'hash', 'result'];
+    if (($request['kind'] ?? '') === 'pull' && array_key_exists('subscriptions_only', $request)) {
+        if (!is_bool($request['subscriptions_only'])) { throw new InvalidArgumentException(); }
+        $keys[] = 'subscriptions_only';
+    }
     if (array_diff(array_keys($request), $keys) !== [] || array_diff($keys, array_keys($request)) !== []) { throw new InvalidArgumentException(); }
     foreach (['registration', 'generation', 'installation'] as $key) {
         if (!is_string($request[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $request[$key])) { throw new InvalidArgumentException(); }

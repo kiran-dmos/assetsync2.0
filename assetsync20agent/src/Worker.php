@@ -53,10 +53,16 @@ final class Worker
                 if ($sent === null) {
                     break;
                 }
-                if (($settings['mode'] ?? 'rest') === 'agent' && (int) $sent['computer_id'] !== (int) $settings['computer_id']) {
-                    Outbox::retry($sent, 'blocked');
-                    $count++;
-                    continue;
+                if (($settings['mode'] ?? 'rest') === 'agent') {
+                    try {
+                        $subscription = TargetScope::subscription($sent['itemtype'], (int) $sent['computer_id'], $settings);
+                        if (!$subscription) { throw new \RuntimeException('Subscription unavailable.'); }
+                        TargetScope::snapshot($subscription, $settings);
+                    } catch (\Throwable) {
+                        Outbox::retry($sent, 'blocked');
+                        $count++;
+                        continue;
+                    }
                 }
                 $sent['computer_id'] = (int) $sent['computer_id'];
                 $sent['revision'] = (int) $sent['revision'];
@@ -77,13 +83,31 @@ final class Worker
     public function reconcile(): int
     {
         global $DB;
-        $state = \Config::getConfigurationValues(Settings::CONTEXT);
+        $state = Settings::load();
         if (($state['mode'] ?? 'rest') === 'agent') {
-            $id = (int) ($state['computer_id'] ?? 0);
-            if ($id <= 0) { throw new \RuntimeException('Agent pair is not configured.'); }
-            Outbox::observe($id, Snapshot::read($id), true, Outbox::find($id));
-            \Config::setConfigurationValues(Settings::CONTEXT, ['reconcile_status' => 'ok']);
-            return 1;
+            $deadline = hrtime(true) + 2_000_000_000;
+            $cursor = max(0, (int) ($state['target_cursor'] ?? 0));
+            $seen = 0;
+            $degraded = false;
+            $where = array_intersect_key($state, array_flip(['installation', 'registration', 'generation', 'connection_id']));
+            $where += ['id' => ['>', $cursor], 'active' => 1, 'expires' => ['>', time()]];
+            foreach ($DB->request(['FROM' => TargetScope::TABLE, 'WHERE' => $where, 'ORDER' => 'id ASC', 'LIMIT' => 50]) as $target) {
+                if (hrtime(true) >= $deadline) { break; }
+                $id = (int) $target['items_id'];
+                $type = $target['itemtype'];
+                try {
+                    $before = Outbox::find($id, $type);
+                    $snapshot = TargetScope::snapshot($target, $state);
+                    Outbox::observe($id, $snapshot, (int) $target['dirty'] === 0, $before, $type);
+                    $DB->update(TargetScope::TABLE, ['dirty' => 0], ['id' => (int) $target['id'], 'dirty' => (int) $target['dirty']]);
+                } catch (\Throwable) { $degraded = true; }
+                $cursor = (int) $target['id'];
+                $seen++;
+                \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor]);
+            }
+            if ($seen < 50 && hrtime(true) < $deadline) { $cursor = 0; }
+            \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor, 'reconcile_status' => $degraded ? 'degraded' : 'ok']);
+            return $seen;
         }
         $deadline = hrtime(true) + 2_000_000_000;
         $count = 0;
@@ -128,6 +152,7 @@ final class Worker
         $keys = ($sent['kind'] ?? '') === 'health'
             ? ['kind', 'registration', 'generation', 'reconcile_status']
             : ['registration', 'generation', 'computer_id', 'revision', 'lifecycle'];
+        if (($settings['mode'] ?? 'rest') === 'agent' && ($sent['kind'] ?? '') !== 'health') { $keys[] = 'itemtype'; }
         $payload = array_intersect_key($sent, array_flip($keys));
         $curl = curl_init($settings['endpoint']);
         $body = '';

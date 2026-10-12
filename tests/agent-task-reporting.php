@@ -30,10 +30,10 @@ TaskJournal::cycle($settings, hrtime(true) + 1_000_000_000);
 $saved = $DB->fetchAssoc($DB->doQuery('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE id=' . $DB->quote($task['id'])));
 agentCheck($saved['report_status'] === 'rejected' && (int) $saved['acknowledged'] === 0 && $saved['result'] === json_encode($result),
     'Current binding is selected before LIMIT despite 21 old binding rows; rejection retains evidence without claiming ACK.');
-agentCheck(AgentTransport::$calls === $calls + 2 && json_decode(AgentTransport::$options[CURLOPT_POSTFIELDS], true)['kind'] === 'pull',
+agentCheck(AgentTransport::$calls === $calls + 3 && json_decode(AgentTransport::$options[CURLOPT_POSTFIELDS], true)['kind'] === 'pull',
     'Terminal report rejection still permits the next pull.');
 $calls = AgentTransport::$calls;
 TaskJournal::cycle($settings, hrtime(true) + 1_000_000_000);
-agentCheck(AgentTransport::$calls === $calls + 1, 'Rejected old report cannot permanently pin every later pull.');
+agentCheck(AgentTransport::$calls === $calls + 2, 'Rejected old report cannot permanently pin subscription updates or later task pulls.');
 
 echo "Agent task reporting tests passed ($checks total checks including prerequisites).\n";

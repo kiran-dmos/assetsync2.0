@@ -4,6 +4,15 @@ declare(strict_types=1);
 
 require __DIR__ . '/agent-prototype.php';
 if (!defined('READ')) { define('READ', 1); }
+class Session
+{
+    public static function haveAccessToEntity($entity): bool { return true; }
+}
+class AgentSearchOptions extends Search
+{
+    public static function clearSearchOptionCache($type): void {}
+}
+class_alias(AgentSearchOptions::class, 'Glpi\\Search\\SearchOption');
 
 use GlpiPlugin\Assetsync20\AgentTask;
 use GlpiPlugin\Assetsync20\AgentInbox;
@@ -24,7 +33,7 @@ function taskSetup(): array
     $request = ['kind' => 'pull', 'registration' => $credentials['registration'], 'generation' => $credentials['generation'],
         'installation' => str_repeat('a', 32), 'connection_id' => 'b'];
     $task = AgentTask::exchange($request, $credentials['token'])['task'];
-    $snapshot = ['computer_id' => 201, 'entity_id' => 100, 'serial' => 'AGENT-101', 'observed_at' => time(),
+    $snapshot = ['pair_id' => $task['pair_id'], 'itemtype' => 'Computer', 'items_id' => 201, 'entity_id' => 100, 'serial' => 'AGENT-101', 'observed_at' => time(),
         'fields' => ['name' => ['key' => 'name', 'label' => 'Name', 'type' => 'text', 'group' => 'Native', 'option' => 1,
             'metadata' => str_repeat('b', 64), 'value' => 'Original']]];
     $result = ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot];
@@ -109,8 +118,8 @@ AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['
     'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), $credentials['token']);
 agentCheck(AgentTask::outstanding('b')['state'] === 'stale' && AgentTask::outstanding('b')['result'] !== '{}', 'Late evidence is durable but cannot become fresh input.');
 $route = EntitySyncRoute::find('route'); $route['active'] = false; EntitySyncRoute::save($route);
-try { AgentTask::exchange($request, $credentials['token']); throw new LogicException('Revoked route delivered payload'); }
-catch (RuntimeException) { agentCheck(true, 'Current route authorization required independently of notification ACK.'); }
+agentCheck(AgentTask::exchange($request, $credentials['token'])['task'] === null,
+    'A revoked pair cannot deliver work; the authenticated installation remains available for other pairs.');
 
 [$credentials, $request, $snapshot] = taskSetup();
 AssetSyncQueue::notify('Computer', 101, 'b');

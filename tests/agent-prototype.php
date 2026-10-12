@@ -27,7 +27,8 @@ function agentCheck(bool $condition, string $message): void
 
 function agentSetup(): array
 {
-    global $DB;
+    global $DB, $CFG_GLPI;
+    $CFG_GLPI['inventory_types'] = ['Computer', 'Printer'];
     $DB = new AgentSqlite();
     Config::$values = [];
     Computer::$allowUpdate = true;

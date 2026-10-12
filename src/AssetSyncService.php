@@ -359,8 +359,8 @@ final class AssetSyncService
     private function prepareAndQueueLockedAsset(string $itemtype, int $itemsId, string $connectionId, bool $forceInboundRecheck, ?int $deadline, ?float $scanDeadline): ?bool
     {
         if (GlpiBConnection::isAgent($this->activeConnection($connectionId) ?? [])) {
-            $pair = AgentTask::pair($connectionId);
-            if ($itemtype !== 'Computer' || !$pair || (int) $pair['local_id'] !== $itemsId || !$pair['confirmed']) {
+            $pair = AgentTask::pair($connectionId, $itemtype, $itemsId);
+            if (!$pair || !$pair['confirmed']) {
                 return false;
             }
             try {
@@ -567,14 +567,14 @@ final class AssetSyncService
 
         $agentConnection = $this->activeConnection($connectionId);
         if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {
-            AgentTask::process($job, function (array $changes, array $mappings) use ($itemsId): bool {
-                return AssetChangeHook::withoutQueue(function () use ($itemsId, $changes, $mappings): bool {
-                    if ($changes !== [] && !$this->updateLocalAsset('Computer', $itemsId, $changes)) {
+            AgentTask::process($job, function (array $changes, array $mappings) use ($itemtype, $itemsId): bool {
+                return AssetChangeHook::withoutQueue(function () use ($itemtype, $itemsId, $changes, $mappings): bool {
+                    if ($changes !== [] && !$this->updateLocalAsset($itemtype, $itemsId, $changes)) {
                         throw new \RuntimeException('Agent inbound local update failed.');
                     }
-                    $asset = $this->loadLocalAsset('Computer', $itemsId);
-                    if ($asset === null) { throw new \RuntimeException('Local Computer disappeared.'); }
-                    $prepared = $this->prepareAssetForSync('Computer', $itemsId, $asset, $mappings, FieldMapping::expectedCustomTypes('Computer', $mappings));
+                    $asset = $this->loadLocalAsset($itemtype, $itemsId);
+                    if ($asset === null) { throw new \RuntimeException('Local asset disappeared.'); }
+                    $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, FieldMapping::expectedCustomTypes($itemtype, $mappings));
                     return $prepared['billing_changed'];
                 });
             });

@@ -15,7 +15,9 @@ final class ServiceContext
         $sessionStatus = session_status();
         $config = $CFG_GLPI;
         $timezone = date_default_timezone_get();
-        \Glpi\Search\SearchOption::clearSearchOptionCache('Computer');
+        $type = $settings['itemtype'] ?? 'Computer';
+        TargetScope::model($type);
+        \Glpi\Search\SearchOption::clearSearchOptionCache($type);
         try {
             self::account((int) $settings['service_user']);
             \Session::destroy();
@@ -49,7 +51,7 @@ final class ServiceContext
                 $_SESSION = $session;
                 date_default_timezone_set($timezone);
             } finally {
-                \Glpi\Search\SearchOption::clearSearchOptionCache('Computer');
+                \Glpi\Search\SearchOption::clearSearchOptionCache($type);
             }
         }
     }
@@ -74,21 +76,22 @@ final class ServiceContext
         }
     }
 
-    public static function computer(array $settings): \Computer
+    public static function computer(array $settings): object
     {
         self::account((int) $settings['service_user']);
         self::grant($settings);
         $profile = new \Profile();
+        $type = $settings['itemtype'] ?? 'Computer';
+        $item = TargetScope::model($type);
         if ((int) \Session::getLoginUserID() !== (int) $settings['service_user']
             || \Session::isCron() || \Session::isInventory() || \Session::isRightChecksDisabled()
             || (int) ($_SESSION['glpiactiveprofile']['id'] ?? 0) !== (int) $settings['service_profile']
             || (int) ($_SESSION['glpiactive_entity'] ?? -1) !== (int) $settings['entity_id']
             || !$profile->getFromDB((int) $settings['service_profile'])
-            || ((int) ($profile->fields['computer'] ?? 0) & (READ | UPDATE)) !== (READ | UPDATE)) {
-            throw new \RuntimeException('Service Computer authorization denied.');
+            || ((int) ($profile->fields[strtolower($type)] ?? 0) & (READ | UPDATE)) !== (READ | UPDATE)) {
+            throw new \RuntimeException('Service asset authorization denied.');
         }
-        $item = new \Computer();
-        $id = (int) $settings['computer_id'];
+        $id = (int) ($settings['items_id'] ?? $settings['computer_id']);
         if (!$item->getFromDB($id) || $item->fields['is_deleted'] || $item->fields['is_template']
             || (int) $item->fields['entities_id'] !== (int) $settings['entity_id']
             || !\Session::haveAccessToEntity((int) $settings['entity_id'])

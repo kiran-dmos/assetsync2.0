@@ -64,6 +64,11 @@ final class TaskJournal
     public static function cycle(array $settings, int $deadline): void
     {
         global $DB;
+        // A separate bounded pull keeps leases/revocations moving even behind a large task or lost result ACK.
+        $response = self::send($settings, ['kind' => 'pull', 'subscriptions_only' => true], $deadline);
+        if ($response['status'] === 200 && isset($response['body']['subscriptions'])) {
+            TargetScope::receive($response['body']['subscriptions'], $settings);
+        }
         // Report durable results before pulling new work. Lost ACKs only replay the same result.
         $where = ['acknowledged' => 0, 'report_status' => 'pending'];
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $where[$key] = $settings[$key]; }
@@ -75,6 +80,9 @@ final class TaskJournal
             if (!self::report($settings, $task, $result, $deadline)) { return; }
         }
         $response = self::send($settings, ['kind' => 'pull'], $deadline);
+        if ($response['status'] === 200 && isset($response['body']['subscriptions'])) {
+            TargetScope::receive($response['body']['subscriptions'], $settings);
+        }
         $task = $response['body']['task'] ?? null;
         if ($response['status'] !== 200 || !is_array($task)) { return; }
         $result = self::run($task, $settings);

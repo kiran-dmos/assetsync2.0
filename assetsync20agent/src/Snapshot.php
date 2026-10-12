@@ -7,7 +7,7 @@ namespace GlpiPlugin\Assetsync20agent;
 final class Snapshot
 {
     /** Discover Fields containers here, independently of A metadata or mappings. */
-    public static function containers(): array
+    public static function containers(string $type = 'Computer'): array
     {
         global $DB;
         if (!$DB->tableExists('glpi_plugin_fields_containers')) {
@@ -20,13 +20,13 @@ final class Snapshot
                 throw new \RuntimeException('Fields container budget exceeded.');
             }
             $types = json_decode((string) ($row['itemtypes'] ?? ''), true);
-            if (!is_array($types) || !in_array('Computer', $types, true)) {
+            if (!is_array($types) || !in_array($type, $types, true)) {
                 continue;
             }
             if (!is_callable(['PluginFieldsContainer', 'getClassname']) || !function_exists('getTableForItemType')) {
                 continue;
             }
-            $class = \PluginFieldsContainer::getClassname('Computer', (string) $row['name']);
+            $class = \PluginFieldsContainer::getClassname($type, (string) $row['name']);
             $table = is_callable([$class, 'getTable']) ? $class::getTable() : \getTableForItemType($class);
             if (is_string($table) && preg_match('/^glpi_plugin_fields_[a-z0-9_]+$/D', $table) && $DB->tableExists($table)) {
                 $row['table'] = $table;
@@ -43,18 +43,23 @@ final class Snapshot
             return [];
         }
         try {
-            return array_values(array_unique(array_column(self::containers(), 'class')));
+            $classes = [];
+            foreach (TargetScope::types() as $type => $reason) {
+                if ($reason === '') { $classes = array_merge($classes, array_column(self::containers($type), 'class')); }
+            }
+            return array_values(array_unique($classes));
         } catch (\Throwable) {
             return [];
         }
     }
 
-    public static function read(int $id, ?int $deadline = null): array
+    public static function read(int $id, ?int $deadline = null, string $type = 'Computer'): array
     {
         global $DB;
         $deadline ??= hrtime(true) + 2_000_000_000;
         $asset = null;
-        foreach ($DB->request(['FROM' => 'glpi_computers', 'WHERE' => ['id' => $id], 'LIMIT' => 1]) as $row) {
+        $item = TargetScope::model($type);
+        foreach ($DB->request(['FROM' => $item::getTable(), 'WHERE' => ['id' => $id], 'LIMIT' => 1]) as $row) {
             $asset = $row;
         }
         if ($asset === null) {
@@ -66,7 +71,7 @@ final class Snapshot
             unset($asset[$key]);
         }
         $custom = [];
-        foreach (self::containers() as $container) {
+        foreach (self::containers($type) as $container) {
             if (hrtime(true) >= $deadline) {
                 throw new \RuntimeException('Snapshot budget exceeded.');
             }
@@ -91,7 +96,7 @@ final class Snapshot
             }
             $values = [];
             foreach ($DB->request(['FROM' => $container['table'], 'WHERE' => ['items_id' => $id,
-                'itemtype' => 'Computer', 'plugin_fields_containers_id' => (int) $container['id']], 'ORDER' => 'id ASC', 'LIMIT' => 2]) as $row) {
+                'itemtype' => $type, 'plugin_fields_containers_id' => (int) $container['id']], 'ORDER' => 'id ASC', 'LIMIT' => 2]) as $row) {
                 $values[] = array_intersect_key($row, array_flip($columns));
             }
             $custom[$container['table']] = $values;

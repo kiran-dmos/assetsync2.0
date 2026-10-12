@@ -20,6 +20,8 @@ final class AgentSqlite
         $this->pdo->sqliteCreateFunction('LEAST', static fn (...$v) => min($v));
         $this->pdo->sqliteCreateFunction('GREATEST', static fn (...$v) => max($v));
         $this->pdo->sqliteCreateFunction('IF', static fn ($c, $a, $b) => $c ? $a : $b, 3);
+        $this->pdo->sqliteCreateFunction('MD5', md5(...), 1);
+        $this->pdo->sqliteCreateFunction('CONCAT', static fn (...$values) => implode('', $values));
     }
 
     public function doQuery(string $sql): PDOStatement|bool
@@ -36,6 +38,43 @@ final class AgentSqlite
         if ($sql === 'START TRANSACTION') { return $this->pdo->beginTransaction(); }
         if ($sql === 'COMMIT') { return $this->pdo->commit(); }
         if ($sql === 'ROLLBACK') { return $this->pdo->rollBack(); }
+        if (preg_match('/^SHOW INDEX FROM `([^`]+)` WHERE Key_name = \'([^\']+)\' AND Seq_in_index = (\d+)$/', $sql, $match)) {
+            $columns = [];
+            if ($match[2] === 'PRIMARY') {
+                foreach ($this->pdo->query('PRAGMA table_info(`' . $match[1] . '`)') as $column) {
+                    if ($column['pk']) { $columns[(int) $column['pk']] = $column['name']; }
+                }
+            } else {
+                foreach ($this->pdo->query('PRAGMA index_list(`' . $match[1] . '`)') as $index) {
+                    $info = $this->pdo->query('PRAGMA index_info(`' . $index['name'] . '`)')->fetchAll(PDO::FETCH_ASSOC);
+                    if (($info[0]['name'] ?? '') === 'registration_id') {
+                        foreach ($info as $column) { $columns[$column['seqno'] + 1] = $column['name']; }
+                    }
+                }
+            }
+            return $this->pdo->query('SELECT ' . $this->quote($columns[(int) $match[3]] ?? '') . ' AS Column_name');
+        }
+        if (preg_match('/^ALTER TABLE `([^`]+)` DROP (PRIMARY KEY|INDEX `agent_computer`), (.*)$/s', $sql, $match)) {
+            $table = $match[1];
+            $create = $this->pdo->query('SELECT sql FROM sqlite_master WHERE name = ' . $this->quote($table))->fetchColumn();
+            if ($match[2] === 'PRIMARY KEY') {
+                $create = preg_replace('/,?\s*PRIMARY KEY\s*\([^)]*\)/', '', $create);
+                $create = str_replace(' PRIMARY KEY', '', $create);
+            } else {
+                $create = preg_replace('/,\s*UNIQUE\s*\(`registration_id`,\s*`computer_id`\)/', '', $create);
+            }
+            $keys = preg_replace('/ADD (PRIMARY KEY|UNIQUE KEY `[^`]+`)/', '$1', $match[3]);
+            $keys = preg_replace('/UNIQUE KEY `[^`]+`/', 'UNIQUE', $keys);
+            $create = substr(rtrim($create), 0, -1) . ', ' . $keys . ')';
+            $this->pdo->beginTransaction();
+            try {
+                $this->pdo->exec('ALTER TABLE `' . $table . '` RENAME TO migration_old');
+                $this->pdo->exec($create);
+                $this->pdo->exec('INSERT INTO `' . $table . '` SELECT * FROM migration_old');
+                $this->pdo->exec('DROP TABLE migration_old');
+                return $this->pdo->commit();
+            } catch (Throwable $error) { $this->pdo->rollBack(); throw $error; }
+        }
         if (str_starts_with($sql, 'CREATE TABLE')) {
             $sql = preg_replace('/\) ENGINE=.*$/s', ')', $sql);
             $sql = preg_replace('/,\s*(?:PRIMARY KEY \(`id`\)|KEY `[^`]+` \([^)]*\))/', '', $sql);
@@ -47,7 +86,8 @@ final class AgentSqlite
         $sql = str_replace([' FOR UPDATE', 'INSERT IGNORE'], ['', 'INSERT OR IGNORE'], $sql);
         if (str_contains($sql, 'ON DUPLICATE KEY UPDATE')) {
             $columns = str_contains($sql, '`glpi_plugin_assetsync20_syncqueue`')
-                ? '`itemtype`,`items_id`,`glpi_b_connection_id`' : '`computer_id`';
+                ? '`itemtype`,`items_id`,`glpi_b_connection_id`' : (str_contains($sql, '`glpi_plugin_assetsync20agent_targets`')
+                    ? '`itemtype`,`items_id`' : '`itemtype`,`computer_id`');
             $sql = str_replace('ON DUPLICATE KEY UPDATE', 'ON CONFLICT (' . $columns . ') DO UPDATE SET', $sql);
             $sql = preg_replace('/VALUES\(`([^`]+)`\)/', 'excluded.`$1`', $sql);
         }
@@ -92,6 +132,7 @@ final class AgentSqlite
             $sql .= ' ORDER BY ' . (is_object($order) ? str_replace('CAST(glpi_b_connection_id AS BINARY)', 'glpi_b_connection_id COLLATE BINARY', $order->expression) : $order);
         }
         if (!empty($query['LIMIT'])) { $sql .= ' LIMIT ' . (int) $query['LIMIT']; }
+        if (!empty($query['START'])) { $sql .= ' OFFSET ' . (int) $query['START']; }
         return new ArrayIterator($this->doQuery($sql)->fetchAll(PDO::FETCH_ASSOC));
     }
     public function firstRow(string $table, array $where): ?array

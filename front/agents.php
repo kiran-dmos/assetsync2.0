@@ -23,6 +23,7 @@ Session::checkRight('config', UPDATE);
 header('Cache-Control: no-store');
 $routes = [];
 foreach (EntitySyncRoute::loadAll(true) as $route) {
+    if (\GlpiPlugin\Assetsync20\GlpiBConnection::isAgentConnection($route['glpi_b_connection_id'])) { continue; }
     if ($route['active'] && in_array('Computer', $route['asset_types'], true)
         && in_array((int) $route['glpi_a_source_entity_id'], array_map('intval', Session::getActiveEntities()), true)) {
         $routes[$route['id']] = $route;
@@ -86,7 +87,7 @@ if ($credentials !== null) {
 echo '<form method="post"><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">';
 echo '<input type="hidden" name="action" value="register"><label>Connection <select name="connection">';
 foreach (\GlpiPlugin\Assetsync20\GlpiBConnection::loadAll(true) as $connection) {
-    if ($connection['active']) {
+    if ($connection['active'] && !\GlpiPlugin\Assetsync20\GlpiBConnection::isAgent($connection)) {
         echo '<option value="' . $html($connection['id']) . '">' . $html($connection['name']) . '</option>';
     }
 }

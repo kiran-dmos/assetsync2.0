@@ -46,15 +46,15 @@ final class AgentActivity
             }
         }
         echo '</table>';
-        echo '<table class="tab_cadre_fixe"><tr><th>Computer</th><th>B ID</th><th>Received / admitted / completed revision</th><th>Current outcome</th><th>Agent last contact (UTC)</th></tr>';
+        echo '<table class="tab_cadre_fixe"><tr><th>Asset</th><th>B ID</th><th>Received / admitted / completed revision</th><th>Current outcome</th><th>Agent last contact (UTC)</th></tr>';
         foreach ($rows as $row) {
-            echo '<tr><td>' . $html($row['asset_name']) . '</td><td>' . (int) $row['computer_id'] . '</td><td>'
+            echo '<tr><td>' . $html(($row['itemtype'] ?? 'Computer') . ': ' . $row['asset_name']) . '</td><td>' . (int) $row['computer_id'] . '</td><td>'
                 . (int) $row['received_revision'] . ' / ' . (int) $row['admitted_revision'] . ' / ' . (int) $row['completed_revision']
                 . '</td><td>' . $html(self::outcome($row)) . '</td><td>'
                 . ((int) $row['last_seen'] > 0 ? $html(gmdate('Y-m-d H:i:s', (int) $row['last_seen'])) : 'Never') . '</td></tr>';
         }
         if ($rows === []) {
-            echo '<tr><td colspan="5">No agent work for visible Computers.</td></tr>';
+            echo '<tr><td colspan="5">No agent work for visible assets.</td></tr>';
         }
         echo '</table>';
         self::renderTasks($entities, $html);
@@ -64,13 +64,14 @@ final class AgentActivity
     {
         global $DB;
         if (!$DB->tableExists(AgentTask::TABLE)) { return; }
-        echo '<h3>Agent Tasks</h3><table class="tab_cadre_fixe"><tr><th>Task</th><th>Computer</th><th>Outcome</th><th>Created (UTC)</th></tr>';
+        echo '<h3>Agent Tasks</h3><table class="tab_cadre_fixe"><tr><th>Task</th><th>Asset</th><th>Outcome</th><th>Created (UTC)</th></tr>';
         foreach ($DB->request(['FROM' => AgentTask::TABLE, 'ORDER' => 'created_at DESC', 'LIMIT' => 100]) as $task) {
-            $pair = AgentTask::pair($task['connection_id']);
-            $item = new \Computer();
+            $pair = AgentTask::taskPair($task);
+            if (!$pair) { continue; }
+            $item = AgentTask::model($pair['itemtype']);
             if (!$pair || !in_array((int) $pair['local_entity'], $entities, true) || !$item->can((int) $pair['local_id'], READ)) { continue; }
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
-            echo '<tr><td>' . $html($task['id']) . '</td><td>#' . (int) $pair['local_id'] . '</td><td>'
+            echo '<tr><td>' . $html($task['id']) . '</td><td>' . $html($pair['itemtype']) . ' #' . (int) $pair['local_id'] . '</td><td>'
                 . $html(in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown') . '</td><td>'
                 . $html(gmdate('Y-m-d H:i:s', (int) $task['created_at'])) . '</td></tr>';
         }

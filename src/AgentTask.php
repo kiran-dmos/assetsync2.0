@@ -9,17 +9,21 @@ final class AgentTask
 {
     public const PAIRS = 'glpi_plugin_assetsync20_agentpairs';
     public const TABLE = 'glpi_plugin_assetsync20_agenttasks';
+    public const BINDINGS = 'glpi_plugin_assetsync20_agentbindings';
     public const OUTCOMES = ['accepted', 'executing', 'waiting_agent', 'verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'];
 
     public static function install(): bool
     {
         global $DB;
         $ok = (bool) $DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::PAIRS . '` (
-            `connection_id` VARCHAR(255) PRIMARY KEY, `registration` CHAR(32) NOT NULL,
+            `id` CHAR(32) NOT NULL PRIMARY KEY, `itemtype` VARCHAR(100) NOT NULL DEFAULT \'Computer\',
+            `connection_id` VARCHAR(255) NOT NULL, `registration` CHAR(32) NOT NULL,
             `installation` CHAR(32) NOT NULL, `local_id` INT NOT NULL, `local_entity` INT NOT NULL,
             `computer_id` INT NOT NULL, `entity_id` INT NOT NULL, `serial` VARCHAR(255) NOT NULL DEFAULT \'\',
             `route_id` VARCHAR(255) NOT NULL DEFAULT \'\', `confirmed` TINYINT NOT NULL DEFAULT 0,
-            `snapshot` MEDIUMTEXT NOT NULL, `observed_at` BIGINT NOT NULL DEFAULT 0
+            `snapshot` MEDIUMTEXT NOT NULL, `observed_at` BIGINT NOT NULL DEFAULT 0,
+            UNIQUE KEY `local_pair` (`connection_id`, `itemtype`, `local_id`),
+            UNIQUE KEY `remote_pair` (`connection_id`, `itemtype`, `computer_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
             && (bool) $DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::TABLE . '` (
             `id` CHAR(32) PRIMARY KEY, `connection_id` VARCHAR(255) NOT NULL,
@@ -33,6 +37,49 @@ final class AgentTask
             if (!$DB->fieldExists(self::PAIRS, $column)
                 && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` ADD `' . $column . '` ' . $definition)) { return false; }
         }
+        foreach (['id' => "CHAR(32) NOT NULL DEFAULT ''", 'itemtype' => "VARCHAR(100) NOT NULL DEFAULT 'Computer'"] as $column => $definition) {
+            if (!$DB->fieldExists(self::PAIRS, $column) && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` ADD `' . $column . '` ' . $definition)) { return false; }
+        }
+        // Deterministic IDs make an interrupted migration restartable without rewriting evidence.
+        foreach ($DB->request(['SELECT' => ['connection_id'], 'FROM' => self::PAIRS, 'WHERE' => ['id' => '']]) as $legacy) {
+            if (!$DB->update(self::PAIRS, ['id' => md5('legacy:' . $legacy['connection_id'])], ['connection_id' => $legacy['connection_id'], 'id' => ''])) { return false; }
+        }
+        $index = AgentInbox::one('SHOW INDEX FROM `' . self::PAIRS . '` WHERE Key_name = \'PRIMARY\' AND Seq_in_index = 1');
+        if (($index['Column_name'] ?? '') !== 'id' && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` DROP PRIMARY KEY, ADD PRIMARY KEY (`id`),
+            ADD UNIQUE KEY `local_pair` (`connection_id`, `itemtype`, `local_id`), ADD UNIQUE KEY `remote_pair` (`connection_id`, `itemtype`, `computer_id`)')) { return false; }
+        if (!$DB->doQuery('CREATE TABLE IF NOT EXISTS `' . self::BINDINGS . '` (
+            `connection_id` VARCHAR(255) PRIMARY KEY, `registration` CHAR(32) NOT NULL,
+            `installation` CHAR(32) NOT NULL, UNIQUE KEY `registration` (`registration`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')) { return false; }
+        // Validate all retained identities before inserting any missing binding.
+        $bindings = [];
+        $registrations = [];
+        foreach ($DB->request(['FROM' => self::BINDINGS]) as $binding) {
+            $bindings[$binding['connection_id']] = $binding;
+            $registrations[$binding['registration']] = $binding['connection_id'];
+        }
+        $missing = [];
+        foreach ($DB->request(['SELECT' => ['connection_id', 'registration', 'installation'], 'FROM' => self::PAIRS]) as $pair) {
+            $binding = $bindings[$pair['connection_id']] ?? null;
+            if (($binding && ($binding['registration'] !== $pair['registration'] || $binding['installation'] !== $pair['installation']))
+                || (isset($registrations[$pair['registration']]) && $registrations[$pair['registration']] !== $pair['connection_id'])) {
+                return false;
+            }
+            if (!$binding) { $missing[$pair['connection_id']] = $pair; }
+            $bindings[$pair['connection_id']] = $pair;
+            $registrations[$pair['registration']] = $pair['connection_id'];
+        }
+        foreach ($missing as $binding) {
+            if (!$DB->insert(self::BINDINGS, $binding)) { return false; }
+        }
+        foreach (['subscription_revision' => 'BIGINT NOT NULL DEFAULT 0', 'subscription_issued' => 'BIGINT NOT NULL DEFAULT 0',
+            'subscription_active' => 'TINYINT NOT NULL DEFAULT 0', 'subscription_generation' => "CHAR(32) NOT NULL DEFAULT ''"] as $column => $definition) {
+            if (!$DB->fieldExists(self::PAIRS, $column) && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` ADD `' . $column . '` ' . $definition)) { return false; }
+        }
+        foreach (['subscription_revision' => 'BIGINT NOT NULL DEFAULT 0', 'subscription_cursor' => "CHAR(32) NOT NULL DEFAULT ''",
+            'discovery_id' => "CHAR(32) NOT NULL DEFAULT ''", 'discovery_observed_id' => "CHAR(32) NOT NULL DEFAULT ''"] as $column => $definition) {
+            if (!$DB->fieldExists(self::BINDINGS, $column) && !$DB->doQuery('ALTER TABLE `' . self::BINDINGS . '` ADD `' . $column . '` ' . $definition)) { return false; }
+        }
         return true;
     }
 
@@ -41,21 +88,31 @@ final class AgentTask
         return hash('sha256', json_encode($data, JSON_THROW_ON_ERROR));
     }
 
-    public static function pair(string $connection): ?array
+    public static function pair(string $connection, string $type = 'Computer', ?int $localId = null): ?array
     {
         global $DB;
-        return AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($connection));
+        $rows = iterator_to_array($DB->request(['FROM' => self::PAIRS, 'WHERE' => array_merge([
+            'connection_id' => $connection, 'itemtype' => $type], $localId === null ? [] : ['local_id' => $localId]), 'LIMIT' => 2]));
+        return count($rows) === 1 ? array_values($rows)[0] : null;
     }
 
-    public static function outstanding(string $connection): ?array
+    public static function outstanding(string $connection, ?array $pair = null): ?array
     {
         global $DB;
-        return AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote($connection));
+        $pair ??= self::pair($connection);
+        if (!$pair) { return null; }
+        $task = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote('pair:' . $pair['id']));
+        if ($task) { return $task; }
+        $legacy = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote($connection));
+        if (!$legacy) { return null; }
+        $body = json_decode($legacy['body'], true, 32, JSON_THROW_ON_ERROR);
+        return ($body['version'] ?? 0) < 3 && $pair['itemtype'] === 'Computer'
+            && ($body['computer_id'] ?? 0) === (int) $pair['computer_id'] && ($body['registration'] ?? '') === $pair['registration'] ? $legacy : null;
     }
 
     public static function needsInspection(array $pair, bool $force): bool
     {
-        if (self::outstanding($pair['connection_id'])) { return false; }
+        if (self::outstanding($pair['connection_id'], $pair)) { return false; }
         $context = self::context($pair);
         return $force || (int) ($pair['checked_at'] ?? 0) < time() - 3600
             || ($pair['local_fingerprint'] ?? '') !== self::localFingerprint($context);
@@ -66,25 +123,93 @@ final class AgentTask
         return self::hash([$context['policy'], $context['metadata'], $context['values']]);
     }
 
-    /** Protected setup can bootstrap inspection without routes, mappings, a REST link or REST credentials. */
-    public static function declare(string $connectionId, string $installation, int $localId, int $remoteId, int $entityId): array
+    public static function model(string $type): object
+    {
+        global $CFG_GLPI;
+        if (!in_array($type, ['Computer', 'Printer'], true) || !in_array($type, $CFG_GLPI['inventory_types'] ?? [], true)) {
+            throw new \RuntimeException('This installed inventory type is not supported by the agent.');
+        }
+        return new $type();
+    }
+
+    public static function binding(string $connection): ?array
+    {
+        global $DB;
+        return AgentInbox::one('SELECT * FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($connection));
+    }
+
+    public static function register(string $connectionId, string $installation): array
     {
         global $DB;
         $connection = AgentInbox::connection($connectionId);
-        $computer = new \Computer();
-        if (!$connection || !GlpiBConnection::isAgent($connection) || !preg_match('/^[a-f0-9]{32}$/D', $installation)
-            || $remoteId <= 0 || $entityId < 0 || !$computer->can($localId, READ) || !$computer->getFromDB($localId)
-            || $computer->fields['is_deleted'] || $computer->fields['is_template'] || trim((string) $computer->fields['serial']) === '') {
-            throw new \RuntimeException('Choose an active agent connection and an existing visible Computer with a serial.');
+        if (!$connection || !GlpiBConnection::isAgent($connection) || !preg_match('/^[a-f0-9]{32}$/D', $installation)) {
+            throw new \RuntimeException('Choose an active agent connection and B installation identity.');
         }
         $credentials = ['registration' => bin2hex(random_bytes(16)), 'generation' => bin2hex(random_bytes(16)), 'token' => bin2hex(random_bytes(32))];
         AgentInbox::sql('START TRANSACTION');
         try {
-            self::write($DB->insert(AgentInbox::REGISTRATIONS, ['id' => $credentials['registration'],
-                'generation' => $credentials['generation'], 'token_hash' => hash('sha256', $credentials['token']),
-                'connection_id' => $connectionId, 'connection_identity' => AgentInbox::identity($connection), 'routes' => '{}', 'active' => 1]));
-            // A primary key prevents a second pair or silently replacing an existing candidate.
-            self::write($DB->insert(self::PAIRS, ['connection_id' => $connectionId, 'registration' => $credentials['registration'],
+            self::write($DB->insert(AgentInbox::REGISTRATIONS, ['id' => $credentials['registration'], 'generation' => $credentials['generation'],
+                'token_hash' => hash('sha256', $credentials['token']), 'connection_id' => $connectionId,
+                'connection_identity' => AgentInbox::identity($connection), 'routes' => '{}', 'active' => 1]));
+            self::write($DB->insert(self::BINDINGS, ['connection_id' => $connectionId, 'registration' => $credentials['registration'], 'installation' => $installation]));
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+        return $credentials;
+    }
+
+    public static function registration(array $binding): array
+    {
+        global $DB;
+        $connection = AgentInbox::connection($binding['connection_id']);
+        $registration = AgentInbox::one('SELECT * FROM `' . AgentInbox::REGISTRATIONS . '` WHERE `id` = ' . $DB->quote($binding['registration']));
+        if (!$connection || !GlpiBConnection::isAgent($connection) || !$registration || !$registration['active']
+            || $registration['connection_id'] !== $binding['connection_id'] || $registration['connection_identity'] !== AgentInbox::identity($connection)) {
+            throw new \RuntimeException('Installation registration is unavailable.');
+        }
+        return $registration;
+    }
+
+    public static function byId(string $connection, string $id): ?array
+    {
+        global $DB;
+        return AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($connection) . ' AND `id` = ' . $DB->quote($id));
+    }
+
+    public static function taskPair(array $task): ?array
+    {
+        global $DB;
+        $body = isset($task['body']) ? json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR) : $task;
+        if (($body['version'] ?? 0) === 3) {
+            $pair = self::byId($body['connection_id'], $body['pair_id']);
+            return $pair && $pair['itemtype'] === $body['itemtype'] && (int) $pair['computer_id'] === $body['items_id']
+                && (int) $pair['entity_id'] === $body['entity_id'] && $pair['registration'] === $body['registration']
+                && $pair['installation'] === $body['installation'] ? $pair : null;
+        }
+        return AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($body['connection_id'])
+            . ' AND `itemtype` = \'Computer\' AND `computer_id` = ' . (int) $body['computer_id'] . ' AND `registration` = ' . $DB->quote($body['registration']));
+    }
+
+    /** Protected setup can bootstrap inspection without routes, mappings, a REST link or REST credentials. */
+    public static function declare(string $connectionId, string $installation, int $localId, int $remoteId, int $entityId, string $type = 'Computer'): array
+    {
+        global $DB;
+        $connection = AgentInbox::connection($connectionId);
+        $computer = self::model($type);
+        if (!$connection || !GlpiBConnection::isAgent($connection) || !preg_match('/^[a-f0-9]{32}$/D', $installation)
+            || $remoteId <= 0 || $entityId < 0 || !$computer->can($localId, READ) || !$computer->getFromDB($localId)
+            || $computer->fields['is_deleted'] || $computer->fields['is_template'] || trim((string) $computer->fields['serial']) === '') {
+            throw new \RuntimeException('Choose an active agent connection and an existing visible asset with a serial.');
+        }
+        self::selectedAsset($type, $localId, (int) $computer->fields['entities_id']);
+        $binding = self::binding($connectionId);
+        $credentials = $binding ? [] : self::register($connectionId, $installation);
+        $binding = self::binding($connectionId);
+        self::registration($binding);
+        if ($binding['installation'] !== $installation) { throw new \RuntimeException('Installation identity differs from the registration.'); }
+        $pairId = bin2hex(random_bytes(16));
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            self::write($DB->insert(self::PAIRS, ['id' => $pairId, 'itemtype' => $type, 'connection_id' => $connectionId, 'registration' => $binding['registration'],
                 'installation' => $installation, 'local_id' => $localId, 'local_entity' => (int) $computer->fields['entities_id'],
                 'computer_id' => $remoteId, 'entity_id' => $entityId, 'snapshot' => '{}']));
             AgentInbox::sql('COMMIT');
@@ -93,7 +218,7 @@ final class AgentTask
             throw new \RuntimeException('Pair already exists or could not be stored. No pair was replaced.', 0, $error);
         }
         try {
-            self::inspect($connectionId);
+            self::inspect($connectionId, $pairId);
         } catch (\Throwable) {
             // The candidate is durable; never lose its once-visible credentials on publication failure.
             $credentials['inspection_error'] = 'Candidate saved, but inspection could not be queued. Use Refresh observation.';
@@ -103,14 +228,10 @@ final class AgentTask
 
     public static function rotate(string $connectionId): array
     {
-        $pair = self::pair($connectionId);
-        $computer = new \Computer();
-        if (!$pair || !$computer->can((int) $pair['local_id'], READ)) {
-            throw new \RuntimeException('Agent pair unavailable.');
-        }
-        $scope = self::scope($pair, false);
-        return ['registration' => $pair['registration'], 'generation' => $scope['registration']['generation'],
-            'token' => AgentInbox::rotate($pair['registration'])];
+        $binding = self::binding($connectionId);
+        if (!$binding) { throw new \RuntimeException('Agent registration unavailable.'); }
+        $registration = self::registration($binding);
+        return ['registration' => $registration['id'], 'generation' => $registration['generation'], 'token' => AgentInbox::rotate($registration['id'])];
     }
 
     public static function recent(string $connectionId): array
@@ -121,12 +242,135 @@ final class AgentTask
             'ORDER' => 'created_at DESC', 'LIMIT' => 5]));
     }
 
+    public static function discoveryTask(string $connection): ?array
+    {
+        global $DB;
+        return AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote('discovery:' . hash('sha256', $connection)));
+    }
+
+    public static function discover(string $connection, string $type, int $entity, string $search = '', int $cursor = 0): void
+    {
+        global $DB;
+        self::model($type);
+        if ($entity < -1 || $cursor < 0 || strlen($search) > 100) { throw new \RuntimeException('Invalid discovery filter.'); }
+        $binding = self::binding($connection);
+        if (!$binding) { throw new \RuntimeException('Register the installation first.'); }
+        $registration = self::registration($binding);
+        $task = ['version' => 3, 'id' => bin2hex(random_bytes(16)), 'kind' => 'discover',
+            'installation' => $binding['installation'], 'registration' => $registration['id'], 'generation' => $registration['generation'],
+            'connection_id' => $connection, 'pair_id' => '', 'itemtype' => $type, 'items_id' => 0, 'entity_id' => $entity,
+            'serial' => '', 'policy' => '', 'expires' => time() + 300, 'changes' => [], 'filter' => ['search' => $search, 'cursor' => $cursor]];
+        $task['hash'] = self::hash($task);
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            self::write($DB->insert(self::TABLE, ['id' => $task['id'], 'connection_id' => $connection, 'slot' => 'discovery:' . hash('sha256', $connection),
+                'hash' => $task['hash'], 'body' => json_encode($task, JSON_THROW_ON_ERROR), 'state' => 'accepted', 'result' => '{}',
+                'job' => '[]', 'context' => '{}', 'created_at' => time(), 'expires' => $task['expires']]));
+            self::write($DB->update(self::BINDINGS, ['discovery_id' => $task['id']], ['connection_id' => $connection]));
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    public static function discovery(string $connection): array
+    {
+        global $DB;
+        $binding = self::binding($connection);
+        $capabilities = null;
+        if (!empty($binding['discovery_observed_id'])) {
+            $observed = AgentInbox::one('SELECT `result` FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($binding['discovery_observed_id']));
+            $capabilities = json_decode($observed['result'] ?? '{}', true)['discovery']['types'] ?? null;
+        }
+        $where = ['connection_id' => $connection];
+        if (!empty($binding['discovery_id'])) { $where['id'] = $binding['discovery_id']; }
+        $rows = $DB->request(['FROM' => self::TABLE, 'WHERE' => $where, 'ORDER' => 'created_at DESC, id DESC', 'LIMIT' => 100]);
+        foreach ($rows as $row) {
+            $body = json_decode($row['body'], true, 32, JSON_THROW_ON_ERROR);
+            if ($body['kind'] !== 'discover') { continue; }
+            $result = json_decode($row['result'], true, 32, JSON_THROW_ON_ERROR);
+            $state = $row['result'] === '{}' ? 'pending' : (!isset($result['discovery']) ? 'error'
+                : ((int) $result['discovery']['observed_at'] < time() - 300 ? 'stale' : ($result['discovery']['rows'] === [] ? 'empty' : 'ready')));
+            return ['state' => $state, 'task' => $body, 'page' => $result['discovery'] ?? [], 'capabilities' => $capabilities];
+        }
+        return ['state' => 'not_requested', 'page' => [], 'capabilities' => $capabilities];
+    }
+
+    private static function validateDiscovery(array $task, array $result): void
+    {
+        $page = $result['discovery'] ?? [];
+        if ($result['changed'] !== [] || !is_array($page['rows'] ?? null) || count($page['rows']) > 50
+            || !is_int($page['observed_at'] ?? null) || $page['observed_at'] < $task['expires'] - 300 || $page['observed_at'] > $task['expires']
+            || !is_array($page['entities'] ?? null) || count($page['entities']) > 50 || !is_array($page['types'] ?? null)
+            || strlen(json_encode($page, JSON_THROW_ON_ERROR)) > 49152
+            || (!is_null($page['next_cursor'] ?? null) && (!is_int($page['next_cursor']) || $page['next_cursor'] <= $task['filter']['cursor']))) {
+            throw new \RuntimeException('Invalid discovery page.');
+        }
+        $last = $task['filter']['cursor'];
+        foreach ($page['rows'] as $row) {
+            if (!is_array($row) || ($row['itemtype'] ?? '') !== $task['itemtype'] || !is_int($row['items_id'] ?? null)
+                || $row['items_id'] <= $last || !is_int($row['entity_id'] ?? null) || $row['entity_id'] < 0
+                || ($task['entity_id'] >= 0 && $row['entity_id'] !== $task['entity_id'])
+                || !is_string($row['name'] ?? null) || !is_string($row['serial'] ?? null) || !is_string($row['reason'] ?? null)) {
+                throw new \RuntimeException('Invalid discovery summary.');
+            }
+            $last = $row['items_id'];
+        }
+    }
+
+    public static function localPage(string $type, int $entity, string $search, int $cursor): array
+    {
+        global $DB;
+        $item = self::model($type);
+        if ($entity < 0 || $cursor < 0 || strlen($search) > 100 || !\Session::haveAccessToEntity($entity)) { throw new \RuntimeException('Invalid local filter.'); }
+        $sql = 'SELECT `id`,`name`,`serial`,`entities_id` FROM `' . $item::getTable() . '` WHERE `entities_id` = ' . $entity
+            . ' AND `is_deleted` = 0 AND `is_template` = 0 AND `id` > ' . $cursor;
+        if ($search !== '') { $sql .= ' AND (`name` LIKE ' . $DB->quote('%' . addcslashes($search, '%_') . '%')
+            . ' OR `serial` LIKE ' . $DB->quote('%' . addcslashes($search, '%_') . '%') . ')'; }
+        $result = AgentInbox::sql($sql . ' ORDER BY `id` LIMIT 51');
+        $rows = []; $scanned = 0; $last = $cursor; $next = null;
+        while ($row = $DB->fetchAssoc($result)) {
+            if (++$scanned > 50) { $next = $last; break; }
+            $last = (int) $row['id'];
+            if (!$item->can($last, READ)) { continue; }
+            $rows[] = ['items_id' => $last, 'itemtype' => $type, 'entity_id' => (int) $row['entities_id'],
+                'name' => (string) $row['name'], 'serial' => trim((string) $row['serial'])];
+        }
+        return ['rows' => $rows, 'next_cursor' => $next];
+    }
+
+    /** Only the displayed page can change the cart; other pages remain explicitly selected. */
+    public static function selectPage(array $cart, string $type, int $entity, string $search, int $cursor, array $selected): array
+    {
+        if (count($selected) > 50 || count($cart) > 200) { throw new \RuntimeException('Selection limit exceeded (50 per page, 200 total).'); }
+        $page = array_column(self::localPage($type, $entity, $search, $cursor)['rows'], null, 'items_id');
+        foreach ($selected as $id) {
+            if (!is_scalar($id) || !ctype_digit((string) $id) || !isset($page[(int) $id]) || $page[(int) $id]['serial'] === '') {
+                throw new \RuntimeException('Selection changed or is outside the displayed readable page.');
+            }
+        }
+        foreach ($page as $id => $row) { unset($cart[$id]); }
+        foreach ($selected as $id) { $cart[(int) $id] = $entity; }
+        if (count($cart) > 200) { throw new \RuntimeException('Selection limit is 200 assets. Clear selections before adding more.'); }
+        return $cart;
+    }
+
+    public static function selectedAsset(string $type, int $id, int $entity): array
+    {
+        $item = self::model($type);
+        if (!$item->getFromDB($id) || !$item->can($id, READ) || !\Session::haveAccessToEntity($entity)
+            || (int) $item->fields['entities_id'] !== $entity || $item->fields['is_deleted'] || $item->fields['is_template']) {
+            throw new \RuntimeException('Selected A asset is no longer readable in its original entity.');
+        }
+        return ['items_id' => $id, 'itemtype' => $type, 'entity_id' => $entity, 'name' => (string) $item->fields['name'],
+            'serial' => trim((string) $item->fields['serial'])];
+    }
+
     public static function scope(array $pair, bool $confirmed = true): array
     {
         global $DB;
         $connection = AgentInbox::connection($pair['connection_id']);
         $registration = AgentInbox::one('SELECT * FROM `' . AgentInbox::REGISTRATIONS . '` WHERE `id` = ' . $DB->quote($pair['registration']));
-        $computer = new \Computer();
+        $type = $pair['itemtype'];
+        $computer = self::model($type);
         if (!$connection || !GlpiBConnection::isAgent($connection) || !$registration || !$registration['active']
             || $registration['connection_identity'] !== AgentInbox::identity($connection)
             || !$computer->getFromDB((int) $pair['local_id']) || $computer->fields['is_deleted'] || $computer->fields['is_template']
@@ -137,13 +381,13 @@ final class AgentTask
             return ['connection' => $connection, 'registration' => $registration, 'asset' => $computer->fields];
         }
         EntitySyncRoute::loadAll(true);
-        $match = EntitySyncRoute::matchAsset('Computer', (string) $pair['local_entity'], [], $pair['connection_id']);
+        $match = EntitySyncRoute::matchAsset($type, (string) $pair['local_entity'], [], $pair['connection_id']);
         $route = $match['matches'][0]['route'] ?? null;
-        $link = AssetSyncLink::find('Computer', (int) $pair['local_id'], $pair['connection_id']);
+        $link = AssetSyncLink::find($type, (int) $pair['local_id'], $pair['connection_id']);
         $links = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
-            'itemtype' => 'Computer', 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
+            'itemtype' => $type, 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
         if (!$pair['confirmed'] || !$route || count($match['matches']) !== 1 || $match['conflicts'] !== []
-            || $route['id'] !== $pair['route_id'] || $route['include_child_entities'] || $route['asset_types'] !== ['Computer']
+            || $route['id'] !== $pair['route_id'] || $route['include_child_entities'] || $route['asset_types'] !== [$type]
             || (int) $route['glpi_b_target_entity_id'] !== (int) $pair['entity_id'] || $route['glpi_b_target_entity_id'] === ''
             || trim((string) $computer->fields['serial']) !== $pair['serial'] || !$link || count($links) !== 1
             || (int) $link['remote_items_id'] !== (int) $pair['computer_id'] || $link['confirmed_identity'] !== AgentInbox::identity($connection)
@@ -153,53 +397,57 @@ final class AgentTask
         return ['connection' => $connection, 'registration' => $registration, 'asset' => $computer->fields, 'route' => $route];
     }
 
-    public static function inspect(string $connectionId): void
+    public static function inspect(string $connectionId, ?string $pairId = null): void
     {
-        $pair = self::pair($connectionId);
+        $pair = $pairId === null ? self::pair($connectionId) : self::byId($connectionId, $pairId);
         if (!$pair) { throw new \RuntimeException('Declare an agent pair first.'); }
         self::publish($pair, 'inspect', [], null, []);
     }
 
-    public static function confirm(string $connectionId, string $routeId): void
+    public static function confirm(string $connectionId, string $routeId, ?string $pairId = null): void
     {
         global $DB;
-        $pair = self::pair($connectionId);
+        $pair = $pairId === null ? self::pair($connectionId) : self::byId($connectionId, $pairId);
         if (!$pair) { throw new \RuntimeException('Declare an agent pair first.'); }
-        AssetUuidOperation::withAssetLock('Computer', (int) $pair['local_id'], static function () use ($pair, $routeId, $DB): void {
+        AssetUuidOperation::withAssetLock($pair['itemtype'], (int) $pair['local_id'], static function () use ($pair, $routeId, $DB): void {
+            $type = $pair['itemtype'];
             $scope = self::scope($pair, false);
-            $item = new \Computer();
-            if (!$item->can((int) $pair['local_id'], READ)) { throw new \RuntimeException('Computer unavailable.'); }
+            $item = self::model($type);
+            if (!$item->can((int) $pair['local_id'], READ) || !\Session::haveAccessToEntity((int) $pair['local_entity'])) { throw new \RuntimeException('Asset unavailable.'); }
             $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
             $route = EntitySyncRoute::find($routeId);
             if ((int) $pair['observed_at'] < time() - 300 || empty($snapshot['serial'])
                 || $snapshot['serial'] !== trim((string) $scope['asset']['serial'])
-                || ($snapshot['computer_id'] ?? null) !== (int) $pair['computer_id'] || ($snapshot['entity_id'] ?? null) !== (int) $pair['entity_id']
-                || !$route || !$route['active'] || $route['include_child_entities'] || $route['asset_types'] !== ['Computer']
+                || ($snapshot['items_id'] ?? $snapshot['computer_id'] ?? null) !== (int) $pair['computer_id'] || ($snapshot['entity_id'] ?? null) !== (int) $pair['entity_id']
+                || ($snapshot['itemtype'] ?? 'Computer') !== $type
+                || !$route || !$route['active'] || $route['include_child_entities'] || $route['asset_types'] !== [$type]
                 || $route['glpi_b_connection_id'] !== $pair['connection_id'] || $route['glpi_b_target_entity_id'] === ''
                 || (int) $route['glpi_a_source_entity_id'] !== (int) $pair['local_entity']
                 || (int) $route['glpi_b_target_entity_id'] !== (int) $pair['entity_id']) {
-                throw new \RuntimeException('Fresh independent inspection, matching serial and an exact Computer route are required.');
+                throw new \RuntimeException('Fresh independent inspection, matching serial and an exact single-type route are required.');
             }
-            $link = AssetSyncLink::find('Computer', (int) $pair['local_id'], $pair['connection_id']);
+            $link = AssetSyncLink::find($type, (int) $pair['local_id'], $pair['connection_id']);
             if ($link && (int) $link['remote_items_id'] !== (int) $pair['computer_id']) {
                 throw new \RuntimeException('Existing link differs; automatic relinking is forbidden.');
             }
             $duplicates = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
-                'itemtype' => 'Computer', 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
+                'itemtype' => $type, 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
             if (count($duplicates) > ($link ? 1 : 0)) { throw new \RuntimeException('Reverse link is not unique.'); }
             AgentInbox::sql('START TRANSACTION');
             try {
                 if (!$link) {
-                    self::write(AssetSyncLink::saveStatus('Computer', (int) $pair['local_id'], $pair['connection_id'], $routeId,
+                    self::write(AssetSyncLink::saveStatus($type, (int) $pair['local_id'], $pair['connection_id'], $routeId,
                         AssetSyncLink::STATUS_BLOCKED_CONFIGURATION, 'Agent pair independently confirmed.', (int) $pair['computer_id']));
                 }
                 self::write($DB->update(AssetSyncLink::TABLE, ['route_id' => $routeId, 'confirmed_remote_id' => (int) $pair['computer_id'],
                     'confirmed_entity_id' => (int) $pair['entity_id'], 'confirmed_identity' => AgentInbox::identity($scope['connection'])],
-                    ['itemtype' => 'Computer', 'items_id' => (int) $pair['local_id'], 'glpi_b_connection_id' => $pair['connection_id']]));
-                self::write($DB->update(AgentInbox::REGISTRATIONS, ['routes' => json_encode([$routeId => [
-                    'fingerprint' => AgentInbox::routeIdentity($route), 'source_entity' => (int) $pair['local_entity']]], JSON_THROW_ON_ERROR)], ['id' => $pair['registration']]));
-                self::write($DB->update(self::PAIRS, ['confirmed' => 1, 'route_id' => $routeId, 'serial' => $snapshot['serial']], ['connection_id' => $pair['connection_id']]));
-                self::scope(self::pair($pair['connection_id']));
+                    ['itemtype' => $type, 'items_id' => (int) $pair['local_id'], 'glpi_b_connection_id' => $pair['connection_id']]));
+                $registration = AgentInbox::one('SELECT * FROM `' . AgentInbox::REGISTRATIONS . '` WHERE `id` = ' . $DB->quote($pair['registration']) . ' FOR UPDATE');
+                $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
+                $approved[$routeId] = ['fingerprint' => AgentInbox::routeIdentity($route), 'source_entity' => (int) $pair['local_entity']];
+                self::write($DB->update(AgentInbox::REGISTRATIONS, ['routes' => json_encode($approved, JSON_THROW_ON_ERROR)], ['id' => $pair['registration']]));
+                self::write($DB->update(self::PAIRS, ['confirmed' => 1, 'route_id' => $routeId, 'serial' => $snapshot['serial']], ['id' => $pair['id']]));
+                self::scope(self::byId($pair['connection_id'], $pair['id']));
                 AgentInbox::sql('COMMIT');
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
         });
@@ -207,9 +455,13 @@ final class AgentTask
 
     public static function catalog(string $connection, string $type): array
     {
-        $pair = self::pair($connection);
+        global $DB;
+        self::model($type);
+        $pair = AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($connection)
+            . ' AND `itemtype` = ' . $DB->quote($type) . ' ORDER BY `observed_at` DESC LIMIT 1');
         $fields = [];
-        if ($pair && $type === 'Computer' && (int) $pair['observed_at'] >= time() - 3600) {
+        if ($pair && (int) $pair['observed_at'] >= time() - 3600
+            && self::model($type)->can((int) $pair['local_id'], READ) && \Session::haveAccessToEntity((int) $pair['local_entity'])) {
             self::scope($pair, false);
             $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
             foreach ($snapshot['fields'] ?? [] as $key => $field) {
@@ -223,13 +475,14 @@ final class AgentTask
 
     public static function validateMappings(string $type, array $rows): void
     {
-        if ($type !== 'Computer' || count($rows) > 32) { throw new \RuntimeException('Agent mode supports one Computer and at most 32 mappings.'); }
+        self::model($type);
+        if (count($rows) > 32) { throw new \RuntimeException('Agent mode supports at most 32 mappings per type.'); }
         foreach ($rows as $row) {
             if (!in_array($row['source_of_truth'] ?? '', ['glpi_a', 'glpi_b'], true)) { throw new \RuntimeException('Agent mode requires one-way mapping authority.'); }
             foreach (['glpi_a_field_key', 'glpi_b_field_key'] as $side) {
                 $key = $row[$side] ?? '';
-                if (!in_array($key, ['name', 'comment', 'Computer.name', 'Computer.comment'], true)
-                    && !preg_match('/^Computer\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key)) {
+                if (!in_array($key, ['name', 'comment', $type . '.name', $type . '.comment'], true)
+                    && !preg_match('/^' . preg_quote($type, '/') . '\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key)) {
                     throw new \RuntimeException('Unsupported agent mapping: Name, Comments and existing custom text, yesno or date only; UUID is unsupported.');
                 }
             }
@@ -240,21 +493,28 @@ final class AgentTask
     public static function publish(array $pair, string $kind, array $changes, ?array $job, array $context, ?string $previous = null): array
     {
         global $DB;
-        $scope = self::scope($pair, $job !== null);
-        $task = ['version' => 2, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
+        $scope = self::scope($pair, $job !== null || $kind === 'apply');
+        if (self::outstanding($pair['connection_id'], $pair) && $previous === null) { throw new \RuntimeException('This pair has an outstanding task.'); }
+        $task = ['version' => 3, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
             'installation' => $pair['installation'], 'registration' => $pair['registration'], 'generation' => $scope['registration']['generation'],
-            'connection_id' => $pair['connection_id'], 'computer_id' => (int) $pair['computer_id'], 'entity_id' => (int) $pair['entity_id'],
+            'connection_id' => $pair['connection_id'], 'pair_id' => $pair['id'], 'itemtype' => $pair['itemtype'],
+            'items_id' => (int) $pair['computer_id'], 'entity_id' => (int) $pair['entity_id'],
             'serial' => $pair['confirmed'] ? $pair['serial'] : '', 'policy' => $context['policy'] ?? '',
             'expires' => time() + 300, 'changes' => $changes];
         $task['hash'] = self::hash($task);
+        if (strlen(json_encode(['status' => 200, 'task' => $task], JSON_THROW_ON_ERROR)) > 65536) {
+            throw new \RuntimeException('Task exceeds the 64 KiB transport envelope.');
+        }
         AgentInbox::sql('START TRANSACTION');
         try {
             if ($job !== null && !AssetSyncQueue::owns($job)) { throw new \RuntimeException('Queue claim changed.'); }
             if ($previous !== null) {
-                self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $previous, 'slot' => $pair['connection_id']]));
+                $old = self::outstanding($pair['connection_id'], $pair);
+                if (!$old || $old['id'] !== $previous) { throw new \RuntimeException('Previous task ownership changed.'); }
+                self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $previous, 'slot' => $old['slot']]));
                 if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Previous task changed.'); }
             }
-            self::write($DB->insert(self::TABLE, ['id' => $task['id'], 'connection_id' => $pair['connection_id'], 'slot' => $pair['connection_id'],
+            self::write($DB->insert(self::TABLE, ['id' => $task['id'], 'connection_id' => $pair['connection_id'], 'slot' => 'pair:' . $pair['id'],
                 'hash' => $task['hash'], 'body' => json_encode($task, JSON_THROW_ON_ERROR), 'state' => 'accepted', 'result' => '{}',
                 'queue_id' => $job['id'] ?? null, 'job' => json_encode($job ?? [], JSON_THROW_ON_ERROR),
                 'context' => json_encode($context, JSON_THROW_ON_ERROR), 'created_at' => time(), 'expires' => $task['expires']]));
@@ -273,29 +533,39 @@ final class AgentTask
         }
         AgentInbox::sql('START TRANSACTION');
         try {
-            $pair = AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `registration` = ' . $DB->quote((string) ($request['registration'] ?? '')) . ' FOR UPDATE');
-            if (!$pair) { throw new \UnexpectedValueException('Unknown pair.'); }
-            try { $scope = self::scope($pair, (bool) $pair['confirmed']); }
-            catch (\RuntimeException $error) { throw new \UnexpectedValueException('Current task scope is unavailable.', 0, $error); }
-            if (!hash_equals($scope['registration']['token_hash'], hash('sha256', $token))
-                || ($request['generation'] ?? '') !== $scope['registration']['generation']
-                || ($request['installation'] ?? '') !== $pair['installation'] || ($request['connection_id'] ?? '') !== $pair['connection_id']) {
+            $binding = AgentInbox::one('SELECT * FROM `' . self::BINDINGS . '` WHERE `registration` = ' . $DB->quote((string) ($request['registration'] ?? '')) . ' FOR UPDATE');
+            if (!$binding) { throw new \UnexpectedValueException('Unknown installation.'); }
+            try { $registration = self::registration($binding); }
+            catch (\RuntimeException $error) { throw new \UnexpectedValueException('Current registration unavailable.', 0, $error); }
+            if (!hash_equals($registration['token_hash'], hash('sha256', $token))
+                || ($request['generation'] ?? '') !== $registration['generation']
+                || ($request['installation'] ?? '') !== $binding['installation'] || ($request['connection_id'] ?? '') !== $binding['connection_id']) {
                 throw new \UnexpectedValueException('Task authentication failed.');
             }
-            $task = self::outstanding($pair['connection_id']);
+            $task = null;
             if ($request['kind'] === 'pull') {
                 $response = ['status' => 200, 'task' => null];
+                $task = ($request['subscriptions_only'] ?? false) === true ? null : AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
+                    . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 1 FOR UPDATE');
                 if ($task && in_array($task['state'], ['accepted', 'executing'], true)) {
+                    $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+                    if ($body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
+                        || $body['installation'] !== $binding['installation']) { throw new \UnexpectedValueException('Task ownership changed.'); }
+                    $pair = $body['kind'] === 'discover' ? null : self::taskPair($task);
                     $policyCurrent = true;
-                    if ($task['queue_id'] !== null) {
-                        try {
+                    try {
+                        if ($body['kind'] !== 'discover') {
+                            if (!$pair) { throw new \RuntimeException('Pair unavailable.'); }
+                            self::scope($pair, $body['kind'] === 'apply' || (bool) $pair['confirmed']);
+                        }
+                        if ($task['queue_id'] !== null) {
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                             $policyCurrent = $expected['policy'] === self::policy($pair);
-                        } catch (\Throwable) { $policyCurrent = false; }
-                    }
+                        }
+                    } catch (\Throwable) { $policyCurrent = false; }
                     if ((int) $task['expires'] < time() || !$policyCurrent) {
                         // A delivered task may have written before losing its result. Never issue another write.
-                        $outcome = $task['state'] === 'executing' ? 'uncertain' : 'stale';
+                        $outcome = $task['state'] === 'executing' && $body['kind'] !== 'discover' ? 'uncertain' : 'stale';
                         self::storeResult($task, ['outcome' => $outcome, 'changed' => []]);
                     } else {
                         self::write($DB->update(self::TABLE, ['state' => 'executing'], ['id' => $task['id']]));
@@ -306,12 +576,14 @@ final class AgentTask
                 $id = $request['id'] ?? '';
                 $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' FOR UPDATE');
                 $result = $request['result'] ?? null;
-                if (!$saved || $saved['connection_id'] !== $pair['connection_id'] || ($request['hash'] ?? '') !== $saved['hash']
+                if (!$saved || $saved['connection_id'] !== $binding['connection_id'] || ($request['hash'] ?? '') !== $saved['hash']
                     || !is_array($result) || !in_array($result['outcome'] ?? '', ['verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'], true)
                     || !is_array($result['changed'] ?? null)) { throw new \UnexpectedValueException('Invalid task result.'); }
                 $body = json_decode($saved['body'], true, 32, JSON_THROW_ON_ERROR);
-                if ($body['generation'] !== $request['generation'] || $body['installation'] !== $request['installation']) { throw new \UnexpectedValueException('Stale result binding.'); }
+                if ($body['registration'] !== $registration['id'] || $body['generation'] !== $request['generation'] || $body['installation'] !== $request['installation']) { throw new \UnexpectedValueException('Stale result binding.'); }
                 if ($saved['result'] === '{}') {
+                    $pair = $body['kind'] === 'discover' ? null : self::taskPair($saved);
+                    $task = $pair ? self::outstanding($binding['connection_id'], $pair) : self::discoveryTask($binding['connection_id']);
                     if (!$task || $task['id'] !== $saved['id']) { throw new \UnexpectedValueException('No matching outstanding task.'); }
                     try { self::validateResult($body, $result); }
                     catch (\RuntimeException $error) { throw new \UnexpectedValueException('Invalid task evidence.', 0, $error); }
@@ -321,16 +593,75 @@ final class AgentTask
                 }
                 $response = ['status' => 200, 'recorded' => true, 'id' => $id, 'hash' => $saved['hash']];
             }
+            if ($request['kind'] === 'pull') {
+                $budget = 65536 - strlen(json_encode($response, JSON_THROW_ON_ERROR)) - 32;
+                if ($budget >= 512) { $response['subscriptions'] = self::subscriptions($binding, $registration, $budget); }
+            }
+            if (strlen(json_encode($response, JSON_THROW_ON_ERROR)) > 65536) { throw new \RuntimeException('Task response exceeds transport budget.'); }
             AgentInbox::sql('COMMIT');
             return $response;
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
     }
 
+    /** The caller holds the binding lock. Lost pages replay fixed A-issued expiries on a later pass. */
+    private static function subscriptions(array $binding, array $registration, int $budget): array
+    {
+        global $DB;
+        $page = ['installation' => $binding['installation'], 'registration' => $registration['id'],
+            'generation' => $registration['generation'], 'connection_id' => $binding['connection_id'], 'updates' => []];
+        $cursor = $binding['subscription_cursor'];
+        $revision = (int) $binding['subscription_revision'];
+        $count = 0;
+        $full = false;
+        foreach ($DB->request(['FROM' => self::PAIRS, 'WHERE' => ['connection_id' => $binding['connection_id'],
+            'id' => ['>', $cursor]], 'ORDER' => 'id ASC', 'LIMIT' => 50]) as $pair) {
+            try { self::scope($pair); $active = true; }
+            catch (\Throwable) { $active = false; }
+            if (!$active && (int) $pair['subscription_revision'] === 0) {
+                $cursor = $pair['id'];
+                $count++;
+                continue;
+            }
+            $issue = (int) $pair['subscription_revision'] === 0 || (bool) $pair['subscription_active'] !== $active
+                || $pair['subscription_generation'] !== $registration['generation']
+                || ($active && (int) $pair['subscription_issued'] <= time() - 600);
+            $issued = $issue ? time() : (int) $pair['subscription_issued'];
+            $update = ['pair_id' => $pair['id'], 'itemtype' => $pair['itemtype'], 'items_id' => (int) $pair['computer_id'],
+                'entity_id' => (int) $pair['entity_id'], 'revision' => $issue ? $revision + 1 : (int) $pair['subscription_revision'],
+                'issued_at' => $issued, 'expires' => $issued + 900, 'active' => $active];
+            $page['updates'][] = $update;
+            if (strlen(json_encode($page, JSON_THROW_ON_ERROR)) > $budget) { array_pop($page['updates']); $full = true; break; }
+            if ($issue) {
+                $revision++;
+                self::write($DB->update(self::PAIRS, ['subscription_revision' => $revision, 'subscription_issued' => $issued,
+                    'subscription_active' => (int) $active, 'subscription_generation' => $registration['generation']], ['id' => $pair['id']]));
+            }
+            $cursor = $pair['id'];
+            $count++;
+        }
+        if (!$full && $count < 50) { $cursor = ''; }
+        self::write($DB->update(self::BINDINGS, ['subscription_cursor' => $cursor, 'subscription_revision' => $revision], ['connection_id' => $binding['connection_id']]));
+        return $page;
+    }
+
+    public static function unconfirm(string $connection, string $pairId): void
+    {
+        global $DB;
+        $pair = self::byId($connection, $pairId);
+        if (!$pair || !self::model($pair['itemtype'])->can((int) $pair['local_id'], READ)
+            || !\Session::haveAccessToEntity((int) $pair['local_entity'])) { throw new \RuntimeException('Pair unavailable.'); }
+        self::write($DB->update(self::PAIRS, ['confirmed' => 0], ['id' => $pair['id']]));
+    }
+
     private static function validateResult(array $task, array $result): void
     {
         if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) { return; }
+        if ($task['kind'] === 'discover') { self::validateDiscovery($task, $result); return; }
         $snapshot = $result['snapshot'] ?? [];
-        if (($snapshot['computer_id'] ?? null) !== $task['computer_id'] || ($snapshot['entity_id'] ?? null) !== $task['entity_id']
+        $type = $task['itemtype'] ?? 'Computer';
+        if (($snapshot['items_id'] ?? $snapshot['computer_id'] ?? null) !== ($task['items_id'] ?? $task['computer_id']) || ($snapshot['entity_id'] ?? null) !== $task['entity_id']
+            || ($snapshot['itemtype'] ?? 'Computer') !== $type
+            || ($task['version'] === 3 && ($snapshot['pair_id'] ?? '') !== $task['pair_id'])
             || !is_string($snapshot['serial'] ?? null) || $snapshot['serial'] === ''
             || ($task['serial'] !== '' && $snapshot['serial'] !== $task['serial'])
             || !is_int($snapshot['observed_at'] ?? null) || $snapshot['observed_at'] > $task['expires']
@@ -344,7 +675,7 @@ final class AgentTask
                 || (in_array($key, ['name', 'comment'], true) && $field['type'] !== 'text')
                 || !is_string($field['label'] ?? null) || !is_int($field['option'] ?? null) || $field['option'] <= 0
                 || !preg_match('/^[a-f0-9]{64}$/D', $field['metadata'] ?? '')
-                || (!in_array($key, ['name', 'comment'], true) && !preg_match('/^Computer\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key))) {
+                || (!in_array($key, ['name', 'comment'], true) && !preg_match('/^' . preg_quote($type, '/') . '\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key))) {
                 throw new \RuntimeException('Invalid scoped metadata.');
             }
         }
@@ -379,14 +710,19 @@ final class AgentTask
         global $DB;
         self::write($DB->update(self::TABLE, ['result' => json_encode($result, JSON_THROW_ON_ERROR),
             'state' => !$fresh && in_array($result['outcome'], ['verified', 'unchanged'], true) ? 'stale' : $result['outcome']], ['id' => $task['id']]));
+        if ($fresh && isset($result['discovery']) && in_array($result['outcome'], ['verified', 'unchanged'], true)) {
+            self::write($DB->update(self::BINDINGS, ['discovery_observed_id' => $task['id']], ['connection_id' => $task['connection_id']]));
+        }
         if ($task['queue_id'] !== null) {
             self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
         } else {
             if ($fresh && isset($result['snapshot']) && in_array($result['outcome'], ['verified', 'unchanged'], true)) {
                 self::write($DB->update(self::PAIRS, ['snapshot' => json_encode($result['snapshot'], JSON_THROW_ON_ERROR),
-                    'observed_at' => min((int) $result['snapshot']['observed_at'], time(), (int) $task['expires'])], ['connection_id' => $task['connection_id']]));
+                    'observed_at' => min((int) $result['snapshot']['observed_at'], time(), (int) $task['expires'])], ['id' => self::taskPair($task)['id']]));
             }
-            self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));
+            if (!in_array($result['outcome'], ['partial', 'uncertain'], true)) {
+                self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));
+            }
         }
     }
 
@@ -402,9 +738,11 @@ final class AgentTask
         FieldMapping::endRunCache();
         FieldsText::endRunCache();
         $scope = self::scope($pair);
-        $rows = FieldMapping::load($pair['connection_id'], 'Computer');
-        self::validateMappings('Computer', $rows);
-        $mappings = FieldMapping::syncMappings($pair['connection_id'], 'Computer', $scope['asset']);
+        $type = $pair['itemtype'];
+        \Glpi\Search\SearchOption::clearSearchOptionCache($type);
+        $rows = FieldMapping::load($pair['connection_id'], $type);
+        self::validateMappings($type, $rows);
+        $mappings = FieldMapping::syncMappings($pair['connection_id'], $type, $scope['asset']);
         if ($mappings === []) { throw new \RuntimeException('No supported agent mappings.'); }
         $values = [];
         $metadata = [];
@@ -415,9 +753,9 @@ final class AgentTask
             if (in_array($key, ['name', 'comment'], true)) {
                 $types[$key] = 'text';
                 $values[$key] = (string) ($scope['asset'][$key] ?? '');
-                $metadata[$key] = NativeField::local('Computer', $key);
+                $metadata[$key] = NativeField::local($type, $key);
             } else {
-                $meta = FieldsText::customMetadata('Computer', [$key])[$key];
+                $meta = FieldsText::customMetadata($type, [$key])[$key];
                 if (!in_array($meta['type'], ['text', 'yesno', 'date'], true)) { throw new \RuntimeException('Agent custom mappings require text, yesno or date fields.'); }
                 $types[$key] = $meta['type'];
                 $container = new \PluginFieldsContainer();
@@ -434,7 +772,7 @@ final class AgentTask
                     'items_id' => (int) $pair['local_id']], 'LIMIT' => 2]));
                 if (count($children) !== 1) { throw new \RuntimeException('Agent mode requires exactly one existing local custom row.'); }
                 $child = array_values($children)[0];
-                if (($child['itemtype'] ?? '') !== 'Computer' || (int) ($child['plugin_fields_containers_id'] ?? 0) !== $meta['container_id']) {
+                if (($child['itemtype'] ?? '') !== $type || (int) ($child['plugin_fields_containers_id'] ?? 0) !== $meta['container_id']) {
                     throw new \RuntimeException('Local custom row identity changed.');
                 }
                 if (!array_key_exists($meta['field'], $child)) { throw new \RuntimeException('Local Fields column is unavailable.'); }
@@ -449,7 +787,7 @@ final class AgentTask
     {
         FieldMapping::endRunCache();
         $scope = self::scope($pair);
-        return self::hash([FieldMapping::load($pair['connection_id'], 'Computer'), $scope['route'],
+        return self::hash([FieldMapping::load($pair['connection_id'], $pair['itemtype']), $scope['route'],
             $scope['registration']['generation'], $pair['installation'], $scope['registration']['connection_identity'],
             \Config::getConfigurationValues('plugin:assetsync20', ['billing_fields'])]);
     }
@@ -457,16 +795,17 @@ final class AgentTask
     public static function process(array $job, callable $applyLocal): void
     {
         global $DB;
-        $pair = self::pair($job['glpi_b_connection_id']);
-        $task = self::outstanding($job['glpi_b_connection_id']);
+        $type = $job['itemtype'];
+        $pair = self::pair($job['glpi_b_connection_id'], $type, (int) $job['items_id']);
+        $task = $pair ? self::outstanding($job['glpi_b_connection_id'], $pair) : null;
         try {
             if ($task && $task['state'] === 'finalizing') {
                 self::write($DB->update(self::TABLE, ['state' => 'uncertain'], ['id' => $task['id'], 'state' => 'finalizing']));
                 self::write(AssetSyncQueue::waitForAgent($job));
                 return;
             }
-            if (($job['itemtype'] ?? '') !== 'Computer' || !$pair || (int) $pair['local_id'] !== (int) $job['items_id']) {
-                throw new \RuntimeException('Agent mode permits only the declared existing Computer.');
+            if (!$pair || (int) $pair['local_id'] !== (int) $job['items_id']) {
+                throw new \RuntimeException('Agent mode requires an independently confirmed typed pair.');
             }
             $context = self::context($pair);
             if (!$task) {
@@ -531,16 +870,16 @@ final class AgentTask
                 }
                 foreach ($localChanges as $key => $value) {
                     if ($current['types'][$key] === 'date' && $value === '') {
-                        $meta = FieldsText::customMetadata('Computer', [$key])[$key];
+                        $meta = FieldsText::customMetadata($pair['itemtype'], [$key])[$key];
                         $definition = new \PluginFieldsField();
-                        $computer = new \Computer();
+                        $computer = self::model($pair['itemtype']);
                         if (!$definition->getFromDB($meta['field_id']) || !$computer->getFromDB((int) $pair['local_id'])) {
                             throw new \RuntimeException('Local date metadata disappeared.');
                         }
                         $mandatory = !empty($definition->fields['mandatory']);
-                        $statusField = \PluginFieldsStatusOverride::getStatusFieldName('Computer');
+                        $statusField = \PluginFieldsStatusOverride::getStatusFieldName($pair['itemtype']);
                         foreach (\PluginFieldsStatusOverride::getOverridesForItemtypeAndStatus(
-                            (int) $definition->fields['plugin_fields_containers_id'], 'Computer', (int) $computer->fields[$statusField]) as $override) {
+                            (int) $definition->fields['plugin_fields_containers_id'], $pair['itemtype'], (int) $computer->fields[$statusField]) as $override) {
                             if ((int) $override['plugin_fields_fields_id'] === (int) $meta['field_id']) { $mandatory = !empty($override['mandatory']); }
                         }
                         if ($mandatory) {
@@ -555,9 +894,11 @@ final class AgentTask
             self::finish($task, $job, $outcome, $context['recheck'] || $billingChanged, self::localFingerprint(self::context($pair)));
         } catch (\Throwable) {
             if ($task) {
-                $current = self::outstanding($job['glpi_b_connection_id']);
+                $current = self::outstanding($job['glpi_b_connection_id'], $pair);
                 if ($current && $current['id'] === $task['id']) {
-                    self::write($DB->update(self::TABLE, ['state' => $current['state'] === 'finalizing' ? 'uncertain' : 'blocked'], ['id' => $task['id']]));
+                    $state = in_array($current['state'], ['uncertain', 'partial'], true) ? $current['state']
+                        : ($current['state'] === 'finalizing' ? 'uncertain' : 'blocked');
+                    self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $task['id']]));
                 }
             }
             // A failed task remains outstanding for inspection. Never silently republish an uncertain write.
@@ -585,7 +926,7 @@ final class AgentTask
             self::write($DB->update(self::TABLE, ['state' => $outcome, 'slot' => null], ['id' => $task['id'], 'state' => 'finalizing']));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Task finalization lost ownership.'); }
             if ($fingerprint !== null) {
-                self::write($DB->update(self::PAIRS, ['local_fingerprint' => $fingerprint, 'checked_at' => time()], ['connection_id' => $task['connection_id']]));
+                self::write($DB->update(self::PAIRS, ['local_fingerprint' => $fingerprint, 'checked_at' => time()], ['id' => self::taskPair($task)['id']]));
             }
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
@@ -610,33 +951,43 @@ final class AgentTask
     private static function lockLocalRows(array $pair, array $keys): void
     {
         global $DB;
-        $tables = ['glpi_computers' => 'id'];
-        $keys = array_merge($keys, HardwareBilling::localOutputKeys('Computer'), SwsdBilling::localOutputKeys('Computer'));
-        foreach (FieldsText::customMetadata('Computer', $keys) as $meta) { $tables[$meta['table']] = 'items_id'; }
+        $type = $pair['itemtype'];
+        $item = self::model($type);
+        $tables = [$item::getTable() => 'id'];
+        $keys = array_merge($keys, HardwareBilling::localOutputKeys($type), SwsdBilling::localOutputKeys($type));
+        foreach (FieldsText::customMetadata($type, $keys) as $meta) { $tables[$meta['table']] = 'items_id'; }
         foreach ($tables as $table => $column) {
             $engine = AgentInbox::one('SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ' . $DB->quote($table));
             if (strtolower((string) ($engine['ENGINE'] ?? '')) !== 'innodb') { throw new \RuntimeException('Transactional local storage is required.'); }
             AgentInbox::sql('SELECT `id` FROM `' . $table . '` WHERE `' . $column . '` = ' . (int) $pair['local_id'] . ' FOR UPDATE');
             if ($column === 'items_id') {
                 $rows = iterator_to_array($DB->request(['FROM' => $table, 'WHERE' => ['items_id' => (int) $pair['local_id']], 'LIMIT' => 2]));
-                if (count($rows) !== 1 || (array_values($rows)[0]['itemtype'] ?? '') !== 'Computer') {
+                if (count($rows) !== 1 || (array_values($rows)[0]['itemtype'] ?? '') !== $type) {
                     throw new \RuntimeException('Existing local mapped/billing child row required.');
                 }
             }
         }
     }
 
+    public static function canRetry(?array $task): bool
+    {
+        if (!$task || !in_array($task['state'], ['stale', 'blocked'], true)) { return false; }
+        $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+        return ($body['kind'] ?? '') === 'inspect'
+            || (($result['outcome'] ?? '') === 'stale' && ($result['changed'] ?? null) === []);
+    }
+
     /** Explicit administrator retry is restricted to tasks known not to have attempted a write. */
-    public static function retryStale(string $connection): void
+    public static function retryStale(string $connection, ?string $pairId = null): void
     {
         global $DB;
         AgentInbox::sql('START TRANSACTION');
         try {
-            $task = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote($connection) . ' FOR UPDATE');
-            $body = $task ? json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR) : [];
-            $result = $task ? json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR) : [];
-            if (!$task || !in_array($task['state'], ['stale', 'blocked'], true)
-                || ($body['kind'] !== 'inspect' && !(($result['outcome'] ?? '') === 'stale' && ($result['changed'] ?? null) === []))) {
+            $pair = $pairId === null ? self::pair($connection) : self::byId($connection, $pairId);
+            $task = $pair ? self::outstanding($connection, $pair) : null;
+            if ($task) { $task = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' FOR UPDATE'); }
+            if (!self::canRetry($task)) {
                 throw new \RuntimeException('Only a confirmed no-write stale operation can be retried. Partial or uncertain evidence requires investigation.');
             }
             self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));

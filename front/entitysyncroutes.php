@@ -80,6 +80,19 @@ if ($requestMethod === 'POST') {
         $routeConnectionId = $selectedConnectionId !== ''
             ? $selectedConnectionId
             : (string) ($_POST['glpi_b_connection_id'] ?? '');
+        $agentConnection = GlpiBConnection::find($routeConnectionId);
+        if ($agentConnection && GlpiBConnection::isAgent($agentConnection)) {
+            $discovery = \GlpiPlugin\Assetsync20\AgentTask::discovery($routeConnectionId);
+            $target = (string) ($_POST['glpi_b_target_entity_id'] ?? '');
+            $types = (array) ($_POST['asset_types'] ?? []);
+            if (!in_array($discovery['state'], ['ready', 'empty'], true) || !ctype_digit($target)
+                || !array_key_exists((int) $target, $discovery['page']['entities'] ?? [])
+                || count($types) !== 1 || !in_array($types[0], ['Computer', 'Printer'], true)
+                || ($discovery['page']['types'][$types[0]] ?? 'unavailable') !== '' || !empty($_POST['include_child_entities'])) {
+                throw new RuntimeException('Choose a freshly discovered B entity and one supported type on an exact route.');
+            }
+            $_POST['glpi_b_target_entity_name'] = $discovery['page']['entities'][(int) $target];
+        }
         $route = EntitySyncRoute::fromInput([
             'id'                         => $_POST['id'] ?? '',
             'name'                       => $_POST['name'] ?? '',
@@ -118,6 +131,8 @@ if ($requestMethod === 'POST') {
 
 $connections = GlpiBConnection::loadAll();
 $selectedConnection = $selectedConnectionId !== '' ? GlpiBConnection::find($selectedConnectionId) : null;
+$agentMode = $selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection);
+$agentDiscovery = $agentMode ? \GlpiPlugin\Assetsync20\AgentTask::discovery($selectedConnectionId) : [];
 
 if ($selectedConnectionId !== '' && $selectedConnection === null) {
     if ($message === null) {
@@ -387,9 +402,14 @@ echo '<td><input type="text" id="glpi_a_source_entity_name" name="glpi_a_source_
 echo '</tr>';
 
 echo '<tr>';
-echo '<td><label for="glpi_b_target_entity_id">GLPI B target entity id</label></td>';
-echo '<td><input type="text" id="glpi_b_target_entity_id" name="glpi_b_target_entity_id" value="'
-    . $html($route['glpi_b_target_entity_id']) . '" size="20" required></td>';
+echo '<td><label for="glpi_b_target_entity_id">GLPI B target entity</label></td><td>';
+if ($agentMode) {
+    Dropdown::showFromArray('glpi_b_target_entity_id', $agentDiscovery['page']['entities'] ?? [], ['value' => $route['glpi_b_target_entity_id']]);
+    echo '<p>Discovery: ' . $html($agentDiscovery['state']) . ' <a href="agent-pair.php?connection=' . rawurlencode($selectedConnectionId) . '">Refresh on Agent Pair</a></p>';
+} else {
+    echo '<input type="text" id="glpi_b_target_entity_id" name="glpi_b_target_entity_id" value="' . $html($route['glpi_b_target_entity_id']) . '" size="20" required>';
+}
+echo '</td>';
 echo '</tr>';
 
 echo '<tr>';
@@ -404,8 +424,10 @@ echo '<td>';
 foreach ($assetTypes as $assetType => $label) {
     $checked = in_array($assetType, $route['asset_types'], true) ? ' checked' : '';
     echo '<label class="assetsync-asset-type">';
-    echo '<input type="checkbox" name="asset_types[]" value="' . $html($assetType) . '"' . $checked . '> ';
-    echo $html($label);
+    $reason = $agentMode && (!in_array($assetType, ['Computer', 'Printer'], true) || ($agentDiscovery['page']['types'][$assetType] ?? 'unavailable') !== '')
+        ? ' (unsupported or unavailable on B)' : '';
+    echo '<input type="' . ($agentMode ? 'radio' : 'checkbox') . '" name="asset_types[]" value="' . $html($assetType) . '"' . $checked . ($reason !== '' ? ' disabled' : '') . '> ';
+    echo $html($label . $reason);
     echo '</label>';
 }
 echo '</td>';

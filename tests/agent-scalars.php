@@ -259,7 +259,7 @@ function scalarControllerRun(array $settings, array $request, string $token): vo
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     for ($step = 0; $step < 2; $step++) {
         $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
-        scalarCheck($task['version'] === 2, 'New controller publishes version 2.');
+        scalarCheck($task['version'] === 3, 'New controller publishes typed version 3.');
         scalarReceipt($request, $token, $task, TaskExecutor::execute($task, $settings));
         AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     }
@@ -413,6 +413,8 @@ foreach (['inspect', 'apply'] as $kind) {
     $saved = AgentTask::outstanding('b');
     $task = json_decode($saved['body'], true);
     $task['version'] = 1;
+    $task['computer_id'] = $task['items_id'];
+    unset($task['items_id'], $task['itemtype'], $task['pair_id']);
     foreach ($task['changes'] as &$change) { unset($change['type']); }
     unset($change);
     $task = scalarHash($task);
