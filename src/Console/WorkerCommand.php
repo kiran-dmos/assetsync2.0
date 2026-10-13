@@ -147,7 +147,10 @@ final class WorkerCommand extends AbstractCommand
 
         $hadCronUser = array_key_exists('glpicronuserrunning', $_SESSION ?? []);
         $previousCronUser = $_SESSION['glpicronuserrunning'] ?? null;
+        $hadCurrentTime = array_key_exists('glpi_currenttime', $_SESSION ?? []);
+        $previousCurrentTime = $_SESSION['glpi_currenttime'] ?? null;
         $_SESSION['glpicronuserrunning'] = 'cron_assetsync20_sync';
+        $_SESSION['glpi_currenttime'] = date('Y-m-d H:i:s');
         try {
             $processed = (new AssetSyncService())->run(10, 60, false);
 
@@ -168,6 +171,11 @@ final class WorkerCommand extends AbstractCommand
 
             return self::FAILURE;
         } finally {
+            if ($hadCurrentTime) {
+                $_SESSION['glpi_currenttime'] = $previousCurrentTime;
+            } else {
+                unset($_SESSION['glpi_currenttime']);
+            }
             if ($hadCronUser) {
                 $_SESSION['glpicronuserrunning'] = $previousCronUser;
             } else {

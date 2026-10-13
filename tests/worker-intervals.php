@@ -13,17 +13,18 @@ namespace Symfony\Component\Console\Output {
 namespace GlpiPlugin\Assetsync20agent {
     class Worker {
         public function run(): int {
-            \LoopFixture::$calls++;
-            \LoopFixture::$now += \LoopFixture::$elapsed;
-            return 1;
+            return \LoopFixture::runCycle();
         }
     }
 }
 namespace GlpiPlugin\Assetsync20agent\Console {
     function hrtime(bool $number): int { return \LoopFixture::$now; }
+    function date(string $format): string {
+        \LoopFixture::$dateFormats[] = $format;
+        return \date($format, \LoopFixture::$epoch);
+    }
     function usleep(int $microseconds): void {
-        \LoopFixture::$sleep = $microseconds;
-        throw new \CycleObserved();
+        \LoopFixture::sleep($microseconds);
     }
 }
 namespace GlpiPlugin\Assetsync20 {
@@ -32,10 +33,7 @@ namespace GlpiPlugin\Assetsync20 {
             if (($_SESSION['glpicronuserrunning'] ?? null) !== 'cron_assetsync20_sync') {
                 throw new \LogicException('CLI synchronization requires its normal GLPI cron context.');
             }
-            if (\LoopFixture::$failCycle) { throw new \RuntimeException('Injected cycle failure.'); }
-            \LoopFixture::$calls++;
-            \LoopFixture::$now += \LoopFixture::$elapsed;
-            return 1;
+            return \LoopFixture::runCycle();
         }
     }
 }
@@ -46,9 +44,12 @@ namespace GlpiPlugin\Assetsync20\Config {
 }
 namespace GlpiPlugin\Assetsync20\Console {
     function hrtime(bool $number): int { return \LoopFixture::$now; }
+    function date(string $format): string {
+        \LoopFixture::$dateFormats[] = $format;
+        return \date($format, \LoopFixture::$epoch);
+    }
     function usleep(int $microseconds): void {
-        \LoopFixture::$sleep = $microseconds;
-        throw new \CycleObserved();
+        \LoopFixture::sleep($microseconds);
     }
 }
 namespace {
@@ -60,11 +61,35 @@ namespace {
         public static int $sleep = 0;
         public static int $interval = 2;
         public static bool $failCycle = false;
+        public static int $epoch = 1791870528;
+        public static int $stopAfterCycles = 1;
+        public static array $observedSessions = [];
+        public static array $dateFormats = [];
+        public static array $expectedSession = [];
+
+        public static function runCycle(): int {
+            self::$observedSessions[] = $_SESSION;
+            self::$calls++;
+            self::$now += self::$elapsed;
+            $_SESSION['glpi_currenttime'] = 'changed_during_cycle';
+            if (self::$failCycle) { throw new RuntimeException('Injected cycle failure.'); }
+            return 1;
+        }
+
+        public static function sleep(int $microseconds): void {
+            if ($_SESSION !== self::$expectedSession) {
+                throw new RuntimeException('The caller session must be restored before loop sleep.');
+            }
+            self::$sleep = $microseconds;
+            self::$now += $microseconds * 1000;
+            self::$epoch += 60;
+            if (self::$calls >= self::$stopAfterCycles) { throw new CycleObserved(); }
+        }
     }
     class LoopInput implements Symfony\Component\Console\Input\InputInterface {
-        public function __construct(private string $interval) {}
+        public function __construct(private string $interval, private bool $loop = true) {}
         public function getOption(string $name): mixed {
-            return match ($name) { 'loop' => true, 'interval' => $this->interval, default => false };
+            return match ($name) { 'loop' => $this->loop, 'interval' => $this->interval, default => false };
         }
     }
     class LoopOutput implements Symfony\Component\Console\Output\OutputInterface {
@@ -72,6 +97,7 @@ namespace {
     }
     require __DIR__ . '/../assetsync20agent/src/Console/WorkerCommand.php';
     require __DIR__ . '/../src/Console/WorkerCommand.php';
+    $_SESSION = [];
     $checks = 0;
     foreach ([GlpiPlugin\Assetsync20agent\Console\WorkerCommand::class => 1,
         GlpiPlugin\Assetsync20\Console\WorkerCommand::class => 2] as $class => $interval) {
@@ -105,6 +131,77 @@ namespace {
             }
             $checks++;
         }
+    }
+    $originalTimezone = date_default_timezone_get();
+    try {
+        foreach (['UTC', 'Asia/Brunei'] as $timezone) {
+            date_default_timezone_set($timezone);
+            foreach ([GlpiPlugin\Assetsync20agent\Console\WorkerCommand::class => 1,
+                GlpiPlugin\Assetsync20\Console\WorkerCommand::class => 2] as $class => $interval) {
+                foreach ([false, true] as $loop) {
+                    foreach ([false, true] as $fail) {
+                        foreach (['absent', 'old', 'null'] as $clockState) {
+                            foreach (['absent', 'old', 'null'] as $cronState) {
+                                $_SESSION = ['caller' => 'preserved'];
+                                if ($clockState !== 'absent') {
+                                    $_SESSION['glpi_currenttime'] = $clockState === 'null' ? null : '2000-01-01 00:00:00';
+                                }
+                                if ($cronState !== 'absent') {
+                                    $_SESSION['glpicronuserrunning'] = $cronState === 'null' ? null : 'prior_cron_context';
+                                }
+                                LoopFixture::$expectedSession = $_SESSION;
+                                LoopFixture::$now = LoopFixture::$calls = LoopFixture::$sleep = 0;
+                                LoopFixture::$elapsed = 100_000_000;
+                                LoopFixture::$interval = $interval;
+                                LoopFixture::$failCycle = $fail;
+                                LoopFixture::$epoch = 1791870528;
+                                LoopFixture::$stopAfterCycles = 2;
+                                LoopFixture::$observedSessions = LoopFixture::$dateFormats = [];
+                                $expectedTimes = [date('Y-m-d H:i:s', LoopFixture::$epoch), date('Y-m-d H:i:s', LoopFixture::$epoch + 60)];
+                                $worker = new $class();
+                                $execute = new ReflectionMethod($class, 'execute');
+                                $input = new LoopInput((string) $interval, $loop);
+                                if ($loop) {
+                                    try {
+                                        $execute->invoke($worker, $input, new LoopOutput());
+                                        throw new LogicException('The continuous worker did not wait.');
+                                    } catch (CycleObserved) {}
+                                    if (LoopFixture::$sleep !== $interval * 1_000_000 - 100_000) {
+                                        throw new RuntimeException('Clock refresh must preserve cycle cadence on success and failure.');
+                                    }
+                                } else {
+                                    for ($cycle = 0; $cycle < 2; $cycle++) {
+                                        $result = $execute->invoke($worker, $input, new LoopOutput());
+                                        if ($result !== (int) $fail || $_SESSION !== LoopFixture::$expectedSession) {
+                                            throw new RuntimeException('One-off success and failure must restore absent, old and null clock/cron values.');
+                                        }
+                                        LoopFixture::$epoch += 60;
+                                    }
+                                }
+                                if (LoopFixture::$calls !== 2 || LoopFixture::$dateFormats !== ['Y-m-d H:i:s', 'Y-m-d H:i:s']
+                                    || array_column(LoopFixture::$observedSessions, 'glpi_currenttime') !== $expectedTimes
+                                    || $_SESSION !== LoopFixture::$expectedSession || date_default_timezone_get() !== $timezone) {
+                                    throw new RuntimeException('Each cycle must refresh the clock using the configured timezone and restore the caller session exactly.');
+                                }
+                                foreach (LoopFixture::$observedSessions as $observedSession) {
+                                    $expectedSession = LoopFixture::$expectedSession;
+                                    if ($class === GlpiPlugin\Assetsync20\Console\WorkerCommand::class) {
+                                        $expectedSession['glpicronuserrunning'] = 'cron_assetsync20_sync';
+                                    }
+                                    $expectedSession['glpi_currenttime'] = $observedSession['glpi_currenttime'];
+                                    if ($observedSession !== $expectedSession) {
+                                        throw new RuntimeException('The cycle must preserve caller context and the A cron marker.');
+                                    }
+                                }
+                                $checks++;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } finally {
+        date_default_timezone_set($originalTimezone);
     }
     echo "Worker interval tests passed ($checks checks; simulated cycles, no database or transport).\n";
 }

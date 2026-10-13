@@ -28,6 +28,9 @@ final class WorkerCommand extends AbstractCommand
         }
         do {
             $started = hrtime(true);
+            $hadCurrentTime = array_key_exists('glpi_currenttime', $_SESSION ?? []);
+            $previousCurrentTime = $_SESSION['glpi_currenttime'] ?? null;
+            $_SESSION['glpi_currenttime'] = date('Y-m-d H:i:s');
             try {
                 $count = (new Worker())->run();
                 $output->writeln('Agent cycle delivered/attempted: ' . $count);
@@ -35,6 +38,12 @@ final class WorkerCommand extends AbstractCommand
                 $output->writeln('<error>Agent cycle failed; durable work retained.</error>');
                 if (!$input->getOption('loop')) {
                     return self::FAILURE;
+                }
+            } finally {
+                if ($hadCurrentTime) {
+                    $_SESSION['glpi_currenttime'] = $previousCurrentTime;
+                } else {
+                    unset($_SESSION['glpi_currenttime']);
                 }
             }
             if ($input->getOption('loop')) {

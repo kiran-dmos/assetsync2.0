@@ -86,26 +86,48 @@ final class Worker
         $state = Settings::load();
         if (($state['mode'] ?? 'rest') === 'agent') {
             $deadline = hrtime(true) + 2_000_000_000;
+            $priorityDeadline = $deadline - 1_000_000_000;
             $cursor = max(0, (int) ($state['target_cursor'] ?? 0));
             $seen = 0;
             $degraded = false;
             $where = array_intersect_key($state, array_flip(['installation', 'registration', 'generation', 'connection_id']));
-            $where += ['id' => ['>', $cursor], 'active' => 1, 'expires' => ['>', time()]];
-            foreach ($DB->request(['FROM' => TargetScope::TABLE, 'WHERE' => $where, 'ORDER' => 'id ASC', 'LIMIT' => 50]) as $target) {
-                if (hrtime(true) >= $deadline) { break; }
+            $where += ['active' => 1, 'expires' => ['>', time()]];
+            $process = static function (array $target) use ($DB, $state, &$degraded): void {
                 $id = (int) $target['items_id'];
                 $type = $target['itemtype'];
                 try {
                     $before = Outbox::find($id, $type);
                     $snapshot = TargetScope::snapshot($target, $state);
                     Outbox::observe($id, $snapshot, (int) $target['dirty'] === 0, $before, $type);
-                    $DB->update(TargetScope::TABLE, ['dirty' => 0], ['id' => (int) $target['id'], 'dirty' => (int) $target['dirty']]);
+                    if (!$DB->update(TargetScope::TABLE, ['dirty' => 0], ['id' => (int) $target['id'], 'dirty' => (int) $target['dirty']])) {
+                        throw new \RuntimeException('Subscription dirty clear failed.');
+                    }
                 } catch (\Throwable) { $degraded = true; }
-                $cursor = (int) $target['id'];
+            };
+            $priorityIds = [];
+            foreach ($DB->request(['FROM' => TargetScope::TABLE, 'WHERE' => $where + ['dirty' => ['>', 0]],
+                'ORDER' => 'id ASC', 'LIMIT' => 5]) as $target) {
+                if (hrtime(true) >= $priorityDeadline) { break; }
+                $priorityIds[(int) $target['id']] = true;
                 $seen++;
-                \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor]);
+                $process($target);
             }
-            if ($seen < 50 && hrtime(true) < $deadline) { $cursor = 0; }
+            if ($seen < 50 && hrtime(true) < $deadline) {
+                $limit = 50 - $seen;
+                $sweepSeen = 0;
+                $interrupted = false;
+                foreach ($DB->request(['FROM' => TargetScope::TABLE, 'WHERE' => $where + ['id' => ['>', $cursor]],
+                    'ORDER' => 'id ASC', 'LIMIT' => $limit]) as $target) {
+                    if ($seen >= 50 || hrtime(true) >= $deadline) { $interrupted = true; break; }
+                    $seen++;
+                    $sweepSeen++;
+                    if (!isset($priorityIds[(int) $target['id']])) { $process($target); }
+                    $cursor = (int) $target['id'];
+                    \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor]);
+                }
+                // Priority rows consume the shared budget but never move the ordinary sweep cursor.
+                if (!$interrupted && $sweepSeen < $limit && hrtime(true) < $deadline) { $cursor = 0; }
+            }
             \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor, 'reconcile_status' => $degraded ? 'degraded' : 'ok']);
             return $seen;
         }
