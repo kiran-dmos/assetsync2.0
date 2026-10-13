@@ -111,19 +111,28 @@ foreach (['glpi_a', 'glpi_b'] as $authority) {
     scalarCheck($pair['confirmed'] === 1 && $basis['method'] === 'otherserial' && $basis['a']['serial'] === ''
         && $basis['b']['serial'] === '', 'Fresh auto inventory pair retains separate blank serial guards.');
     scalarCheck($DB->firstRow(AssetSyncQueue::TABLE, ['items_id' => 101])['status'] === 'pending', 'Matched is pending synchronization, not synchronized.');
+    $matchedQueue = $DB->firstRow(AssetSyncQueue::TABLE, ['items_id' => 101]);
+    scalarCheck($matchedQueue['route_id'] === 'route' && $matchedQueue['remote_items_id'] === 201,
+        'Pair confirmation atomically retains queue route and remote ID.');
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
     autoStep($settings, $request, $token, 'inspect');
-    autoStep($settings, $request, $token, 'apply');
+    if ($authority === 'glpi_a') { autoStep($settings, $request, $token, 'apply'); }
+    else { scalarCheck(AgentTask::outstanding('b', $pair) === null, 'B authority finishes from a fresh inspect without a B mutation.'); }
     $expected = $authority === 'glpi_a' ? 'A value' : 'B value';
     $table = $assetType === 'Computer' ? PluginFieldsComputerscalar::getTable() : PluginFieldsPrinterscalar::getTable();
     scalarCheck($DB->firstRow($table, ['items_id' => 101])['textfield'] === $expected && $DB->firstRow($table, ['items_id' => 201])['textfield'] === $expected,
         'Blank-serial inventory pair completes ordinary mapped update ' . $assetType . ' ' . $authority);
     scalarCheck($DB->firstRow(AssetSyncQueue::TABLE, ['items_id' => 101])['status'] === 'done', 'Synchronization completes only after apply/readback.');
+    $completedQueue = $DB->firstRow(AssetSyncQueue::TABLE, ['items_id' => 101]);
+    $completedLink = AssetSyncLink::find($assetType, 101, 'b');
+    scalarCheck($completedLink['status'] === AssetSyncLink::STATUS_SYNCED && $completedLink['last_sync_at'] !== null
+        && $completedLink['last_payload_hash'] !== '' && $completedLink['last_payload_hash'] === $completedQueue['payload_hash'],
+        'Verified typed completion stores synced link, time and matching queue hash.');
     $logs = iterator_to_array($DB->request(['FROM' => 'glpi_logs']));
     AssetSyncQueue::notify($assetType, 101, 'b');
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
     autoStep($settings, $request, $token, 'inspect');
-    autoStep($settings, $request, $token, 'apply');
+    scalarCheck(AgentTask::outstanding('b', $pair) === null, 'Equal reinspection publishes no B apply.');
     scalarCheck(iterator_to_array($DB->request(['FROM' => 'glpi_logs'])) === $logs, 'Repeated synchronization is a real no-op.');
     $DB->update($assetType === 'Computer' ? 'glpi_computers' : 'glpi_printers', ['otherserial' => 'changed'], ['id' => 101]);
     scalarReject(static fn () => AgentTask::scope(AgentTask::pair('b', $assetType)), 'A inventory guard remains enforced after confirmation.');
@@ -363,7 +372,8 @@ foreach (['yesfield', 'datefield'] as $column) {
         autoStep($settings, $request, $token, 'reverify');
         AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
         autoStep($settings, $request, $token, 'inspect');
-        autoStep($settings, $request, $token, 'apply');
+        if ($authority === 'glpi_a') { autoStep($settings, $request, $token, 'apply'); }
+        else { scalarCheck(AgentTask::outstanding('b') === null, 'Typed B-authority readback needs no B apply.'); }
         $expected = $column === 'yesfield' ? ($authority === 'glpi_a' ? 1 : 0) : ($authority === 'glpi_a' ? '2030-01-02' : '');
         $fieldType = $column === 'yesfield' ? 'yesno' : 'date';
         scalarCheck(AgentTask::normalizeValue($fieldType, scalarRow(101)[$column]) === $expected

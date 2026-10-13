@@ -25,7 +25,16 @@ try {
     $request = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
     if (!is_array($request)) { throw new InvalidArgumentException(); }
     $keys = ($request['kind'] ?? '') === 'pull' ? ['kind', 'registration', 'generation', 'installation', 'connection_id']
-        : ['kind', 'registration', 'generation', 'installation', 'connection_id', 'id', 'hash', 'result'];
+        : ['kind', 'registration', 'generation', 'installation', 'connection_id', 'id', 'hash', ($request['kind'] ?? '') === 'recovery' ? 'proof' : 'result'];
+    if (($request['kind'] ?? '') === 'pull' && array_key_exists('recovery_version', $request)) {
+        if ($request['recovery_version'] !== 1) { throw new InvalidArgumentException(); }
+        $keys[] = 'recovery_version';
+    }
+    if (($request['kind'] ?? '') === 'recovery') {
+        if (!is_string($request['id'] ?? null) || !preg_match('/^[a-f0-9]{32}$/D', $request['id'])
+            || !is_string($request['hash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $request['hash'])
+            || !is_array($request['proof'] ?? null)) { throw new InvalidArgumentException(); }
+    }
     if (($request['kind'] ?? '') === 'pull' && array_key_exists('subscriptions_only', $request)) {
         if (!is_bool($request['subscriptions_only'])) { throw new InvalidArgumentException(); }
         $keys[] = 'subscriptions_only';

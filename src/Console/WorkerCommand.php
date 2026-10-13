@@ -52,22 +52,22 @@ final class WorkerCommand extends AbstractCommand
 
         while (true) {
             $interval = WorkerSettings::getInterval();
-            $cycleStartedAt = microtime(true);
+            $cycleStartedAt = hrtime(true);
 
             $this->runOneCycle($output);
 
-            $elapsed = microtime(true) - $cycleStartedAt;
-            $sleepSeconds = max(0, $interval - (int) ceil($elapsed));
+            $elapsed = (hrtime(true) - $cycleStartedAt) / 1_000_000_000;
+            $sleepMicroseconds = max(0, (int) round(($interval - $elapsed) * 1_000_000));
 
-            if ($sleepSeconds > 0) {
+            if ($sleepMicroseconds > 0) {
                 $output->writeln(
                     sprintf(
                         '<comment>Next cycle in %d seconds.</comment>',
-                        $sleepSeconds
+                        (int) ceil($sleepMicroseconds / 1_000_000)
                     )
                 );
 
-                sleep($sleepSeconds);
+                usleep($sleepMicroseconds);
             } else {
                 $output->writeln(
                     '<comment>Cycle took at least the configured interval; continuing.</comment>'
@@ -145,6 +145,9 @@ final class WorkerCommand extends AbstractCommand
             '<info>Starting AssetSync2.0 synchronization...</info>'
         );
 
+        $hadCronUser = array_key_exists('glpicronuserrunning', $_SESSION ?? []);
+        $previousCronUser = $_SESSION['glpicronuserrunning'] ?? null;
+        $_SESSION['glpicronuserrunning'] = 'cron_assetsync20_sync';
         try {
             $processed = (new AssetSyncService())->run(10, 60, false);
 
@@ -164,7 +167,12 @@ final class WorkerCommand extends AbstractCommand
             );
 
             return self::FAILURE;
+        } finally {
+            if ($hadCronUser) {
+                $_SESSION['glpicronuserrunning'] = $previousCronUser;
+            } else {
+                unset($_SESSION['glpicronuserrunning']);
+            }
         }
     }
 }
-

@@ -72,7 +72,7 @@ foreach (['Computer', 'Printer'] as $type) {
             scalarCheck((int) $pair['computer_id'] === $id, 'Fresh independent confirmation retains the created B ID.');
             AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
             autoStep($settings, $request, $token, 'inspect');
-            autoStep($settings, $request, $token, 'apply');
+            scalarCheck(AgentTask::outstanding('b', $pair) === null, 'Initialized values finish with fresh inspection and no B apply.');
             scalarCheck(Computer::$adds === 1, 'Normal synchronization does not recreate.');
             $child = $type === 'Computer' ? PluginFieldsComputerscalar::getTable() : PluginFieldsPrinterscalar::getTable();
             $a = $DB->firstRow($child, ['items_id' => 101])[$column];
@@ -84,7 +84,7 @@ foreach (['Computer', 'Printer'] as $type) {
                 AssetSyncQueue::notify($type, 101, 'b');
                 AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
                 autoStep($settings, $request, $token, 'inspect');
-                autoStep($settings, $request, $token, 'apply');
+                scalarCheck(AgentTask::outstanding('b', $pair) === null, 'Later B authority requires no B mutation.');
                 scalarCheck($DB->firstRow($child, ['items_id' => 101])[$column] === $later, 'B authority applies immediately after initialization.');
             }
         }
@@ -214,7 +214,8 @@ scalarReceipt($request, $token, $task, $result);
 AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
 autoStep($settings, $request, $token, 'reverify');
 AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
-autoStep($settings, $request, $token, 'inspect'); autoStep($settings, $request, $token, 'apply');
+autoStep($settings, $request, $token, 'inspect');
+scalarCheck(AgentTask::outstanding('b') === null, 'Fresh existing values complete without a B mutation.');
 scalarCheck(scalarRow(101)['textfield'] === 'Keep existing B', 'Existing B keeps ordinary B authority.');
 
 foreach (['prepare_create', 'confirm_create', 'create'] as $phase) {

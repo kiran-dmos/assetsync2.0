@@ -114,10 +114,17 @@ final class AgentTask
 
     public static function needsInspection(array $pair, bool $force): bool
     {
+        global $DB;
         if (self::outstanding($pair['connection_id'], $pair)) { return false; }
         $context = self::context($pair);
+        $queue = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `itemtype` = ' . $DB->quote($pair['itemtype'])
+            . ' AND `items_id` = ' . (int) $pair['local_id'] . ' AND `glpi_b_connection_id` = ' . $DB->quote($pair['connection_id']));
+        $link = AssetSyncLink::find($pair['itemtype'], (int) $pair['local_id'], $pair['connection_id']);
+        $unfinishedLink = $queue && $queue['status'] === 'done'
+            && ((int) ($queue['remote_items_id'] ?? 0) !== (int) $pair['computer_id']
+                || $queue['route_id'] !== $pair['route_id'] || ($link['status'] ?? '') !== AssetSyncLink::STATUS_SYNCED);
         return $force || (int) ($pair['checked_at'] ?? 0) < time() - 3600
-            || ($pair['local_fingerprint'] ?? '') !== self::localFingerprint($context);
+            || ($pair['local_fingerprint'] ?? '') !== self::localFingerprint($context) || $unfinishedLink;
     }
 
     private static function localFingerprint(array $context): string
@@ -546,9 +553,11 @@ final class AgentTask
         }
         AgentInbox::sql('START TRANSACTION');
         try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($pair['connection_id']) . ' FOR UPDATE');
             if ($job !== null && !AssetSyncQueue::owns($job)) { throw new \RuntimeException('Queue claim changed.'); }
             if ($previous !== null) {
                 $old = self::outstanding($pair['connection_id'], $pair);
+                if ($old) { $old = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($old['id']) . ' FOR UPDATE'); }
                 if (!$old || $old['id'] !== $previous) { throw new \RuntimeException('Previous task ownership changed.'); }
                 self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $previous, 'slot' => $old['slot']]));
                 if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Previous task changed.'); }
@@ -567,7 +576,7 @@ final class AgentTask
     public static function exchange(array $request, string $token): array
     {
         global $DB;
-        if (!preg_match('/^[a-f0-9]{64}$/D', $token) || !in_array($request['kind'] ?? '', ['pull', 'result'], true)) {
+        if (!preg_match('/^[a-f0-9]{64}$/D', $token) || !in_array($request['kind'] ?? '', ['pull', 'result', 'recovery'], true)) {
             return ['status' => 401];
         }
         AgentInbox::sql('START TRANSACTION');
@@ -658,6 +667,83 @@ final class AgentTask
                         $response['task'] = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
                     }
                 }
+                if (!$task && ($request['recovery_version'] ?? 0) === 1) {
+                    foreach ($DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $binding['connection_id'],
+                        'state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+                        'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.recovery_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]) as $candidate) {
+                        $body = json_decode($candidate['body'], true, 32, JSON_THROW_ON_ERROR);
+                        // Rotate every examined row, including ineligible older bindings and kinds.
+                        $candidateContext = json_decode($candidate['context'], true, 32, JSON_THROW_ON_ERROR);
+                        $candidateContext['recovery_checked_at'] = (int) (microtime(true) * 1_000_000);
+                        self::write($DB->update(self::TABLE, ['context' => json_encode($candidateContext, JSON_THROW_ON_ERROR)],
+                            ['id' => $candidate['id'], 'slot' => $candidate['slot'], 'state' => 'stale']));
+                        if (($body['kind'] ?? '') !== 'apply' || ($body['version'] ?? 5) >= 5 || $candidate['queue_id'] === null
+                            || isset($candidateContext['recovery_proof'])
+                            || $body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
+                            || $body['installation'] !== $binding['installation']) { continue; }
+                        $response['recovery'] = $body;
+                        break;
+                    }
+                }
+            } elseif ($request['kind'] === 'recovery') {
+                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) ($request['id'] ?? '')) . ' FOR UPDATE');
+                $proof = $request['proof'] ?? null;
+                $proofKeys = ['version', 'observed_at', 'journal', 'result_hash'];
+                if (is_array($proof) && ($proof['journal'] ?? '') === 'verified') { $proofKeys[] = 'result'; }
+                if (!$saved || $saved['connection_id'] !== $binding['connection_id'] || ($request['hash'] ?? '') !== $saved['hash']
+                    || !is_array($proof) || array_keys($proof) !== $proofKeys
+                    || $proof['version'] !== 1 || !is_int($proof['observed_at'])
+                    || $proof['observed_at'] < time() - 300 || $proof['observed_at'] > time() + 30
+                    || !in_array($proof['journal'], ['absent', 'unchanged', 'stale', 'verified'], true)
+                    || !is_string($proof['result_hash'])
+                    || ($proof['journal'] === 'absent' ? $proof['result_hash'] !== '' : !preg_match('/^[a-f0-9]{64}$/D', $proof['result_hash']))) {
+                    throw new \UnexpectedValueException('Invalid recovery proof.');
+                }
+                $body = json_decode($saved['body'], true, 32, JSON_THROW_ON_ERROR);
+                if ($body['kind'] !== 'apply' || $body['version'] >= 5
+                    || ($proof['journal'] === 'absent' && ((int) $saved['expires'] >= time() || $proof['observed_at'] <= $body['expires']))
+                    || $body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
+                    || $body['installation'] !== $binding['installation']) { throw new \UnexpectedValueException('Recovery binding changed.'); }
+                if ($proof['journal'] === 'verified') {
+                    $writtenResult = $proof['result'];
+                    if (!is_array($writtenResult) || ($writtenResult['outcome'] ?? '') !== 'verified'
+                        || !is_array($writtenResult['changed'] ?? null) || $writtenResult['changed'] === []
+                        || self::hash($writtenResult) !== $proof['result_hash']) { throw new \UnexpectedValueException('Invalid verified recovery result.'); }
+                    foreach ($writtenResult['changed'] as $key => $historyId) {
+                        if (!isset($body['changes'][$key]) || !is_int($historyId) || $historyId <= 0) { throw new \UnexpectedValueException('Invalid verified recovery History.'); }
+                    }
+                    try { self::validateResult($body, $writtenResult); }
+                    catch (\RuntimeException $error) { throw new \UnexpectedValueException('Incomplete verified recovery evidence.', 0, $error); }
+                }
+                $context = json_decode($saved['context'], true, 32, JSON_THROW_ON_ERROR);
+                if (isset($context['recovery_proof'])) {
+                    $previousProof = $context['recovery_proof'];
+                    unset($previousProof['observed_at']);
+                    $replayedProof = $proof;
+                    unset($replayedProof['observed_at']);
+                    if ($previousProof !== $replayedProof) { throw new \UnexpectedValueException('Conflicting recovery replay.'); }
+                } else {
+                    $oldResult = json_decode($saved['result'], true, 32, JSON_THROW_ON_ERROR);
+                    $sameVerifiedResult = $proof['journal'] === 'verified' && ($oldResult['outcome'] ?? '') === 'verified'
+                        && self::hash($oldResult) === $proof['result_hash'];
+                    if ($saved['result'] !== '{}'
+                        && !$sameVerifiedResult
+                        && (!in_array($oldResult['outcome'] ?? '', ['stale', 'unchanged'], true) || ($oldResult['changed'] ?? null) !== [])) {
+                        throw new \UnexpectedValueException('Retained write evidence forbids recovery.');
+                    }
+                    $pair = self::taskPair($saved);
+                    $current = $pair ? self::outstanding($binding['connection_id'], $pair) : null;
+                    $job = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `id` = ' . (int) $saved['queue_id'] . ' FOR UPDATE');
+                    if (!$pair || !$current || $current['id'] !== $saved['id'] || $saved['state'] !== 'stale' || !$job
+                        || $job['itemtype'] !== $pair['itemtype'] || (int) $job['items_id'] !== (int) $pair['local_id']
+                        || $job['glpi_b_connection_id'] !== $binding['connection_id'] || $job['status'] === 'running') {
+                        throw new \UnexpectedValueException('Recovery task or queue ownership changed.');
+                    }
+                    $context['recovery_proof'] = $proof;
+                    self::write($DB->update(self::TABLE, ['context' => json_encode($context, JSON_THROW_ON_ERROR)], ['id' => $saved['id'], 'slot' => $saved['slot'], 'state' => 'stale']));
+                    self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $job['id'], 'status' => $job['status']]));
+                }
+                $response = ['status' => 200, 'recorded' => true, 'id' => $saved['id'], 'hash' => $saved['hash']];
             } else {
                 $id = $request['id'] ?? '';
                 $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' FOR UPDATE');
@@ -1290,6 +1376,7 @@ final class AgentTask
             self::write($DB->update(self::TABLE, ['slot' => null, 'state' => 'matched'], ['id' => $task['id'], 'slot' => $task['slot']]));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching task ownership changed.'); }
             self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending', 'claim_token' => '', 'started_at' => null,
+                'route_id' => $route['id'], 'remote_items_id' => $candidate['items_id'],
                 'last_error' => 'Automatically matched; synchronization pending.'], ['id' => (int) $job['id'], 'claim_token' => $job['claim_token'], 'status' => 'running']));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Matching queue ownership changed.'); }
             AgentInbox::sql('COMMIT');
@@ -1490,6 +1577,7 @@ final class AgentTask
             return;
         }
         $task = $pair ? self::outstanding($job['glpi_b_connection_id'], $pair) : null;
+        $recovering = false;
         try {
             if ($task && $task['state'] === 'finalizing') {
                 self::write($DB->update(self::TABLE, ['state' => 'uncertain'], ['id' => $task['id'], 'state' => 'finalizing']));
@@ -1505,6 +1593,14 @@ final class AgentTask
                 return;
             }
             if ((int) $task['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Another agent operation is outstanding.'); }
+            $recovery = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR)['recovery_proof'] ?? null;
+            if ($task['state'] === 'stale' && $recovery !== null) {
+                $recovering = true;
+                $oldBody = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+                if ($oldBody['kind'] !== 'apply' || $oldBody['version'] >= 5) { throw new \RuntimeException('Recovery kind changed.'); }
+                self::publish($pair, 'inspect', [], $job, $context, $task['id']);
+                return;
+            }
             if ($task['result'] === '{}') {
                 self::park($job, $task);
                 return;
@@ -1530,6 +1626,7 @@ final class AgentTask
             $context['recheck'] = !empty($expected['recheck']) || !empty($job['previous_needs_recheck']);
             if ($body['kind'] === 'inspect') {
                 $changes = [];
+                $needsBWrite = false;
                 foreach ($context['mappings'] as $mapping) {
                     $key = $mapping['glpi_b_field'];
                     $field = $result['snapshot']['fields'][$key] ?? null;
@@ -1538,9 +1635,12 @@ final class AgentTask
                     $value = $mapping['source_of_truth'] === 'glpi_a' ? $context['values'][$mapping['glpi_a_field']] : $field['value'];
                     $changes[$key] = ['type' => $type, 'metadata' => $field['metadata'], 'expected' => $field['value'],
                         'value' => self::normalizeValue($type, $value, true)];
+                    $needsBWrite = $needsBWrite || $changes[$key]['value'] !== $field['value'];
                 }
-                self::publish($pair, 'apply', $changes, $job, $context, $task['id']);
-                return;
+                if ($needsBWrite) {
+                    self::publish($pair, 'apply', $changes, $job, $context, $task['id']);
+                    return;
+                }
             }
             if (!AssetSyncQueue::owns($job)) { return; }
             // This durable marker prevents replay after process death during any A-side model/billing write.
@@ -1588,14 +1688,15 @@ final class AgentTask
             if ($task) {
                 $current = self::outstanding($job['glpi_b_connection_id'], $pair);
                 if ($current && $current['id'] === $task['id']) {
-                    $state = in_array($current['state'], ['uncertain', 'partial'], true) ? $current['state']
-                        : ($current['state'] === 'finalizing' ? 'uncertain' : 'blocked');
+                    $state = $recovering && $current['state'] === 'stale' ? 'stale' : (in_array($current['state'], ['uncertain', 'partial'], true) ? $current['state']
+                        : ($current['state'] === 'finalizing' ? 'uncertain' : 'blocked'));
                     self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $task['id']]));
                 }
             }
             // A failed task remains outstanding for inspection. Never silently republish an uncertain write.
             if (AssetSyncQueue::owns($job)) {
-                if ($task) { self::write(AssetSyncQueue::waitForAgent($job)); }
+                if ($recovering) { self::write(AssetSyncQueue::retry($job, 'Fresh inspection publication failed; recovery evidence retained.')); }
+                elseif ($task) { self::write(AssetSyncQueue::waitForAgent($job)); }
                 else { AssetSyncQueue::retry($job, 'Blocked before task publication: agent scope or mapping is unsupported; inspect Agent Pair configuration.'); }
             }
         }
@@ -1606,8 +1707,32 @@ final class AgentTask
         global $DB;
         AgentInbox::sql('START TRANSACTION');
         try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
+            $current = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' FOR UPDATE');
+            if (!$current || $current['hash'] !== $task['hash'] || $current['state'] !== 'finalizing'
+                || $current['slot'] !== $task['slot'] || (int) $current['queue_id'] !== (int) $job['id']) {
+                throw new \RuntimeException('Task changed before finalization.');
+            }
+            $pair = self::taskPair($current);
+            if (!$pair || $pair['itemtype'] !== $job['itemtype'] || (int) $pair['local_id'] !== (int) $job['items_id']) {
+                throw new \RuntimeException('Pair changed before finalization.');
+            }
+            $scope = self::scope($pair);
+            $link = AssetSyncLink::find($pair['itemtype'], (int) $pair['local_id'], $pair['connection_id']);
+            if (!$link || (int) $link['remote_items_id'] !== (int) $pair['computer_id'] || $link['route_id'] !== $pair['route_id']) {
+                throw new \RuntimeException('Confirmed link changed before finalization.');
+            }
+            $fingerprint ??= self::localFingerprint(self::context($pair));
             if (!AssetSyncQueue::owns($job)) { throw new \RuntimeException('Queue claim changed before finalization.'); }
+            self::write(AssetSyncLink::save([
+                'itemtype' => $pair['itemtype'], 'items_id' => (int) $pair['local_id'], 'glpi_b_connection_id' => $pair['connection_id'],
+                'route_id' => $pair['route_id'], 'remote_items_id' => (int) $pair['computer_id'], 'status' => AssetSyncLink::STATUS_SYNCED,
+                'last_payload_hash' => $fingerprint, 'last_payload_date' => $job['payload_date'] ?? null, 'last_error' => '',
+                'confirmed_remote_id' => (int) $pair['computer_id'], 'confirmed_entity_id' => (int) $pair['entity_id'],
+                'confirmed_identity' => AgentInbox::identity($scope['connection']),
+            ]));
             self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'done', 'claim_token' => '',
+                'route_id' => $pair['route_id'], 'remote_items_id' => (int) $pair['computer_id'], 'payload_hash' => $fingerprint,
                 'agent_completed' => (int) $job['agent_snapshot'], 'needs_recheck' => new \Glpi\DBAL\QueryExpression('GREATEST(`needs_recheck`, ' . (int) $recheck . ')'),
                 'last_error' => 'Agent task ' . $outcome . '.', 'finished_at' => new \Glpi\DBAL\QueryExpression('NOW()')],
                 ['id' => (int) $job['id'], 'claim_token' => $job['claim_token'], 'status' => 'running']));
@@ -1617,9 +1742,7 @@ final class AgentTask
                 . ' WHERE `queue_id` = ' . (int) $job['id'] . ' AND `work_generation` <= ' . (int) $job['agent_snapshot']);
             self::write($DB->update(self::TABLE, ['state' => $outcome, 'slot' => null], ['id' => $task['id'], 'state' => 'finalizing']));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Task finalization lost ownership.'); }
-            if ($fingerprint !== null) {
-                self::write($DB->update(self::PAIRS, ['local_fingerprint' => $fingerprint, 'checked_at' => time()], ['id' => self::taskPair($task)['id']]));
-            }
+            self::write($DB->update(self::PAIRS, ['local_fingerprint' => $fingerprint, 'checked_at' => time()], ['id' => $pair['id']]));
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
     }
@@ -1673,7 +1796,40 @@ final class AgentTask
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
         $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
         return ($body['kind'] ?? '') === 'inspect'
-            || (($result['outcome'] ?? '') === 'stale' && ($result['changed'] ?? null) === []);
+            || (($body['kind'] ?? '') === 'apply' && (int) ($task['result_received_at'] ?? 0) > 0
+                && ($result['outcome'] ?? '') === 'stale' && ($result['changed'] ?? null) === []);
+    }
+
+    /** Normal runs recover read-only inspections; retained write tasks require independent B evidence. */
+    public static function recoverStaleInspections(int $deadline): void
+    {
+        global $DB;
+        if (!$DB || !method_exists($DB, 'tableExists') || !$DB->tableExists(self::TABLE) || hrtime(true) >= $deadline) { return; }
+        $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+            'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]);
+        foreach ($tasks as $task) {
+            if (hrtime(true) >= $deadline) { break; }
+            // Atomic JSON update preserves any separately recorded apply proof while skipped rows rotate.
+            AgentInbox::sql('UPDATE `' . self::TABLE . '` SET `context` = JSON_SET(`context`, \'$.inspection_checked_at\', '
+                . (int) (microtime(true) * 1_000_000) . ') WHERE `id` = ' . $DB->quote($task['id'])
+                . ' AND `slot` = ' . $DB->quote($task['slot']) . " AND `state` = 'stale'");
+            $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            if (($body['kind'] ?? '') !== 'inspect' || $task['queue_id'] === null) { continue; }
+            $pair = self::taskPair($task);
+            if (!$pair || !$pair['confirmed']) { continue; }
+            try {
+                AssetUuidOperation::withAssetLock($pair['itemtype'], (int) $pair['local_id'], static function () use ($pair, $task, $deadline): void {
+                    if (hrtime(true) >= $deadline) { return; }
+                    self::scope($pair);
+                    $current = self::outstanding($pair['connection_id'], $pair);
+                    if ($current && $current['id'] === $task['id'] && $current['state'] === 'stale') {
+                        self::retryStale($pair['connection_id'], $pair['id']);
+                    }
+                });
+            } catch (\RuntimeException) {
+                // Retain revoked or changed scope for inspection without stopping other due work.
+            }
+        }
     }
 
     /** Explicit administrator retry is restricted to tasks known not to have attempted a write. */
@@ -1682,13 +1838,15 @@ final class AgentTask
         global $DB;
         AgentInbox::sql('START TRANSACTION');
         try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($connection) . ' FOR UPDATE');
             $pair = $pairId === null ? self::pair($connection) : self::byId($connection, $pairId);
             $task = $pair ? self::outstanding($connection, $pair) : null;
             if ($task) { $task = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' FOR UPDATE'); }
             if (!self::canRetry($task)) {
                 throw new \RuntimeException('Only a confirmed no-write stale operation can be retried. Partial or uncertain evidence requires investigation.');
             }
-            self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));
+            self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id'], 'slot' => $task['slot'], 'state' => $task['state']]));
+            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Retry task ownership changed.'); }
             if ($task['queue_id'] !== null) { self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent'])); }
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }

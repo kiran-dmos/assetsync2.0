@@ -255,9 +255,14 @@ function scalarApplyLocal(array $changes): bool
 }
 function scalarControllerRun(array $settings, array $request, string $token): void
 {
+    global $DB;
     AssetSyncQueue::notify('Computer', 101, 'b');
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     for ($step = 0; $step < 2; $step++) {
+        if (AgentTask::outstanding('b') === null) {
+            scalarCheck($DB->firstRow(AssetSyncQueue::TABLE, ['items_id' => 101])['status'] === 'done', 'No B apply is needed only after verified local completion.');
+            break;
+        }
         $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
         scalarCheck($task['version'] === 3, 'New controller publishes typed version 3.');
         scalarReceipt($request, $token, $task, TaskExecutor::execute($task, $settings));
@@ -376,17 +381,14 @@ foreach (['mandatory', 'status_mandatory', 'readback', 'fresh_local', 'type_mism
     $result = TaskExecutor::execute($task, $settings);
     if ($failure === 'type_mismatch') { $result['snapshot']['fields'][scalarKey('datefield')]['type'] = 'text'; }
     scalarReceipt($request, $token, $task, $result);
+    if ($failure === 'readback') { PluginFieldsComputerscalar::$ignoreUpdate = true; }
+    if ($failure === 'fresh_local') { $DB->update(PluginFieldsComputerscalar::getTable(), ['datefield' => '2026-10-14'], ['items_id' => 101]); }
+    $before = scalarRow(101);
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     if ($failure === 'type_mismatch') {
         scalarCheck(AgentTask::outstanding('b')['state'] === 'blocked', 'Fresh endpoint type mismatch blocks before apply publication.');
         continue;
     }
-    $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
-    scalarReceipt($request, $token, $task, TaskExecutor::execute($task, $settings));
-    if ($failure === 'readback') { PluginFieldsComputerscalar::$ignoreUpdate = true; }
-    if ($failure === 'fresh_local') { $DB->update(PluginFieldsComputerscalar::getTable(), ['datefield' => '2026-10-14'], ['items_id' => 101]); }
-    $before = scalarRow(101);
-    AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     scalarCheck(AgentTask::outstanding('b')['state'] === ($failure === 'fresh_local' ? 'stale' : 'uncertain')
         && scalarRow(101) === $before && iterator_to_array($DB->request(['FROM' => 'glpi_logs'])) === [], 'A denial/stale/readback failure retains explicit evidence without changing data: ' . $failure);
 }
@@ -397,7 +399,7 @@ PluginFieldsStatusOverride::$overrides = [['plugin_fields_containers_id' => 1, '
     'itemtype' => 'Computer', 'states' => [0], 'mandatory' => 0]];
 AssetSyncQueue::notify('Computer', 101, 'b');
 AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
-foreach (['inspect', 'apply'] as $kind) {
+foreach (['inspect'] as $kind) {
     $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
     scalarReceipt($request, $token, $task, TaskExecutor::execute($task, $settings));
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
@@ -409,7 +411,7 @@ scalarCheck(AgentTask::outstanding('b') === null && scalarRow(101)['datefield'] 
 [$settings, $request, $token] = scalarControllerSetup('textfield', 'glpi_b', 'old', 'legacy inbound');
 AssetSyncQueue::notify('Computer', 101, 'b');
 AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
-foreach (['inspect', 'apply'] as $kind) {
+foreach (['inspect'] as $kind) {
     $saved = AgentTask::outstanding('b');
     $task = json_decode($saved['body'], true);
     $task['version'] = 1;

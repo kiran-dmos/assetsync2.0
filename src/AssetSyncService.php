@@ -96,6 +96,8 @@ final class AssetSyncService
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
+            AgentTask::recoverStaleInspections(min($this->runDeadlineNs - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS,
+                hrtime(true) + 1_000_000_000));
             $uuidAvailable = false;
             $uuidDue = false;
             $uuidOutcome = 'upgrade_required';

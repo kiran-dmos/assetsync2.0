@@ -10,10 +10,23 @@ namespace GlpiPlugin\Assetsync20agent {
         public static int $closed = 0;
         public static int $status = 200;
         public static string $body = '{}';
+        public static array $responses = [];
+        public static array $payloads = [];
     }
     function curl_init(string $url): object { AgentTransport::$calls++; return (object) ['url' => $url]; }
-    function curl_setopt_array(object $handle, array $options): bool { AgentTransport::$options = $options; return true; }
-    function curl_exec(object $handle): bool { return (AgentTransport::$options[CURLOPT_WRITEFUNCTION])($handle, AgentTransport::$body) === strlen(AgentTransport::$body); }
+    function curl_setopt_array(object $handle, array $options): bool {
+        AgentTransport::$options = $options;
+        AgentTransport::$payloads[] = json_decode($options[CURLOPT_POSTFIELDS], true);
+        return true;
+    }
+    function curl_exec(object $handle): bool {
+        if (AgentTransport::$responses !== []) {
+            $response = array_shift(AgentTransport::$responses);
+            AgentTransport::$status = $response['status'];
+            AgentTransport::$body = json_encode($response['body']);
+        }
+        return (AgentTransport::$options[CURLOPT_WRITEFUNCTION])($handle, AgentTransport::$body) === strlen(AgentTransport::$body);
+    }
     function curl_getinfo(object $handle, int $option): int { return AgentTransport::$status; }
     function curl_close(object $handle): void { AgentTransport::$closed++; }
 }
@@ -99,7 +112,7 @@ namespace {
     $options = AgentTransport::$options;
     $check($options[CURLOPT_SSL_VERIFYPEER] && $options[CURLOPT_SSL_VERIFYHOST] === 2
         && !$options[CURLOPT_FOLLOWLOCATION] && $options[CURLOPT_PROTOCOLS] === CURLPROTO_HTTPS, 'Task transport also requires strict HTTPS with no redirect.');
-    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4, 5]] + array_intersect_key($settings,
+    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4, 5], 'recovery_version' => 1] + array_intersect_key($settings,
         array_flip(['registration', 'generation', 'installation', 'connection_id'])), 'Task request includes only capabilities and complete binding, not service credentials.');
     AgentTransport::$body = str_repeat('x', 65537);
     $check(\GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000)['status'] === 0,

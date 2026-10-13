@@ -11,7 +11,7 @@ listed below; this is not a production rollout or scale qualification.
 
 ### Automatic Creation (Protocol V5)
 
-Upgrade **B agent 0.5.0 first, then A controller 0.6.0**, with both workers stopped,
+Upgrade **A controller 0.6.2 first, then B agent 0.5.1**, with both workers stopped,
 using GLPI's plugin Update action. B advertises `task_versions: [1,2,3,4,5]`;
 A withholds creation tasks from older agents and shows an upgrade requirement.
 There are no new configuration switches or creation-specific database columns.
@@ -146,7 +146,7 @@ fixture columns; they do not prove live MySQL collation, InnoDB concurrency or s
 ### Installation And Automatic Pairing
 
 Stop both workers, including scheduled runs, before upgrading AssetSync. Install
-the B agent code first (0.5.0), then the A controller code (0.6.0),
+the A controller code first (0.6.2), then the B agent code (0.5.1),
 using GLPI's plugin Update action when upgrading from older installed versions.
 New task/pair/journal tables and columns are additive. Existing connections default
 to REST and retain their existing behavior. This is an AssetSync upgrade only;
@@ -529,3 +529,57 @@ lock and in-flight HTTP requests, and refresh the serving PHP workers after
 atomic file replacement. Preserve the existing enabled schedule, frequency,
 mode and batch size. Keep backups and verify old task evidence and deployed
 hashes. A code rollback should retain the additive column and task history.
+
+### Controller 0.6.2 / Agent 0.5.1 recovery and cadence
+
+Keep the existing enabled GLPI automatic action, frequency and batch size. The
+database run lock prevents the A loop and automatic action from overlapping.
+A's existing worker interval accepts 2-3600 seconds (default 10). B's loop accepts
+`--interval=1` through `--interval=3600` (default 15), measured between cycle starts.
+For the owned localhost fixture, use A's saved 2-second interval and B's
+`plugins:assetsync20agent:worker --loop --interval=1`. Deployment and local interval
+changes are separate operational steps; installing source does not change them.
+
+B drains at most ten task reports/executions/recovery probes in a soft five-second
+budget, reserving the rest of the existing twenty-second cycle for other work.
+Each result is acknowledged before the next pull. Empty pulls, failed transport
+and exhausted deadlines stop the drain. An execution in progress still resolves
+its durable outcome before returning. A reserved probe and rotating offers keep
+ordinary traffic or refused journal evidence from pinning legacy recovery.
+
+When every desired B value strictly equals its validated fresh inspection, A
+does not publish a no-op B apply. It uses the same guarded local finalization,
+permissions, row locks, billing checks and readback instead. Any real B change
+still requires apply. This remains an asynchronous observation, not a guarantee
+that B cannot change again after inspection.
+
+Normal A runs consider at most ten retained stale inspections within a one-second
+budget. They release only read-only inspect slots and request fresh inspection.
+Already-done legacy queues with missing remote IDs/routes or unsynchronized links
+also require a fresh inspect/apply chain. Old completion is not new verification.
+Matching stores queue remote ID/route with pair confirmation. Apply completion
+stores the synced link, verification time and payload hash with queue remote ID,
+route and current claim. New notifications remain outstanding.
+
+Legacy stale apply slots use a separate authenticated recovery envelope that B
+never executes. Under its existing exclusive worker lock, B validates the original
+immutable task, current binding and exact typed target, then reads its journal.
+An expired absent record or an exact terminal unchanged/stale record with no
+changed fields can authorize a new inspection. A terminal verified journal also
+permits fresh inspection when its complete typed readback and named History are
+validated and A stopped before local finalization. Terminal proof need not wait
+for expiry; an absent journal always must. Failed reads, nonexpired absent tasks,
+hash/body conflicts, executing journals, interrupted A finalization,
+partial/uncertain outcomes and creation
+tasks remain retained. Absence authorizes fresh inspection; it does not certify
+a historical outcome. Old bodies, hashes, results and null receipt times stay
+intact; proof is stored separately in context. The journal has no pruning path.
+After restoring or deleting journal data, re-establish installation identity
+before using absence recovery.
+
+Minimum handshake versions are A 0.6.2 and B 0.5.1. B 0.5.1 advertises
+`recovery_version: 1`; older A rejects that pull field with HTTP 400. Drain B before
+deploying, make A 0.6.2 ready first, then deploy/restart B 0.5.1. New A accepts older
+B pulls without that capability, but legacy apply recovery requires the B upgrade.
+A rollback must coordinate B compatibility. Preserve enabled cron and all retained
+task/journal evidence throughout deployment.

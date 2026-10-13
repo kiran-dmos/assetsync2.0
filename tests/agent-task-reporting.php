@@ -25,6 +25,9 @@ for ($i = 0; $i < 21; $i++) {
 $DB->insert(TaskJournal::TABLE, $row);
 AgentTransport::$status = 409;
 AgentTransport::$body = '{}';
+AgentTransport::$responses = [
+    ['status' => 200, 'body' => []], ['status' => 409, 'body' => []], ['status' => 200, 'body' => ['task' => null]],
+];
 $calls = AgentTransport::$calls;
 TaskJournal::cycle($settings, hrtime(true) + 1_000_000_000);
 $saved = $DB->fetchAssoc($DB->doQuery('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE id=' . $DB->quote($task['id'])));

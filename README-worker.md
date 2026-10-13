@@ -77,6 +77,7 @@ docker compose -f compose.yml -f C:\assetsync2.0-10sec\docker\worker.compose.yml
 ## Important notes
 
 - This worker configuration is separate from GLPI's standard cron runner (`cron-worker.sh`); do not substitute one for the other.
-- Keep only one scheduler responsible for the same AssetSync sync workload. In the tested setup, the GLPI automatic action `assetsync20_sync` was disabled while the dedicated worker was running.
+- Keep the GLPI automatic action `assetsync20_sync` enabled. The controller loop and automatic action share a database-scoped run lock that prevents overlapping runs.
+- A's saved interval accepts 2-3600 seconds and defaults to 10. For the owned localhost fixture, use 2 seconds on A and `plugins:assetsync20agent:worker --loop --interval=1` on B. B defaults to 15 seconds. These are deployment settings; installing code does not change them.
 - Do not commit database backups, API tokens, user tokens, passwords, or environment-specific secrets.
 - The local test confirmed four computer queue jobs reached `done` and the corresponding computers were visible in GLPI B. Each teammate should repeat the test in their own environment.

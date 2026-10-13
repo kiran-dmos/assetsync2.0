@@ -9,7 +9,7 @@ final class WorkerSettings
     private const CONTEXT = 'plugin:assetsync20';
     private const INTERVAL_KEY = 'worker_interval_seconds';
     private const DEFAULT_INTERVAL = 10;
-    private const MIN_INTERVAL = 10;
+    private const MIN_INTERVAL = 2;
     private const MAX_INTERVAL = 3600;
 
     public static function getInterval(): int
@@ -38,7 +38,7 @@ final class WorkerSettings
     {
         if ($interval < self::MIN_INTERVAL || $interval > self::MAX_INTERVAL) {
             throw new \InvalidArgumentException(
-                'Worker interval must be between 10 and 3600 seconds.'
+                'Worker interval must be between 2 and 3600 seconds.'
             );
         }
 

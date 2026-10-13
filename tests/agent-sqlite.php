@@ -10,6 +10,7 @@ final class AgentSqlite
     public ?Closure $beforeQuery = null;
     public string $databaseVersion = '8.0.36';
     private int $affected = 0;
+    public bool $workerLockHeld = false;
 
     public function __construct(string $file = ':memory:')
     {
@@ -36,7 +37,11 @@ final class AgentSqlite
         }
         if ($sql === 'SELECT DATABASE() AS database_name') { return $this->pdo->query("SELECT 'agent_test' AS database_name"); }
         if (preg_match('/^SELECT (GET_LOCK|RELEASE_LOCK)\(/', $sql, $m)) {
+            if (str_contains($sql, 'assetsync20agent:')) { $this->workerLockHeld = $m[1] === 'GET_LOCK'; }
             return $this->pdo->query('SELECT 1 AS ' . ($m[1] === 'GET_LOCK' ? 'acquired' : 'released'));
+        }
+        if (str_starts_with($sql, 'SELECT IS_USED_LOCK(')) {
+            return $this->pdo->query('SELECT ' . (int) $this->workerLockHeld . ' AS owned');
         }
         if ($sql === 'START TRANSACTION') { return $this->pdo->beginTransaction(); }
         // SQLite cannot model InnoDB snapshots; actual lock contention is tested in the isolated lab.

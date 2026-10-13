@@ -426,12 +426,18 @@ final class FakeDB
                 $order = end($order);
             }
             if ($order instanceof \Glpi\DBAL\QueryExpression) {
-                if ($order->expression !== 'CAST(glpi_b_connection_id AS BINARY) ASC') {
+                if ($order->expression === 'CAST(glpi_b_connection_id AS BINARY) ASC') {
+                    $order = 'glpi_b_connection_id ASC';
+                } elseif ($order->expression === "COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC") {
+                    usort($filtered, static fn (array $a, array $b): int =>
+                        [json_decode($a['context'], true)['inspection_checked_at'] ?? 0, $a['created_at'], $a['id']]
+                        <=> [json_decode($b['context'], true)['inspection_checked_at'] ?? 0, $b['created_at'], $b['id']]);
+                    $order = null;
+                } else {
                     throw new RuntimeException('Unexpected SQL order: ' . $order->expression);
                 }
-                $order = 'glpi_b_connection_id ASC';
             }
-            $filtered = $this->sortRows($filtered, (string) $order);
+            if ($order !== null) { $filtered = $this->sortRows($filtered, (string) $order); }
         }
 
         if (isset($query['LIMIT'])) {
@@ -1524,7 +1530,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.6.1',
+    'version' => '0.6.2',
 ];
 
 foreach ($expectations as $key => $expected) {

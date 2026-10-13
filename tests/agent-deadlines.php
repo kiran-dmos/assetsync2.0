@@ -102,7 +102,7 @@ namespace {
     }
 
     // Every phase can be processed after expiry when receipt was timely and observation still fresh.
-    [$settings, $request, $token] = createSetup();
+    [$settings, $request, $token] = createSetup('glpi_a');
     $GLOBALS['deadlineNow'] = time();
     autoStart();
     foreach (['match', 'prepare_create', 'create', 'confirm_create', 'inspect', 'apply'] as $kind) {
@@ -119,7 +119,11 @@ namespace {
         scalarCheck($DB->firstRow(AgentTask::TABLE, ['id' => $task['id']])['result_received_at'] === $received,
             'Late duplicate cannot rewrite first receipt: ' . $kind);
         AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
-        if ($kind === 'confirm_create') { AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal'); }
+        if ($kind === 'confirm_create') {
+            $DB->update(PluginFieldsComputerscalar::getTable(), ['textfield' => 'Changed B after creation'],
+                ['items_id' => AgentTask::pair('b')['computer_id']]);
+            AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
+        }
     }
     scalarCheck(Computer::$adds === 1 && AgentTask::outstanding('b') === null,
         'Delayed worker finishes creation and scalar synchronization with one add.');

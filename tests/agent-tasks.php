@@ -148,7 +148,8 @@ foreach ([0, 1] as $newNotification) {
     $claim = AssetSyncQueue::claimDue(1)[0];
     $DB->update(AgentTask::TABLE, ['state' => 'finalizing'], ['id' => $task['id']]);
     if ($newNotification) { AssetSyncQueue::notify('Computer', 101, 'b'); }
-    (new ReflectionMethod(AgentTask::class, 'finish'))->invoke(null, $task, $claim, 'unchanged', false);
+    $savedTask = AgentTask::outstanding('b');
+    (new ReflectionMethod(AgentTask::class, 'finish'))->invoke(null, $savedTask, $claim, 'unchanged', false);
     agentCheck(queue()['status'] === 'done' && (int) queue()['needs_recheck'] === $newNotification,
         'Finalization consumes captured dirty work but preserves a newly arrived local notification.');
 }
