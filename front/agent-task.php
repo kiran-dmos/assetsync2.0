@@ -41,7 +41,7 @@ try {
     }
     if (($request['kind'] ?? '') === 'pull' && array_key_exists('task_versions', $request)) {
         if (!is_array($request['task_versions']) || !array_is_list($request['task_versions'])
-            || count($request['task_versions']) > 5 || array_diff($request['task_versions'], [1, 2, 3, 4, 5]) !== []
+            || count($request['task_versions']) > 6 || array_diff($request['task_versions'], [1, 2, 3, 4, 5, 6]) !== []
             || count(array_filter($request['task_versions'], 'is_int')) !== count($request['task_versions'])) { throw new InvalidArgumentException(); }
         $keys[] = 'task_versions';
     }

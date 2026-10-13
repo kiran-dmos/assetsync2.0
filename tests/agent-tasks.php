@@ -68,10 +68,18 @@ foreach (['uuid', 'serial', 'otherserial', 'states_id'] as $field) {
     try { AgentTask::validateMappings('Computer', [['glpi_a_field_key' => $field, 'glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']]); throw new LogicException('Unsupported native accepted'); }
     catch (RuntimeException) { agentCheck(true, 'Unsupported native mapping blocked before UUID filtering.'); }
 }
-foreach (['both', 'invalid'] as $source) {
+AgentTask::validateMappings('Computer', [['glpi_a_field_key' => 'name', 'glpi_b_field_key' => 'Computer.name', 'source_of_truth' => 'both']]);
+agentCheck(true, 'Same native Both endpoint aliases are supported.');
+foreach (['invalid'] as $source) {
     try { AgentTask::validateMappings('Computer', [['glpi_a_field_key' => 'name', 'glpi_b_field_key' => 'name', 'source_of_truth' => $source]]); throw new LogicException('Unsupported authority accepted'); }
     catch (RuntimeException) { agentCheck(true, 'Unsupported authority blocked.'); }
 }
+foreach ([['name', 'comment'], ['Computer.PluginFieldsComputertest.textfield', 'name']] as [$a, $b]) {
+    try { AgentTask::validateMappings('Computer', [['glpi_a_field_key' => $a, 'glpi_b_field_key' => $b, 'source_of_truth' => 'both']]); throw new LogicException('Unsupported Both accepted'); }
+    catch (RuntimeException) { agentCheck(true, 'Custom or cross-native Both stays blocked.'); }
+}
+try { AgentTask::validateMappings('Computer', [['glpi_a_field_key' => 'name', 'glpi_b_field_key' => 'name', 'source_of_truth' => 'both']], true); throw new LogicException('Creation Both accepted'); }
+catch (RuntimeException) { agentCheck(true, 'Creation Both stays blocked.'); }
 $participants = (new ReflectionMethod(\GlpiPlugin\Assetsync20\AssetUuidService::class, 'participants'))->invoke(
     new \GlpiPlugin\Assetsync20\AssetUuidService(), 'Computer', 101, ['entities_id' => 1], []);
 agentCheck($participants['outcome'] === 'unsupported_agent', 'UUID participation explicitly blocked before any remote request.');

@@ -47,6 +47,7 @@ namespace Glpi\Http {
 
 namespace {
     require __DIR__ . '/../assetsync20agent/src/autoload.php';
+    require __DIR__ . '/../assetsync20agent/setup.php';
     use GlpiPlugin\Assetsync20agent\AgentTransport;
     use GlpiPlugin\Assetsync20agent\Settings;
     use GlpiPlugin\Assetsync20agent\Worker;
@@ -57,6 +58,7 @@ namespace {
         if (!$ok) { throw new RuntimeException($message); }
     };
     $settings = ['endpoint' => 'https://controller.invalid/plugins/assetsync20/front/agent-notify.php', 'token' => str_repeat('a', 64)];
+    $check(plugin_version_assetsync20agent()['version'] === '0.5.3', 'B advertises the v6 feature package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
@@ -112,8 +114,18 @@ namespace {
     $options = AgentTransport::$options;
     $check($options[CURLOPT_SSL_VERIFYPEER] && $options[CURLOPT_SSL_VERIFYHOST] === 2
         && !$options[CURLOPT_FOLLOWLOCATION] && $options[CURLOPT_PROTOCOLS] === CURLPROTO_HTTPS, 'Task transport also requires strict HTTPS with no redirect.');
-    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4, 5], 'recovery_version' => 1] + array_intersect_key($settings,
+    $check(json_decode($options[CURLOPT_POSTFIELDS], true) === ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4, 5, 6], 'recovery_version' => 1] + array_intersect_key($settings,
         array_flip(['registration', 'generation', 'installation', 'connection_id'])), 'Task request includes only capabilities and complete binding, not service credentials.');
+    AgentTransport::$responses = [['status' => 400, 'body' => ['error' => 'Invalid task request']], ['status' => 200, 'body' => ['task' => null]]];
+    $calls = AgentTransport::$calls;
+    $response = \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000);
+    $check($response['status'] === 200 && AgentTransport::$calls === $calls + 2
+        && AgentTransport::$payloads[count(AgentTransport::$payloads) - 1]['task_versions'] === [1, 2, 3, 4, 5], 'B-first upgrade retries an older A capability rejection with legacy read-only pull.');
+    AgentTransport::$responses = [['status' => 400, 'body' => []]];
+    $calls = AgentTransport::$calls;
+    \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'result', 'id' => 'retained'], hrtime(true) + 1_000_000_000);
+    $check(AgentTransport::$calls === $calls + 1, 'Capability compatibility never retries or downgrades a result/write.');
+    AgentTransport::$status = 200;
     AgentTransport::$body = str_repeat('x', 65537);
     $check(\GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000)['status'] === 0,
         'Task response is capped at 64 KiB.');

@@ -77,6 +77,10 @@ final class AgentActivity
             if (!$pair || !in_array((int) $pair['local_entity'], $entities, true) || !$item->can((int) $pair['local_id'], READ)) { continue; }
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
+            $context = json_decode($task['context'], true);
+            if ($state === 'blocked' && isset($context['field_conflict'])) {
+                $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
+            }
             if (AgentTask::isMatch($body)) {
                 $label = match ($state) {
                     'accepted' => 'Matching queued', 'executing' => 'Reading B identities', 'matched' => 'Matched; synchronization pending',

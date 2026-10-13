@@ -9,6 +9,42 @@ listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
+### Native Both (Protocol V6)
+
+Confirmed existing pairs may use Both for the same native Name or Comments key
+on A and B. Native/custom cross-mappings, custom Both, creation with Both, UUID
+and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
+retain their protocol behavior and permission checks.
+
+Upgrade **B agent 0.5.3 first, then A controller 0.6.4**. B's read-only pull retries with the v1-v5
+capability list when an older A rejects the additive v6 list. Upgrade A before
+enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
+There is no task downgrade or REST fallback. No new database table or column is
+required for Both; older installations still need their existing additive migrations.
+Back up privately and preserve outstanding tasks, journals, results and enabled scheduling.
+
+Equal normalized values are no-ops, including blanks, without requiring timestamps.
+For different values, a strictly newer reliable native asset instant wins, including
+a newer blank. Each instance reads native values and UNIX_TIMESTAMP(date_mod) together
+from its own TIMESTAMP column. Equal, missing, invalid or ambiguous instants report
+`blocked_field_conflict`; a populated value never wins merely because the other is blank.
+
+V6 pins both observations, metadata, identities and resolved directions before writes.
+B prevalidates the entire batch under existing parent/child locks and asserts captured
+values and modification evidence even when B wins without a B write. A rechecks its
+observation before dispatch and under its finalization lock. No direction is recomputed
+after a model or billing write advances date_mod. Post-write native values, epochs and
+actual parent History anchors live in the existing task context and journal; unchanged
+own mutations inherit the pinned real comparison origin. Later native History can
+establish a fresh human edit in the same second. Legacy incomplete provenance stays
+ambiguous; neither author names nor guessed timestamps repair it.
+
+A retained read-only v6 inspection conflict may refresh after changed A context or a
+new admitted B notification. The old row and evidence remain. It does not repeatedly
+inspect an unchanged conflict or replay partial/uncertain writes. V6 apply recovery
+requires independent B journal proof and starts a new v6 inspection; v5 creation
+remains excluded. Retained v1-v5 bodies, hashes, results and replay schemas are unchanged.
+
 ### Automatic Creation (Protocol V5)
 
 Upgrade **A controller 0.6.2 first, then B agent 0.5.1**, with both workers stopped,
@@ -190,7 +226,8 @@ upgrade to expose Yes/No and Date fields in the mapping catalog.
    existing candidates and links remain intact.
 7. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
    Custom endpoint types must match. Each mapping must use
-   `glpi_a` or `glpi_b` authority; Both is rejected. Metadata GET uses the bounded
+   `glpi_a` or `glpi_b` authority; matching native Name/Comments on confirmed
+   existing pairs also support v6 Both. Metadata GET uses the bounded
    stored B observation; explicit refresh queues a fresh inspection without REST.
 
 Automatic creation uses existing saved mappings. The mapping UI still requires an
@@ -252,8 +289,9 @@ an old database NULL has blank history text. A reuses FieldsText
 normalization and its existing model writer. Both writers preserve NULL-to-zero
 Yes/No updates despite GLPI's loose comparison.
 
-Types other than Computer and Printer, recursive/inherited-only grants, Both, dropdowns,
-textarea, number, datetime, other native fields and UUID mutation are unsupported
+Types other than Computer and Printer, recursive/inherited-only grants, custom or
+cross-key Both mappings, creation with Both, dropdowns, textarea, number, datetime,
+other native fields and UUID mutation are unsupported
 in agent-only mode. The separate UUID service
 returns `unsupported_agent` before any mutation/REST for agent participation,
 including mixed REST/agent participant sets. Supported scalar work remains

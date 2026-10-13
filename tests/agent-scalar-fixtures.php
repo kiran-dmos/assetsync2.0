@@ -14,6 +14,7 @@ define('CREATE', 4);
 class ScalarDB
 {
     public AgentSqlite $sql;
+    public string $nativeTimestampType = 'timestamp';
     public function __construct() { $this->sql = new AgentSqlite(); }
     public function quote(string $value): string { return $this->sql->quote($value); }
     public function tableExists(string $table): bool { return $this->sql->tableExists($table); }
@@ -29,6 +30,9 @@ class ScalarDB
         // SQLite verifies rollback, not InnoDB lock semantics (reserved for independent live verification).
         if (str_starts_with($sql, 'SELECT ENGINE FROM information_schema.TABLES')) {
             return $this->sql->pdo->query("SELECT 'InnoDB' AS ENGINE");
+        }
+        if (str_starts_with($sql, 'SELECT DATA_TYPE FROM information_schema.COLUMNS')) {
+            return $this->sql->pdo->query('SELECT ' . $this->quote($this->nativeTimestampType) . ' AS DATA_TYPE');
         }
         return $this->sql->doQuery($sql);
     }
@@ -72,8 +76,8 @@ class Session
     public static function loadLanguage(): void {}
     public static function changeProfile($id): void { $_SESSION['glpiactiveprofile'] = ['id' => $id]; }
     public static function changeActiveEntities($id, $recursive): bool { $_SESSION['glpiactive_entity'] = $id; return true; }
-    public static function getLoginUserID(): int { return $_SESSION['glpiID'] ?? 0; }
-    public static function isCron(): bool { return false; }
+    public static function getLoginUserID(bool $forceHuman = true): int|string { return !$forceHuman && isset($_SESSION['glpicronuserrunning']) ? $_SESSION['glpicronuserrunning'] : ($_SESSION['glpiID'] ?? 0); }
+    public static function isCron(): bool { return isset($_SESSION['glpicronuserrunning']); }
     public static function isInventory(): bool { return false; }
     public static function isRightChecksDisabled(): bool { return false; }
     public static function haveAccessToEntity($id): bool { return self::$entityAccess; }
@@ -166,6 +170,9 @@ class Computer
             $old = $DB->firstRow(static::getTable(), ['id' => $id])[$column];
             $DB->update(static::getTable(), [$column => $value], ['id' => $id]);
             Log::record($id, $column, $old, $value, static::class);
+        }
+        if ($DB->fieldExists(static::getTable(), 'date_mod')) {
+            $DB->update(static::getTable(), ['date_mod' => $_SESSION['glpi_currenttime'] ?? gmdate('Y-m-d H:i:s')], ['id' => $id]);
         }
         return true;
     }
@@ -300,10 +307,14 @@ class Log
                 $decoded = json_decode($value);
                 $$side = is_array($decoded) || is_object($decoded) ? '' : mb_substr($value, 0, 255);
             }
-            $DB->insert('glpi_logs', ['items_id' => $id, 'itemtype' => $type, 'id_search_option' => $optionId,
+            $user = Session::getLoginUserID(false);
+            $author = is_numeric($user) ? User::getNameForLog((int) $user) : $user;
+            $audit = ['items_id' => $id, 'itemtype' => $type, 'id_search_option' => $optionId,
                 'itemtype_link' => '', 'linked_action' => 0, 'field' => $option['name'],
-                'user_name' => User::getNameForLog(Session::getLoginUserID()), 'old_value' => $old,
-                'new_value' => PluginFieldsContainer::$fault === 'history_wrong' ? 'wrong' : $new]);
+                'user_name' => $author, 'old_value' => $old,
+                'new_value' => PluginFieldsContainer::$fault === 'history_wrong' ? 'wrong' : $new];
+            if ($DB->fieldExists('glpi_logs', 'date_mod')) { $audit['date_mod'] = $_SESSION['glpi_currenttime'] ?? gmdate('Y-m-d H:i:s'); }
+            $DB->insert('glpi_logs', $audit);
         }
     }
     public static function getHistoryData($computer, $start, $limit): array

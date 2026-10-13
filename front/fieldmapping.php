@@ -44,11 +44,20 @@ if ($selectedConnection !== null) {
         Session::checkRight('config', UPDATE);
         try {
             global $DB;
+            $queued = false;
             foreach ($DB->request(['FROM' => \GlpiPlugin\Assetsync20\AgentTask::PAIRS,
-                'WHERE' => ['connection_id' => $selectedConnectionId, 'itemtype' => $selectedItemtype], 'ORDER' => 'local_id ASC', 'LIMIT' => 1]) as $pair) {
-                if (!\GlpiPlugin\Assetsync20\AgentTask::model($selectedItemtype)->can((int) $pair['local_id'], READ)) { throw new RuntimeException('Asset unavailable.'); }
+                'WHERE' => ['connection_id' => $selectedConnectionId, 'itemtype' => $selectedItemtype, 'confirmed' => 1],
+                'ORDER' => 'local_id DESC', 'LIMIT' => 32]) as $pair) {
+                if (!\GlpiPlugin\Assetsync20\AgentTask::model($selectedItemtype)->can((int) $pair['local_id'], READ)
+                    || !Session::haveAccessToEntity((int) $pair['local_entity'])
+                    || \GlpiPlugin\Assetsync20\AgentTask::outstanding($selectedConnectionId, $pair)) { continue; }
+                try { \GlpiPlugin\Assetsync20\AgentTask::scope($pair); }
+                catch (RuntimeException) { continue; }
                 \GlpiPlugin\Assetsync20\AgentTask::inspect($selectedConnectionId, $pair['id']);
+                $queued = true;
+                break;
             }
+            if (!$queued) { throw new RuntimeException('No readable confirmed pair is available for inspection. Existing outstanding tasks were preserved.'); }
             $message = 'Inspection queued; awaiting B agent.';
         } catch (Throwable $error) { $message = $error->getMessage(); $messageClass = 'warning'; }
     }
@@ -86,7 +95,7 @@ try {
         $savedMappings = FieldMapping::load($selectedConnectionId, $selectedItemtype);
         $message = 'Field mappings saved.';
         $messageClass = 'success';
-    } elseif ($selectedConnection !== null && !$glpiBFieldsLoaded) {
+    } elseif ($selectedConnection !== null && !$glpiBFieldsLoaded && $message === null) {
         throw new RuntimeException('GLPI B fields could not be loaded: ' . ($glpiBFieldsMessage ?? 'Unknown error.'));
     }
 } catch (Throwable $error) {
@@ -95,7 +104,7 @@ try {
 }
 $fields = FieldMapping::fieldsFor($selectedItemtype);
 if ($selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection)) {
-    $sourceOptions = array_intersect_key($sourceOptions, array_flip(['glpi_a', 'glpi_b']));
+    $sourceOptions = array_intersect_key($sourceOptions, array_flip(['glpi_a', 'glpi_b', 'both']));
     $fields = array_values(array_filter($fields, static fn (array $field): bool => in_array($field['key'], ['name', 'comment'], true)
         || ($field['group'] === 'Custom' && in_array($field['type'], ['text', 'yesno', 'date'], true))));
 }
@@ -113,7 +122,9 @@ echo '<link rel="stylesheet" href="' . $html($stylesheet) . '">';
 echo '<div class="assetsync-page assetsync-mapping">';
 echo '<h2>Field Mapping</h2>';
 if ($selectedConnection !== null && GlpiBConnection::isAgent($selectedConnection)) {
+    echo '<p>Both is available for matching native Name or Comments on confirmed existing pairs. Custom Both and creation with Both are unsupported.</p>';
     echo '<form method="post"><input type="hidden" name="connection_id" value="' . $html($selectedConnectionId) . '">'
+        . '<input type="hidden" name="itemtype" value="' . $html($selectedItemtype) . '">'
         . '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">'
         . '<button class="submit" name="refresh_agent" value="1">Refresh B observation</button></form>';
 }

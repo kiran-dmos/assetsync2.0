@@ -438,11 +438,11 @@ scalarCheck(AgentTask::outstanding('b') === null && scalarRow(101)['textfield'] 
 // Render the real mapping page with the same bootstrap substitution as fieldmapping-ui.php.
 scalarControllerSetup('textfield', 'glpi_a', 'old', 'new');
 Search::$options[104] = array_replace(Search::$options[102], ['field' => 'numberfield', 'name' => 'Number', 'pfields_type' => 'number']);
-function scalarMappingPage(): string
+function scalarMappingPage(array $post = []): string
 {
     $_GET = ['connection_id' => 'b', 'itemtype' => 'Computer'];
-    $_POST = [];
-    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $_POST = $post;
+    $_SERVER['REQUEST_METHOD'] = $post === [] ? 'GET' : 'POST';
     $_SERVER['PHP_SELF'] = '/plugins/assetsync20/front/fieldmapping.php';
     $source = file_get_contents(__DIR__ . '/../front/fieldmapping.php');
     $source = str_replace("include GLPI_ROOT . '/inc/includes.php';", '', $source);
@@ -466,6 +466,7 @@ foreach (['glpi_a_field_key', 'glpi_b_field_key'] as $side) {
     scalarCheck(in_array(scalarKey('yesfield'), $keys, true) && in_array(scalarKey('datefield'), $keys, true)
         && !in_array(scalarKey('numberfield'), $keys, true), 'Mapping selector offers Yes/No and Date but not Number: ' . $side);
 }
-scalarCheck(!str_contains($html, '<option value="both"') && Config::$values === $configBefore, 'Agent page keeps one-way authorities and read-only rendering.');
+scalarCheck(str_contains($html, '<option value="both"') && str_contains($html, 'Custom Both and creation with Both are unsupported.')
+    && Config::$values === $configBefore, 'Agent page offers bounded native Both and keeps read-only rendering.');
 
 echo "Agent scalar tests passed ({$checks} checks; host model doubles and SQLite, not live GLPI/InnoDB).\n";

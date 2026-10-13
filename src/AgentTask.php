@@ -498,28 +498,38 @@ final class AgentTask
     {
         global $DB;
         self::model($type);
-        $pair = AgentInbox::one('SELECT * FROM `' . self::PAIRS . '` WHERE `connection_id` = ' . $DB->quote($connection)
-            . ' AND `itemtype` = ' . $DB->quote($type) . ' ORDER BY `observed_at` DESC LIMIT 1');
         $fields = [];
-        if ($pair && (int) $pair['observed_at'] >= time() - 3600
-            && self::model($type)->can((int) $pair['local_id'], READ) && \Session::haveAccessToEntity((int) $pair['local_entity'])) {
-            self::scope($pair, false);
-            $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
+        foreach ($DB->request(['FROM' => self::PAIRS, 'WHERE' => ['connection_id' => $connection, 'itemtype' => $type,
+            'observed_at' => ['>=', time() - 3600]], 'ORDER' => 'observed_at DESC,local_id DESC', 'LIMIT' => 32]) as $pair) {
+            if (!self::model($type)->can((int) $pair['local_id'], READ)
+                || !\Session::haveAccessToEntity((int) $pair['local_entity'])) { continue; }
+            try {
+                self::scope($pair, false);
+                $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
+            } catch (\RuntimeException | \JsonException) { continue; }
             foreach ($snapshot['fields'] ?? [] as $key => $field) {
                 $fields[] = ['key' => $key, 'uid' => $key, 'id' => (string) $field['option'], 'label' => $field['label'],
                     'type' => $field['type'], 'group' => $field['group'], 'supported' => true, 'reason' => ''];
             }
+            if ($fields !== []) { break; }
         }
         return ['success' => $fields !== [], 'fields' => $fields, 'message' => $fields === []
             ? 'No fresh scoped agent metadata. Declare the pair and request inspection on Agent Pair.' : 'Scoped B observation available.'];
     }
 
-    public static function validateMappings(string $type, array $rows): void
+    public static function validateMappings(string $type, array $rows, bool $creation = false): void
     {
         self::model($type);
         if (count($rows) > 32) { throw new \RuntimeException('Agent mode supports at most 32 mappings per type.'); }
         foreach ($rows as $row) {
-            if (!in_array($row['source_of_truth'] ?? '', ['glpi_a', 'glpi_b'], true)) { throw new \RuntimeException('Agent mode requires one-way mapping authority.'); }
+            if (!in_array($row['source_of_truth'] ?? '', ['glpi_a', 'glpi_b', 'both'], true)) { throw new \RuntimeException('Unsupported agent mapping authority.'); }
+            if (($row['source_of_truth'] ?? '') === 'both') {
+                $a = str_starts_with($row['glpi_a_field_key'] ?? '', $type . '.') ? substr($row['glpi_a_field_key'], strlen($type) + 1) : ($row['glpi_a_field_key'] ?? '');
+                $b = str_starts_with($row['glpi_b_field_key'] ?? '', $type . '.') ? substr($row['glpi_b_field_key'], strlen($type) + 1) : ($row['glpi_b_field_key'] ?? '');
+                if ($creation || !in_array($a, ['name', 'comment'], true) || $a !== $b) {
+                    throw new \RuntimeException('Agent Both requires the same native Name or Comments field on an existing confirmed pair; custom fields and creation are unsupported.');
+                }
+            }
             foreach (['glpi_a_field_key', 'glpi_b_field_key'] as $side) {
                 $key = $row[$side] ?? '';
                 if (!in_array($key, ['name', 'comment', $type . '.name', $type . '.comment'], true)
@@ -536,7 +546,7 @@ final class AgentTask
         global $DB;
         $scope = self::scope($pair, $job !== null || $kind === 'apply');
         if (self::outstanding($pair['connection_id'], $pair) && $previous === null) { throw new \RuntimeException('This pair has an outstanding task.'); }
-        if ($job !== null) { $context['source_guard'] = self::creationSourceGuard($job); }
+        if ($job !== null && (!isset($context['modification']) || !isset($context['source_guard']))) { $context['source_guard'] = self::creationSourceGuard($job); }
         $task = ['version' => 3, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
             'installation' => $pair['installation'], 'registration' => $pair['registration'], 'generation' => $scope['registration']['generation'],
             'connection_id' => $pair['connection_id'], 'pair_id' => $pair['id'], 'itemtype' => $pair['itemtype'],
@@ -546,6 +556,13 @@ final class AgentTask
         if (!empty($pair['identity_basis'])) {
             $task['version'] = 4;
             $task['identity'] = json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['b'];
+        }
+        if (isset($context['modification'])) {
+            $task['version'] = 6;
+            $task['identity'] = $kind === 'apply' ? self::identity($context['b_snapshot'])
+                : (!empty($pair['identity_basis']) ? json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['b'] : null);
+            $task['guard'] = $kind === 'apply' ? ['modification' => $context['b_snapshot']['modification'],
+                'native_values' => $context['b_snapshot']['native_values'], 'origin_epoch' => $context['b_origin']] : null;
         }
         $task['hash'] = self::hash($task);
         if (strlen(json_encode(['status' => 200, 'task' => $task], JSON_THROW_ON_ERROR)) > 65536) {
@@ -618,11 +635,22 @@ final class AgentTask
                         if ($task['queue_id'] !== null && !$matching) {
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                             $policyCurrent = $expected['policy'] === self::policy($pair);
+                            if ($body['version'] === 6) {
+                                // Bearer pulls have no interactive Fields profile. Check the captured raw guard,
+                                // then native values/instant/identity; worker metadata and rights are rechecked at finalize.
+                                $native = self::nativeEvidence($pair);
+                                $policyCurrent = $policyCurrent && self::sameEvidence($expected['modification'], $native['modification'])
+                                    && self::sameEvidence($expected['native_values'], $native['native_values']) && self::sameEvidence($expected['identity'], self::identity($native['asset']))
+                                    && self::sameEvidence($expected['source_guard'], self::creationSourceGuard([
+                                        'glpi_b_connection_id' => $pair['connection_id'], 'itemtype' => $pair['itemtype'], 'items_id' => (int) $pair['local_id']]));
+                            }
                             if ($task['state'] === 'accepted' && (int) $task['expires'] < time() + 300) {
                                 if (isset($expected['source_guard'])) {
-                                    $policyCurrent = $policyCurrent && self::creationSourceGuard([
+                                    $freshGuard = self::creationSourceGuard([
                                         'glpi_b_connection_id' => $pair['connection_id'], 'itemtype' => $pair['itemtype'],
-                                        'items_id' => (int) $pair['local_id']]) === $expected['source_guard'];
+                                        'items_id' => (int) $pair['local_id']]);
+                                    $policyCurrent = $policyCurrent && ($body['version'] === 6
+                                        ? self::sameEvidence($freshGuard, $expected['source_guard']) : $freshGuard === $expected['source_guard']);
                                 } else {
                                     $current = self::context($pair);
                                     $policyCurrent = $policyCurrent && $expected['values'] === $current['values']
@@ -633,9 +661,10 @@ final class AgentTask
                     } catch (\Throwable) { $policyCurrent = false; }
                     if (($body['version'] ?? 0) >= 4 && !in_array($body['version'], $request['task_versions'] ?? [], true)) {
                         if ($task['queue_id'] !== null) {
-                            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => $body['version'] === 5
+                            self::write($DB->update(AssetSyncQueue::TABLE, ['last_error' => $body['version'] === 6
+                                ? 'Both waiting: upgrade B to an agent supporting protocol v6 before enabling Both on A.' : ($body['version'] === 5
                                 ? 'Creation waiting: upgrade B to agent 0.5.0 (protocol v5), then upgrade A.'
-                                : 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.'],
+                                : 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.')],
                                 ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
                         }
                     } elseif (!$policyCurrent || ($task['state'] === 'executing' && (int) $task['expires'] < time())) {
@@ -677,7 +706,7 @@ final class AgentTask
                         $candidateContext['recovery_checked_at'] = (int) (microtime(true) * 1_000_000);
                         self::write($DB->update(self::TABLE, ['context' => json_encode($candidateContext, JSON_THROW_ON_ERROR)],
                             ['id' => $candidate['id'], 'slot' => $candidate['slot'], 'state' => 'stale']));
-                        if (($body['kind'] ?? '') !== 'apply' || ($body['version'] ?? 5) >= 5 || $candidate['queue_id'] === null
+                        if (($body['kind'] ?? '') !== 'apply' || !in_array($body['version'] ?? null, [1, 2, 3, 4, 6], true) || $candidate['queue_id'] === null
                             || isset($candidateContext['recovery_proof'])
                             || $body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
                             || $body['installation'] !== $binding['installation']) { continue; }
@@ -700,7 +729,7 @@ final class AgentTask
                     throw new \UnexpectedValueException('Invalid recovery proof.');
                 }
                 $body = json_decode($saved['body'], true, 32, JSON_THROW_ON_ERROR);
-                if ($body['kind'] !== 'apply' || $body['version'] >= 5
+                if ($body['kind'] !== 'apply' || !in_array($body['version'], [1, 2, 3, 4, 6], true)
                     || ($proof['journal'] === 'absent' && ((int) $saved['expires'] >= time() || $proof['observed_at'] <= $body['expires']))
                     || $body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
                     || $body['installation'] !== $binding['installation']) { throw new \UnexpectedValueException('Recovery binding changed.'); }
@@ -829,6 +858,9 @@ final class AgentTask
 
     private static function validateResult(array $task, array $result): void
     {
+        if (!in_array($task['version'] ?? null, [1, 2, 3, 4, 5, 6], true)) {
+            throw new \RuntimeException('Unsupported task result version.');
+        }
         foreach (['snapshot', 'evidence', 'discovery'] as $key) {
             if (isset($result[$key]['observed_at']) && $result[$key]['observed_at'] > time()) {
                 throw new \RuntimeException('Observation is in the future.');
@@ -864,6 +896,7 @@ final class AgentTask
             || ($task['version'] >= 3 && ($snapshot['pair_id'] ?? '') !== $task['pair_id'])
             || !is_string($snapshot['serial'] ?? null) || ($task['version'] < 4 && $snapshot['serial'] === '')
             || ($task['version'] === 4 && self::identity($snapshot) !== $task['identity'])
+            || ($task['version'] === 6 && ($task['identity'] !== null || $task['kind'] !== 'inspect') && self::identity($snapshot) !== $task['identity'])
             || ($task['serial'] !== '' && $snapshot['serial'] !== $task['serial'])
             || !is_int($snapshot['observed_at'] ?? null) || $snapshot['observed_at'] > $task['expires']
             || $snapshot['observed_at'] < $task['expires'] - 300
@@ -879,6 +912,29 @@ final class AgentTask
                 || (!in_array($key, ['name', 'comment'], true) && !preg_match('/^' . preg_quote($type, '/') . '\.PluginFields[A-Za-z0-9]+\.[a-z][a-z0-9_]*$/D', $key))) {
                 throw new \RuntimeException('Invalid scoped metadata.');
             }
+        }
+        if ($task['version'] === 6) {
+            self::identity($snapshot);
+            if (!array_key_exists('origin_epoch', $snapshot) || !is_array($snapshot['modification'] ?? null)
+                || !is_array($snapshot['native_values'] ?? null) || array_keys($snapshot['native_values']) !== ['name', 'comment']) {
+                throw new \RuntimeException('V6 modification evidence missing.');
+            }
+            foreach ([$snapshot['modification']['epoch'] ?? null, $snapshot['origin_epoch']] as $epoch) {
+                if ($epoch !== null && (!is_int($epoch) || $epoch <= 0 || $epoch > time() + 30)) { throw new \RuntimeException('Invalid native epoch.'); }
+            }
+            $mod = $snapshot['modification'];
+            if (array_keys($mod) !== ['epoch', 'untrusted_date_mod', 'history'] || ($mod['untrusted_date_mod'] !== null && !is_string($mod['untrusted_date_mod']))
+                || !is_array($mod['history']) || array_keys($mod['history']) !== ['id', 'epoch', 'field']
+                || !is_int($mod['history']['id']) || $mod['history']['id'] < 0 || !in_array($mod['history']['field'], ['', 'name', 'comment'], true)
+                || ($mod['history']['epoch'] !== null && (!is_int($mod['history']['epoch']) || $mod['history']['epoch'] <= 0 || $mod['history']['epoch'] > time() + 30))) {
+                throw new \RuntimeException('Invalid native History anchor.');
+            }
+            foreach (['name', 'comment'] as $key) {
+                if ($snapshot['native_values'][$key] !== ($snapshot['fields'][$key]['value'] ?? null)) { throw new \RuntimeException('Native atomic read mismatch.'); }
+            }
+            if ($task['kind'] === 'apply' && (($result['mutation']['modification'] ?? null) !== $snapshot['modification']
+                || ($result['mutation']['native_values'] ?? null) !== $snapshot['native_values']
+                || ($result['mutation']['origin_epoch'] ?? null) !== $task['guard']['origin_epoch'])) { throw new \RuntimeException('Post-write provenance missing.'); }
         }
         foreach ($task['changes'] as $key => $change) {
             if (($snapshot['fields'][$key]['value'] ?? null) !== $change['value']
@@ -1002,7 +1058,184 @@ final class AgentTask
     public static function context(array $pair): array
     {
         $scope = self::scope($pair);
-        return self::mappingContext($pair, $scope['asset'], self::policy($pair));
+        $context = self::mappingContext($pair, $scope['asset'], self::policy($pair));
+        if (in_array('both', array_column($context['mappings'], 'source_of_truth'), true)) {
+            if (empty($pair['confirmed'])) { throw new \RuntimeException('Both requires an existing independently confirmed pair.'); }
+            $native = self::nativeEvidence($pair);
+            $context['identity'] = self::identity($native['asset']);
+            $context['modification'] = $native['modification'];
+            $context['native_values'] = $native['native_values'];
+            foreach ($context['values'] as $key => $value) {
+                if (isset($native['native_values'][$key])) { $context['values'][$key] = $native['native_values'][$key]; }
+            }
+            $context['origin_epoch'] = self::localOrigin($pair, $native);
+        }
+        return $context;
+    }
+
+    private static function nativeEvidence(array $pair): array
+    {
+        global $DB;
+        $table = self::model($pair['itemtype'])::getTable();
+        $schema = AgentInbox::one('SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '
+            . $DB->quote($table) . ' AND COLUMN_NAME = \'date_mod\'');
+        $row = AgentInbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch, (SELECT COALESCE(MAX(`id`),0) FROM `glpi_logs` WHERE `itemtype` = '
+            . $DB->quote($pair['itemtype']) . ' AND `items_id` = ' . (int) $pair['local_id'] . ') AS history_id FROM `' . $table . '` WHERE `id` = ' . (int) $pair['local_id']);
+        if (!$row || (int) $row['entities_id'] !== (int) $pair['local_entity'] || !empty($row['is_deleted']) || !empty($row['is_template'])) {
+            throw new \RuntimeException('Native comparison target changed.');
+        }
+        $epoch = strtolower((string) ($schema['DATA_TYPE'] ?? '')) === 'timestamp' && is_numeric($row['epoch'])
+            && (int) $row['epoch'] > 0 && (int) $row['epoch'] <= time() + 30 ? (int) $row['epoch'] : null;
+        $log = AgentInbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch FROM `glpi_logs` WHERE `id` = ' . (int) $row['history_id']);
+        $field = '';
+        $options = \Glpi\Search\SearchOption::getOptionsForItemtype($pair['itemtype']);
+        $dateOptions = array_filter($options, static fn ($option): bool => is_array($option) && ($option['table'] ?? '') === $table && ($option['field'] ?? '') === 'date_mod');
+        if ($log && $epoch !== null && count($dateOptions) === 1 && (int) $log['id_search_option'] === (int) array_key_first($dateOptions)
+            && $log['itemtype_link'] === '' && (int) $log['linked_action'] === 0 && (int) $log['epoch'] === $epoch
+            && self::nativeTimestampLog($log, $epoch)) {
+            // GLPI may append Last update after the real field. Skip only that proven audit row.
+            $previous = AgentInbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch FROM `glpi_logs` WHERE `itemtype` = '
+                . $DB->quote($pair['itemtype']) . ' AND `items_id` = ' . (int) $pair['local_id'] . ' AND `id` < ' . (int) $row['history_id'] . ' ORDER BY `id` DESC LIMIT 1');
+            if ($previous && (int) $previous['epoch'] === $epoch && $previous['user_name'] === $log['user_name']) { $log = $previous; }
+        }
+        foreach (['name', 'comment'] as $key) {
+            $matches = array_filter($options, static fn ($option): bool => is_array($option) && ($option['table'] ?? '') === $table && ($option['field'] ?? '') === $key);
+            if ($log && count($matches) === 1 && (int) $log['id_search_option'] === (int) array_key_first($matches) && $log['itemtype_link'] === ''
+                && (int) $log['linked_action'] === 0 && $log['new_value'] === self::nativeHistoryValue((string) $row[$key])) { $field = $key; }
+        }
+        return ['asset' => $row, 'history_row' => $log, 'native_values' => ['name' => (string) $row['name'], 'comment' => (string) $row['comment']],
+            'modification' => ['epoch' => $epoch, 'untrusted_date_mod' => $epoch === null ? $row['date_mod'] : null, 'history' => ['id' => (int) $row['history_id'],
+                'epoch' => is_numeric($log['epoch'] ?? null) && (int) $log['epoch'] > 0 && (int) $log['epoch'] <= time() + 30 ? (int) $log['epoch'] : null, 'field' => $field]]];
+    }
+
+    private static function nativeHistoryValue(string $value): string
+    {
+        $decoded = json_decode($value);
+        return is_array($decoded) || is_object($decoded) ? '' : mb_substr($value, 0, 255);
+    }
+
+    private static function nativeTimestampLog(array $log, int $epoch): bool
+    {
+        if (!preg_match('/\(([1-9][0-9]*)\)$/', $log['user_name'], $match)
+            || \User::getNameForLog((int) $match[1]) !== $log['user_name']) { return false; }
+        $user = new \User();
+        if (!$user->getFromDB((int) $match[1])) { return false; }
+        $zone = $user->fields['timezone'] ?? (\Config::getConfigurationValues('core')['timezone'] ?? '');
+        if ($zone === '' || $zone === '0') { return false; }
+        try {
+            $date = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $log['new_value'], new \DateTimeZone($zone));
+            return $date !== false && $date->format('Y-m-d H:i:s') === $log['new_value'] && $date->getTimestamp() === $epoch
+                && $log['old_value'] !== $log['new_value'];
+        } catch (\Exception) { return false; }
+    }
+
+    private static function legacyOwnMutation(array $pair, array $native): bool
+    {
+        global $DB;
+        $log = $native['history_row'];
+        if (!$log || self::ownHistoryAuthor($log['user_name'])) { return true; }
+        $rows = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $pair['connection_id'],
+            new \Glpi\DBAL\QueryExpression('`queue_id` IS NOT NULL AND JSON_EXTRACT(`body`, \'$.version\') IN (1,2,3,4,5) AND '
+                . '(JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
+                . ' OR (JSON_EXTRACT(`body`, \'$.version\') IN (1,2) AND JSON_EXTRACT(`body`, \'$.computer_id\') = ' . (int) $pair['computer_id'] . '))')], 'ORDER' => 'created_at DESC,id DESC', 'LIMIT' => 32]);
+        foreach ($rows as $task) {
+            $target = self::taskPair($task);
+            if (!$target || (int) $target['local_id'] !== (int) $pair['local_id'] || $target['itemtype'] !== $pair['itemtype']) { continue; }
+            $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+            // A completed no-op, or an undelivered replaced task, cannot explain an A mutation.
+            if ($task['state'] === 'unchanged' || ($task['state'] === 'accepted' && $task['slot'] === null && $task['result'] === '{}')) { continue; }
+            foreach ($context['mappings'] ?? [] as $mapping) {
+                if ($mapping['source_of_truth'] !== 'glpi_b' || $mapping['glpi_a_field'] !== $native['modification']['history']['field']) { continue; }
+                $before = $context['values'][$mapping['glpi_a_field']] ?? null;
+                $after = $result['snapshot']['fields'][$mapping['glpi_b_field']]['value'] ?? null;
+                if (is_string($before) && is_string($after) && $before !== $after && $after === $native['native_values'][$mapping['glpi_a_field']]
+                    && $log['old_value'] === self::nativeHistoryValue($before) && $log['new_value'] === self::nativeHistoryValue($after)) { return true; }
+            }
+            // An unanchored write in a retained operation's window cannot be called human.
+            $epoch = $native['modification']['epoch'];
+            if ($epoch !== null && $epoch >= (int) $task['created_at'] && $epoch <= (int) $task['expires'] + 300) { return true; }
+        }
+        return false;
+    }
+
+    private static function ownHistoryAuthor(string $author): bool
+    {
+        if ($author === '' || $author === \User::getNameForLog(0) || $author === 'cron_' . AssetSyncCron::TASK_NAME) { return true; }
+        if (\Session::isCron()) {
+            $id = \Session::getLoginUserID(false);
+            return $author === (is_numeric($id) ? \User::getNameForLog((int) $id) : (string) $id);
+        }
+        return false;
+    }
+
+    private static function localOrigin(array $pair, array $native): ?int
+    {
+        global $DB;
+        $anchors = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $pair['connection_id'],
+            new \Glpi\DBAL\QueryExpression('JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
+                . ' AND (JSON_EXTRACT(`context`, \'$.local_mutation\') IS NOT NULL OR JSON_EXTRACT(`context`, \'$.field_conflict\') IS NOT NULL)')], 'ORDER' => 'created_at DESC,id DESC', 'LIMIT' => 32]);
+        $seen = false;
+        $latestHistory = 0;
+        foreach ($anchors as $task) {
+            $stored = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $anchor = $stored['local_mutation'] ?? $stored;
+            $seen = true;
+            $latestHistory = max($latestHistory, $anchor['modification']['history']['id']);
+            if (self::sameEvidence($anchor['modification'], $native['modification']) && self::sameEvidence($anchor['native_values'], $native['native_values'])) { return $anchor['origin_epoch']; }
+            // Older false conflicts did not recognize GLPI's trailing timestamp audit. Re-prove
+            // that exact generation once; do not invent a fresh edit or rewrite its ledger entry.
+            $corrected = $anchor['modification'];
+            $corrected['history']['field'] = $native['modification']['history']['field'];
+            if (isset($stored['field_conflict']) && $anchor['origin_epoch'] === null && $anchor['modification']['history']['field'] === ''
+                && $native['modification']['epoch'] !== null && $native['modification']['history']['epoch'] === $native['modification']['epoch']
+                && $native['modification']['history']['field'] !== '' && self::sameEvidence($corrected, $native['modification'])
+                && self::sameEvidence($anchor['native_values'], $native['native_values'])
+                && !self::ownHistoryAuthor($native['history_row']['user_name']) && !self::legacyOwnMutation($pair, $native)) {
+                return $native['modification']['epoch'];
+            }
+        }
+        $mod = $native['modification'];
+        $author = $native['history_row']['user_name'] ?? '';
+        if ($mod['epoch'] !== null && $mod['history']['epoch'] === $mod['epoch'] && $mod['history']['field'] !== ''
+            && !self::ownHistoryAuthor($author)
+            && ($seen ? $mod['history']['id'] > $latestHistory : !self::legacyOwnMutation($pair, $native))) { return $mod['epoch']; }
+        return null;
+    }
+
+    private static function sameLocalContext(array $expected, array $current): bool
+    {
+        foreach (['policy', 'values', 'metadata', 'identity', 'modification', 'native_values', 'origin_epoch'] as $key) {
+            if (array_key_exists($key, $expected) && !self::sameEvidence($current[$key] ?? null, $expected[$key])) { return false; }
+        }
+        return true;
+    }
+
+    /** JSON objects are unordered; list order and scalar types remain part of the guard. */
+    private static function sameEvidence(mixed $left, mixed $right): bool
+    {
+        if (!is_array($left) || !is_array($right)) { return $left === $right; }
+        if (count($left) !== count($right) || array_is_list($left) !== array_is_list($right)) { return false; }
+        if (array_is_list($left) && array_keys($left) !== array_keys($right)) { return false; }
+        foreach ($left as $key => $value) {
+            if (!array_key_exists($key, $right) || !self::sameEvidence($value, $right[$key])) { return false; }
+        }
+        return true;
+    }
+
+    private static function bothDirection(array $context, array $snapshot, string $key): string
+    {
+        if ($context['values'][$key] === $snapshot['fields'][$key]['value']) { return 'equal'; }
+        $aRaw = $context['modification']['epoch'];
+        $bRaw = $snapshot['modification']['epoch'];
+        $a = $context['origin_epoch'];
+        $b = $snapshot['origin_epoch'];
+        // Unknown provenance supplies an upper bound only; it never wins a difference.
+        if ($aRaw !== null && $bRaw !== null) {
+            if ($a !== null && $a > ($b ?? $bRaw)) { return 'glpi_a'; }
+            if ($b !== null && $b > ($a ?? $aRaw)) { return 'glpi_b'; }
+        }
+        throw new \RuntimeException('blocked_field_conflict: ' . $key . ' differs without a strictly newer reliable native asset instant.');
     }
 
     private static function mappingContext(array $pair, array $asset, string $policy): array
@@ -1386,6 +1619,7 @@ final class AgentTask
     /** Capture every mapped A value, including B-authority values, for new-item initialization only. */
     private static function creationSource(array $job, array $scope): array
     {
+        self::validateMappings($job['itemtype'], FieldMapping::load($job['glpi_b_connection_id'], $job['itemtype']), true);
         foreach ($scope['identity'] as $column => $value) {
             if ($value !== '' && $scope['local_counts'][$column] !== 1) {
                 throw new \RuntimeException('Creation requires unique local identifiers.');
@@ -1578,6 +1812,7 @@ final class AgentTask
         }
         $task = $pair ? self::outstanding($job['glpi_b_connection_id'], $pair) : null;
         $recovering = false;
+        $fieldConflict = false;
         try {
             if ($task && $task['state'] === 'finalizing') {
                 self::write($DB->update(self::TABLE, ['state' => 'uncertain'], ['id' => $task['id'], 'state' => 'finalizing']));
@@ -1597,7 +1832,7 @@ final class AgentTask
             if ($task['state'] === 'stale' && $recovery !== null) {
                 $recovering = true;
                 $oldBody = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-                if ($oldBody['kind'] !== 'apply' || $oldBody['version'] >= 5) { throw new \RuntimeException('Recovery kind changed.'); }
+                if ($oldBody['kind'] !== 'apply' || !in_array($oldBody['version'], [1, 2, 3, 4, 6], true)) { throw new \RuntimeException('Recovery kind changed.'); }
                 self::publish($pair, 'inspect', [], $job, $context, $task['id']);
                 return;
             }
@@ -1609,13 +1844,24 @@ final class AgentTask
             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
             $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
             $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            if ($task['state'] === 'blocked' && $body['version'] === 6 && $body['kind'] === 'inspect'
+                && isset($expected['field_conflict']) && ($result['changed'] ?? null) === []
+                && ((int) ($job['agent_snapshot'] ?? 0) > (int) ($captured['agent_snapshot'] ?? 0)
+                    || !self::sameLocalContext($expected, $context))) {
+                self::publish($pair, 'inspect', [], $job, $context, $task['id']);
+                return;
+            }
+            if ($task['state'] === 'blocked' && $body['version'] === 6 && $body['kind'] === 'inspect'
+                && isset($expected['field_conflict']) && ($result['changed'] ?? null) === []) {
+                self::write(AssetSyncQueue::block($job, $expected['field_conflict']));
+                return;
+            }
             if (!in_array($task['state'], ['verified', 'unchanged'], true)
                 || !in_array($result['outcome'], ['verified', 'unchanged'], true)) {
                 self::write(AssetSyncQueue::waitForAgent($job));
                 return;
             }
-            if (!self::timelyResult($task) || $expected['policy'] !== $context['policy'] || $expected['values'] !== $context['values']
-                || $expected['metadata'] !== $context['metadata']
+            if (!self::timelyResult($task) || !self::sameLocalContext($expected, $context)
                 || $body['serial'] !== $pair['serial'] || $body['generation'] !== self::scope($pair)['registration']['generation']) {
                 self::write($DB->update(self::TABLE, ['state' => 'stale'], ['id' => $task['id']]));
                 self::write(AssetSyncQueue::waitForAgent($job));
@@ -1624,31 +1870,45 @@ final class AgentTask
             // Only the original captured notification generation may be completed by this chain.
             $job['agent_snapshot'] = (int) ($captured['agent_snapshot'] ?? 0);
             $context['recheck'] = !empty($expected['recheck']) || !empty($job['previous_needs_recheck']);
+            if ($body['version'] === 6) { $context['source_guard'] = $expected['source_guard']; }
             if ($body['kind'] === 'inspect') {
                 $changes = [];
                 $needsBWrite = false;
+                if ($body['version'] === 6) {
+                    $context['b_snapshot'] = $result['snapshot'];
+                    $context['directions'] = [];
+                    $context['b_origin'] = $result['snapshot']['origin_epoch'];
+                    foreach ($context['mappings'] as $mapping) {
+                        $key = $mapping['glpi_a_field'];
+                        $direction = $mapping['source_of_truth'] === 'both' ? self::bothDirection($context, $result['snapshot'], $key) : $mapping['source_of_truth'];
+                        $context['directions'][$key] = $direction;
+                        if ($mapping['source_of_truth'] === 'both' && $direction === 'glpi_a') { $context['b_origin'] = $context['origin_epoch']; }
+                    }
+                }
                 foreach ($context['mappings'] as $mapping) {
                     $key = $mapping['glpi_b_field'];
                     $field = $result['snapshot']['fields'][$key] ?? null;
                     $type = $context['types'][$mapping['glpi_a_field']];
                     if (!$field || $field['type'] !== $type) { throw new \RuntimeException('Mapped B field type or existing row is unavailable.'); }
-                    $value = $mapping['source_of_truth'] === 'glpi_a' ? $context['values'][$mapping['glpi_a_field']] : $field['value'];
+                    $direction = $context['directions'][$mapping['glpi_a_field']] ?? $mapping['source_of_truth'];
+                    $value = $direction === 'glpi_a' ? $context['values'][$mapping['glpi_a_field']] : $field['value'];
                     $changes[$key] = ['type' => $type, 'metadata' => $field['metadata'], 'expected' => $field['value'],
                         'value' => self::normalizeValue($type, $value, true)];
                     $needsBWrite = $needsBWrite || $changes[$key]['value'] !== $field['value'];
                 }
-                if ($needsBWrite) {
+                if ($needsBWrite || $body['version'] === 6) {
                     self::publish($pair, 'apply', $changes, $job, $context, $task['id']);
                     return;
                 }
             }
+            if ($body['version'] === 6) { $context = array_replace($context, array_intersect_key($expected, array_flip(['directions', 'b_snapshot', 'b_origin']))); }
             if (!AssetSyncQueue::owns($job)) { return; }
             // This durable marker prevents replay after process death during any A-side model/billing write.
             self::write($DB->update(self::TABLE, ['state' => 'finalizing'], ['id' => $task['id'], 'state' => $task['state']]));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Task already finalized.'); }
             $localChanges = [];
             foreach ($context['mappings'] as $mapping) {
-                if ($mapping['source_of_truth'] === 'glpi_b') {
+                if (($context['directions'][$mapping['glpi_a_field']] ?? $mapping['source_of_truth']) === 'glpi_b') {
                     $value = $result['snapshot']['fields'][$mapping['glpi_b_field']]['value'];
                     if ($context['values'][$mapping['glpi_a_field']] !== $value) { $localChanges[$mapping['glpi_a_field']] = $value; }
                 }
@@ -1657,7 +1917,7 @@ final class AgentTask
             try {
                 self::lockLocalRows($pair, array_keys($context['values']));
                 $current = self::context($pair);
-                if ($current['policy'] !== $context['policy'] || $current['values'] !== $context['values'] || $current['metadata'] !== $context['metadata']) {
+                if (!self::sameLocalContext($context, $current)) {
                     throw new \RuntimeException('Local expected values changed.');
                 }
                 foreach ($localChanges as $key => $value) {
@@ -1680,14 +1940,35 @@ final class AgentTask
                     }
                 }
                 $billingChanged = $applyLocal($localChanges, $context['mappings']) === true;
+                if ($body['version'] === 6) {
+                    $after = self::nativeEvidence($pair);
+                    if (self::identity($after['asset']) !== $context['identity']) { throw new \RuntimeException('Local identity changed during finalization.'); }
+                    foreach ($localChanges as $key => $value) {
+                        if (isset($after['native_values'][$key]) && $after['native_values'][$key] !== $value) { throw new \RuntimeException('Local native readback failed.'); }
+                    }
+                    $origin = $context['origin_epoch'];
+                    foreach ($context['mappings'] as $mapping) {
+                        if ($mapping['source_of_truth'] === 'both' && ($context['directions'][$mapping['glpi_a_field']] ?? '') === 'glpi_b') {
+                            $origin = $context['b_snapshot']['origin_epoch'];
+                        }
+                    }
+                    $expected['local_mutation'] = ['modification' => $after['modification'], 'native_values' => $after['native_values'], 'origin_epoch' => $origin];
+                    self::write($DB->update(self::TABLE, ['context' => json_encode($expected, JSON_THROW_ON_ERROR)], ['id' => $task['id'], 'state' => 'finalizing']));
+                }
                 AgentInbox::sql('COMMIT');
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
             $outcome = $billingChanged || $localChanges !== [] || $result['changed'] !== [] ? 'verified' : 'unchanged';
             self::finish($task, $job, $outcome, $context['recheck'] || $billingChanged, self::localFingerprint(self::context($pair)));
-        } catch (\Throwable) {
+        } catch (\Throwable $error) {
             if ($task) {
                 $current = self::outstanding($job['glpi_b_connection_id'], $pair);
                 if ($current && $current['id'] === $task['id']) {
+                    if (str_starts_with($error->getMessage(), 'blocked_field_conflict:') && ($body['version'] ?? 0) === 6
+                        && ($body['kind'] ?? '') === 'inspect' && ($result['changed'] ?? null) === []) {
+                        $expected['field_conflict'] = $error->getMessage();
+                        self::write($DB->update(self::TABLE, ['context' => json_encode($expected, JSON_THROW_ON_ERROR)], ['id' => $task['id']]));
+                        $fieldConflict = true;
+                    }
                     $state = $recovering && $current['state'] === 'stale' ? 'stale' : (in_array($current['state'], ['uncertain', 'partial'], true) ? $current['state']
                         : ($current['state'] === 'finalizing' ? 'uncertain' : 'blocked'));
                     self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $task['id']]));
@@ -1695,7 +1976,12 @@ final class AgentTask
             }
             // A failed task remains outstanding for inspection. Never silently republish an uncertain write.
             if (AssetSyncQueue::owns($job)) {
-                if ($recovering) { self::write(AssetSyncQueue::retry($job, 'Fresh inspection publication failed; recovery evidence retained.')); }
+                if ($fieldConflict) {
+                    self::write(AssetSyncLink::saveStatus($pair['itemtype'], (int) $pair['local_id'], $pair['connection_id'],
+                        $pair['route_id'], AssetSyncLink::STATUS_BLOCKED_FIELD_CONFLICT, $expected['field_conflict']));
+                    self::write(AssetSyncQueue::block($job, $expected['field_conflict']));
+                }
+                elseif ($recovering) { self::write(AssetSyncQueue::retry($job, 'Fresh inspection publication failed; recovery evidence retained.')); }
                 elseif ($task) { self::write(AssetSyncQueue::waitForAgent($job)); }
                 else { AssetSyncQueue::retry($job, 'Blocked before task publication: agent scope or mapping is unsupported; inspect Agent Pair configuration.'); }
             }
@@ -1805,14 +2091,14 @@ final class AgentTask
     {
         global $DB;
         if (!$DB || !method_exists($DB, 'tableExists') || !$DB->tableExists(self::TABLE) || hrtime(true) >= $deadline) { return; }
-        $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+        $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
             'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]);
         foreach ($tasks as $task) {
             if (hrtime(true) >= $deadline) { break; }
             // Atomic JSON update preserves any separately recorded apply proof while skipped rows rotate.
             AgentInbox::sql('UPDATE `' . self::TABLE . '` SET `context` = JSON_SET(`context`, \'$.inspection_checked_at\', '
                 . (int) (microtime(true) * 1_000_000) . ') WHERE `id` = ' . $DB->quote($task['id'])
-                . ' AND `slot` = ' . $DB->quote($task['slot']) . " AND `state` = 'stale'");
+                . ' AND `slot` = ' . $DB->quote($task['slot']) . ' AND `state` = ' . $DB->quote($task['state']));
             $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
             if (($body['kind'] ?? '') !== 'inspect' || $task['queue_id'] === null) { continue; }
             $pair = self::taskPair($task);
@@ -1822,7 +2108,18 @@ final class AgentTask
                     if (hrtime(true) >= $deadline) { return; }
                     self::scope($pair);
                     $current = self::outstanding($pair['connection_id'], $pair);
-                    if ($current && $current['id'] === $task['id'] && $current['state'] === 'stale') {
+                    if ($current && $current['id'] === $task['id'] && $current['state'] === 'blocked') {
+                        $body = json_decode($current['body'], true, 32, JSON_THROW_ON_ERROR);
+                        $expected = json_decode($current['context'], true, 32, JSON_THROW_ON_ERROR);
+                        $result = json_decode($current['result'], true, 32, JSON_THROW_ON_ERROR);
+                        $captured = json_decode($current['job'], true, 32, JSON_THROW_ON_ERROR);
+                        $queue = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `id` = ' . (int) $current['queue_id']);
+                        if ($body['version'] !== 6 || $body['kind'] !== 'inspect' || !isset($expected['field_conflict'])
+                            || ($result['changed'] ?? null) !== [] || !$queue
+                            || ((int) $queue['agent_requested'] <= (int) ($captured['agent_snapshot'] ?? 0)
+                                && self::sameLocalContext($expected, self::context($pair)))) { return; }
+                        self::retryStale($pair['connection_id'], $pair['id']);
+                    } elseif ($current && $current['id'] === $task['id'] && $current['state'] === 'stale') {
                         self::retryStale($pair['connection_id'], $pair['id']);
                     }
                 });
@@ -1847,7 +2144,7 @@ final class AgentTask
             }
             self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id'], 'slot' => $task['slot'], 'state' => $task['state']]));
             if ($DB->affectedRows() !== 1) { throw new \RuntimeException('Retry task ownership changed.'); }
-            if ($task['queue_id'] !== null) { self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent'])); }
+            if ($task['queue_id'] !== null) { self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => ['waiting_agent', 'blocked']])); }
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
     }

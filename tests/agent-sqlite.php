@@ -24,6 +24,8 @@ final class AgentSqlite
         $this->pdo->sqliteCreateFunction('IF', static fn ($c, $a, $b) => $c ? $a : $b, 3);
         $this->pdo->sqliteCreateFunction('MD5', md5(...), 1);
         $this->pdo->sqliteCreateFunction('CONCAT', static fn (...$values) => implode('', $values));
+        // SQLite JSON_EXTRACT already unquotes strings; MariaDB requires JSON_UNQUOTE.
+        $this->pdo->sqliteCreateFunction('JSON_UNQUOTE', static fn ($value) => $value);
     }
 
     public function doQuery(string $sql): PDOStatement|bool

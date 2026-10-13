@@ -39,7 +39,8 @@ final class TaskJournal
                 throw new \RuntimeException('Task ID/hash collision.');
             }
             if ($existing['result'] !== '{}') { return json_decode($existing['result'], true, 32, JSON_THROW_ON_ERROR); }
-            $readOnlyMatch = $task['version'] === 4 && in_array($task['kind'], ['match', 'reverify'], true);
+            $readOnlyMatch = ($task['version'] === 4 && in_array($task['kind'], ['match', 'reverify'], true))
+                || ($task['version'] === 6 && $task['kind'] === 'inspect');
             $result = ['outcome' => $readOnlyMatch ? 'stale' : 'uncertain', 'changed' => []];
         } else {
             TaskExecutor::validate($task, $settings);
@@ -52,13 +53,13 @@ final class TaskJournal
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
             $result = TaskExecutor::execute($task, $settings);
         }
-        if ($task['version'] === 5 && $task['kind'] === 'create') {
-            // Creation writes its successful result in the same transaction as the model add.
+        if (($task['version'] === 5 && $task['kind'] === 'create') || ($task['version'] === 6 && $task['kind'] === 'apply')) {
+            // Creation and v6 apply write their result in the same transaction as their models.
             // A failed/ambiguous COMMIT must not report inferred success from an in-memory result.
             $saved = Outbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($id));
-            if (!$saved) { throw new \RuntimeException('Creation journal disappeared.'); }
+            if (!$saved) { throw new \RuntimeException($task['version'] === 5 ? 'Creation journal disappeared.' : 'V6 journal disappeared.'); }
             if ($saved['result'] !== '{}') { return json_decode($saved['result'], true, 32, JSON_THROW_ON_ERROR); }
-            if ($result['outcome'] === 'verified') { $result = ['outcome' => 'uncertain', 'changed' => []]; }
+            if ($result['outcome'] === 'verified' || ($task['version'] === 6 && $result['outcome'] === 'unchanged')) { $result = ['outcome' => 'uncertain', 'changed' => []]; }
         }
         Outbox::sql('START TRANSACTION');
         try {
@@ -134,7 +135,7 @@ final class TaskJournal
     {
         global $DB;
         TaskExecutor::validate($task, $settings, false);
-        if ($task['kind'] !== 'apply' || $task['version'] >= 5) { return null; }
+        if ($task['kind'] !== 'apply' || !in_array($task['version'], [1, 2, 3, 4, 6], true)) { return null; }
         $lock = 'assetsync20agent:' . substr(hash('sha256', (string) ($DB->dbdefault ?? 'glpi')), 0, 32);
         if ((int) (Outbox::one('SELECT IS_USED_LOCK(' . $DB->quote($lock) . ') = CONNECTION_ID() AS owned')['owned'] ?? 0) !== 1) {
             return null;
@@ -181,11 +182,11 @@ final class TaskJournal
         return $DB->update(self::TABLE, ['acknowledged' => 1], ['id' => $task['id'], 'hash' => $task['hash']]);
     }
 
-    public static function send(array $settings, array $payload, int $deadline): array
+    public static function send(array $settings, array $payload, int $deadline, bool $legacyPull = false): array
     {
         if (!Settings::validEndpoint($settings['endpoint'] ?? '') || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
         if (($payload['kind'] ?? '') === 'pull') {
-            $payload['task_versions'] = [1, 2, 3, 4, 5];
+            $payload['task_versions'] = $legacyPull ? [1, 2, 3, 4, 5] : [1, 2, 3, 4, 5, 6];
             $payload['recovery_version'] = 1;
         }
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $payload[$key] = $settings[$key]; }
@@ -208,7 +209,12 @@ final class TaskJournal
                 }]);
             $ok = curl_exec($curl);
             $decoded = json_decode($body, true, 32);
-            return ['status' => $ok === false ? 0 : (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE), 'body' => is_array($decoded) ? $decoded : []];
+            $response = ['status' => $ok === false ? 0 : (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE), 'body' => is_array($decoded) ? $decoded : []];
         } finally { curl_close($curl); }
+        // Older A rejects the additive capability list before handling a pull. Retry only that read.
+        if (!$legacyPull && ($payload['kind'] ?? '') === 'pull' && $response['status'] === 400) {
+            return self::send($settings, $payload, $deadline, true);
+        }
+        return $response;
     }
 }

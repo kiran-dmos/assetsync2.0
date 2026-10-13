@@ -16,18 +16,19 @@ final class TaskExecutor
         $hash = $task['hash'] ?? '';
         unset($task['hash']);
         $keys = ['version', 'id', 'kind', 'installation', 'registration', 'generation', 'connection_id', 'computer_id', 'entity_id', 'serial', 'policy', 'expires', 'changes'];
-        if (in_array($task['version'] ?? null, [3, 4, 5], true)) {
+        if (in_array($task['version'] ?? null, [3, 4, 5, 6], true)) {
             $keys = array_values(array_diff($keys, ['computer_id']));
             $keys = array_merge($keys, ['pair_id', 'itemtype', 'items_id']);
             if (($task['kind'] ?? '') === 'discover') { $keys[] = 'filter'; }
         }
-        if (in_array($task['version'] ?? null, [4, 5], true)) { $keys[] = 'identity'; }
+        if (in_array($task['version'] ?? null, [4, 5, 6], true)) { $keys[] = 'identity'; }
+        if (($task['version'] ?? null) === 6) { $keys[] = 'guard'; }
         if (($task['version'] ?? null) === 5) { $keys = array_merge($keys, ['seed', 'prerequisites']); }
         if (array_diff(array_keys($task), $keys) !== [] || array_diff($keys, array_keys($task)) !== []) {
             throw new \RuntimeException('Unknown task schema.');
         }
         if (!is_string($hash) || !hash_equals(self::hash($task), $hash)
-            || !in_array($task['version'] ?? null, [1, 2, 3, 4, 5], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
+            || !in_array($task['version'] ?? null, [1, 2, 3, 4, 5, 6], true) || !preg_match('/^[a-f0-9]{32}$/D', $task['id'] ?? '')
             || !in_array($task['kind'] ?? '', $task['version'] === 5 ? ['prepare_create', 'create', 'confirm_create']
                 : ($task['version'] === 4 ? ['inspect', 'apply', 'match', 'reverify']
                 : ($task['version'] === 3 ? ['inspect', 'apply', 'discover'] : ['inspect', 'apply'])), true)
@@ -45,8 +46,31 @@ final class TaskExecutor
             || ($task['kind'] !== 'apply' && $task['changes'] !== [])) {
             throw new \RuntimeException('Task target mismatch.');
         }
-        if ($task['version'] >= 4 && (!is_array($task['identity']) || self::identity($task['identity']) !== $task['identity'])) {
+        if ($task['version'] >= 4 && !($task['version'] === 6 && $task['kind'] === 'inspect' && $task['identity'] === null)
+            && (!is_array($task['identity']) || self::identity($task['identity']) !== $task['identity'])) {
             throw new \RuntimeException('Invalid v4 identity guard.');
+        }
+        if ($task['version'] === 6) {
+            if (!in_array($task['kind'], ['inspect', 'apply'], true) || ($task['kind'] === 'inspect' ? $task['guard'] !== null
+                : (!is_array($task['guard']) || array_keys($task['guard']) !== ['modification', 'native_values', 'origin_epoch']
+                    || !is_array($task['guard']['modification']) || !is_array($task['guard']['native_values'])
+                    || array_keys($task['guard']['native_values']) !== ['name', 'comment']
+                    || ($task['guard']['origin_epoch'] !== null && (!is_int($task['guard']['origin_epoch']) || $task['guard']['origin_epoch'] <= 0))))) {
+                throw new \RuntimeException('Invalid v6 guard.');
+            }
+            if ($task['kind'] === 'apply') {
+                $mod = $task['guard']['modification'];
+                if (array_keys($mod) !== ['epoch', 'untrusted_date_mod', 'history'] || ($mod['untrusted_date_mod'] !== null && !is_string($mod['untrusted_date_mod']))
+                    || !is_array($mod['history'])
+                    || array_keys($mod['history']) !== ['id', 'epoch', 'field'] || !is_int($mod['history']['id']) || $mod['history']['id'] < 0
+                    || !in_array($mod['history']['field'], ['', 'name', 'comment'], true)) { throw new \RuntimeException('Invalid native History guard.'); }
+                foreach ([$mod['epoch'], $mod['history']['epoch'], $task['guard']['origin_epoch']] as $epoch) {
+                    if ($epoch !== null && (!is_int($epoch) || $epoch <= 0 || $epoch > time() + 30)) { throw new \RuntimeException('Invalid native instant guard.'); }
+                }
+                foreach ($task['guard']['native_values'] as $value) {
+                    if (!is_string($value) || strlen($value) > 16384) { throw new \RuntimeException('Invalid native value guard.'); }
+                }
+            }
         }
         if ($task['version'] >= 3) {
             TargetScope::model($task['itemtype']);
@@ -126,6 +150,8 @@ final class TaskExecutor
         \Glpi\Search\SearchOption::clearSearchOptionCache($type);
         $computer = ServiceContext::computer($settings);
         $id = (int) ($settings['items_id'] ?? $settings['computer_id']);
+        $native = $version === 6 ? self::nativeEvidence($settings) : null;
+        if ($native !== null) { $computer->fields = $native['asset']; }
         $options = \Glpi\Search\SearchOption::getOptionsForItemtype($type);
         $fields = [];
         foreach (['name', 'comment'] as $column) {
@@ -141,7 +167,7 @@ final class TaskExecutor
         }
         if (\Plugin::isPluginActive('fields')) {
             foreach (Snapshot::containers($type) as $container) {
-                if ($version === 4 && (int) $container['entities_id'] === (int) $settings['entity_id'] && !$container['is_recursive']
+                if (in_array($version, [4, 6], true) && (int) $container['entities_id'] === (int) $settings['entity_id'] && !$container['is_recursive']
                     && \PluginFieldsProfile::getRightOnContainer((int) $settings['service_profile'], (int) $container['id']) <= READ) {
                     throw new \RuntimeException('V4 scoped Fields permission unavailable.');
                 }
@@ -202,7 +228,12 @@ final class TaskExecutor
             $snapshot['pair_id'] = $settings['pair_id'];
             $snapshot['name'] = (string) $computer->fields['name'];
         }
-        if ($version === 4) { $snapshot = array_replace($snapshot, self::identity($computer->fields)); }
+        if (in_array($version, [4, 6], true)) { $snapshot = array_replace($snapshot, self::identity($computer->fields)); }
+        if ($version === 6) {
+            $snapshot['modification'] = $native['modification'];
+            $snapshot['native_values'] = $native['native_values'];
+            $snapshot['origin_epoch'] = self::nativeOrigin($settings, $native);
+        }
         if (strlen(json_encode($snapshot, JSON_THROW_ON_ERROR)) > 49152) {
             throw new \RuntimeException('Scoped snapshot exceeds the transport budget.');
         }
@@ -226,6 +257,7 @@ final class TaskExecutor
             self::configuration($settings, $task['version'] < 3);
             return ServiceContext::run($settings, static function () use ($task, $settings, &$changed, &$attempted): array {
                 if ($task['version'] === 5) { return Creation::execute($task, $settings); }
+                if ($task['version'] === 6) { return self::executeBoth($task, $settings); }
                 if ($task['kind'] === 'discover') {
                     return ['outcome' => 'unchanged', 'changed' => [], 'discovery' => self::discover($task, $settings)];
                 }
@@ -337,6 +369,185 @@ final class TaskExecutor
             });
         } catch (\Throwable) {
             return ['outcome' => $attempted ? 'uncertain' : ($changed !== [] ? 'partial' : 'blocked'), 'changed' => $changed];
+        }
+    }
+
+    private static function nativeEvidence(array $settings): array
+    {
+        global $DB;
+        $type = $settings['itemtype'];
+        $id = (int) $settings['items_id'];
+        $table = TargetScope::model($type)::getTable();
+        $schema = Outbox::one('SELECT DATA_TYPE FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '
+            . $DB->quote($table) . ' AND COLUMN_NAME = \'date_mod\'');
+        $row = Outbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch, (SELECT COALESCE(MAX(`id`),0) FROM `glpi_logs` WHERE `itemtype` = '
+            . $DB->quote($type) . ' AND `items_id` = ' . $id . ') AS history_id FROM `' . $table . '` WHERE `id` = ' . $id);
+        if (!$row || (int) $row['entities_id'] !== (int) $settings['entity_id'] || !empty($row['is_deleted']) || !empty($row['is_template'])) {
+            throw new \RuntimeException('Native comparison target changed.');
+        }
+        $epoch = strtolower((string) ($schema['DATA_TYPE'] ?? '')) === 'timestamp' && is_numeric($row['epoch'])
+            && (int) $row['epoch'] > 0 && (int) $row['epoch'] <= time() + 30 ? (int) $row['epoch'] : null;
+        $log = Outbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch FROM `glpi_logs` WHERE `id` = ' . (int) $row['history_id']);
+        $field = '';
+        $options = \Glpi\Search\SearchOption::getOptionsForItemtype($type);
+        $dateOptions = array_filter($options, static fn ($option): bool => is_array($option) && ($option['table'] ?? '') === $table && ($option['field'] ?? '') === 'date_mod');
+        if ($log && $epoch !== null && count($dateOptions) === 1 && (int) $log['id_search_option'] === (int) array_key_first($dateOptions)
+            && $log['itemtype_link'] === '' && (int) $log['linked_action'] === 0 && (int) $log['epoch'] === $epoch
+            && self::nativeTimestampLog($log, $epoch)) {
+            // GLPI may append Last update after the real field. Keep the newest ID as the guard.
+            $previous = Outbox::one('SELECT *, UNIX_TIMESTAMP(`date_mod`) AS epoch FROM `glpi_logs` WHERE `itemtype` = '
+                . $DB->quote($type) . ' AND `items_id` = ' . $id . ' AND `id` < ' . (int) $row['history_id'] . ' ORDER BY `id` DESC LIMIT 1');
+            if ($previous && (int) $previous['epoch'] === $epoch && $previous['user_name'] === $log['user_name']) { $log = $previous; }
+        }
+        foreach ($options as $optionId => $option) {
+            $key = $option['field'] ?? '';
+            if (is_array($option) && ($option['table'] ?? '') === $table && in_array($key, ['name', 'comment'], true)
+                && $log && (int) $log['id_search_option'] === (int) $optionId && $log['itemtype_link'] === ''
+                && (int) $log['linked_action'] === 0 && $log['new_value'] === self::historyValue((string) $row[$key], 'text')) { $field = $key; }
+        }
+        return ['asset' => $row, 'history_row' => $log, 'native_values' => ['name' => (string) $row['name'], 'comment' => (string) $row['comment']],
+            'modification' => ['epoch' => $epoch, 'untrusted_date_mod' => $epoch === null ? $row['date_mod'] : null, 'history' => ['id' => (int) $row['history_id'],
+                'epoch' => is_numeric($log['epoch'] ?? null) && (int) $log['epoch'] > 0 && (int) $log['epoch'] <= time() + 30 ? (int) $log['epoch'] : null, 'field' => $field]]];
+    }
+
+    private static function nativeTimestampLog(array $log, int $epoch): bool
+    {
+        if (!preg_match('/\(([1-9][0-9]*)\)$/', $log['user_name'], $match)
+            || \User::getNameForLog((int) $match[1]) !== $log['user_name']) { return false; }
+        $user = new \User();
+        if (!$user->getFromDB((int) $match[1])) { return false; }
+        $zone = $user->fields['timezone'] ?? (\Config::getConfigurationValues('core')['timezone'] ?? '');
+        if ($zone === '' || $zone === '0') { return false; }
+        try {
+            $date = \DateTimeImmutable::createFromFormat('!Y-m-d H:i:s', $log['new_value'], new \DateTimeZone($zone));
+            return $date !== false && $date->format('Y-m-d H:i:s') === $log['new_value'] && $date->getTimestamp() === $epoch
+                && $log['old_value'] !== $log['new_value'];
+        } catch (\Exception) { return false; }
+    }
+
+    private static function nativeOrigin(array $settings, array $native): ?int
+    {
+        global $DB;
+        $latestOwn = 0;
+        $possibleOwn = false;
+        $rows = $DB->request(['FROM' => TaskJournal::TABLE, 'WHERE' => ['installation' => $settings['installation'],
+            'connection_id' => $settings['connection_id'], new \Glpi\DBAL\QueryExpression('(JSON_EXTRACT(`body`, \'$.items_id\') = ' . (int) $settings['items_id']
+                . ' OR JSON_EXTRACT(`body`, \'$.computer_id\') = ' . (int) $settings['items_id'] . ') AND '
+                . '(JSON_EXTRACT(`result`, \'$.mutation\') IS NOT NULL OR JSON_EXTRACT(`result`, \'$.changed\') <> \'[]\''
+                . ' OR `state` IN (\'executing\',\'partial\',\'uncertain\'))')], 'ORDER' => 'created_at DESC,id DESC', 'LIMIT' => 32]);
+        foreach ($rows as $row) {
+            $body = json_decode($row['body'], true, 32, JSON_THROW_ON_ERROR);
+            if (($body['itemtype'] ?? 'Computer') !== $settings['itemtype']) { continue; }
+            $result = json_decode($row['result'], true, 32, JSON_THROW_ON_ERROR);
+            $anchor = $result['mutation'] ?? null;
+            if ($anchor && $anchor['modification'] === $native['modification'] && $anchor['native_values'] === $native['native_values']) { return $anchor['origin_epoch']; }
+            foreach ($result['changed'] ?? [] as $historyId) { $latestOwn = max($latestOwn, $historyId); }
+            if ($anchor) { $latestOwn = max($latestOwn, $anchor['modification']['history']['id']); }
+            $key = $native['modification']['history']['field'];
+            $change = $body['changes'][$key] ?? null;
+            $log = $native['history_row'];
+            if (!$anchor && !isset($result['changed'][$key]) && $change && $log
+                && $change['value'] === $native['native_values'][$key]
+                && $log['old_value'] === self::historyValue($change['expected'], $change['type'] ?? 'text')
+                && $log['new_value'] === self::historyValue($change['value'], $change['type'] ?? 'text')) { $possibleOwn = true; }
+        }
+        $mod = $native['modification'];
+        $author = $native['history_row']['user_name'] ?? '';
+        return $mod['epoch'] !== null && $mod['history']['epoch'] === $mod['epoch'] && $mod['history']['field'] !== ''
+            && !$possibleOwn && $author !== ''
+            && ($author !== \User::getNameForLog((int) $settings['service_user']) || $latestOwn > 0)
+            && $mod['history']['id'] > $latestOwn ? $mod['epoch'] : null;
+    }
+
+    /** V6 validates the entire batch and its timestamp assertion under one parent/child lock. */
+    private static function executeBoth(array $task, array $settings): array
+    {
+        global $DB;
+        $before = self::snapshot($settings, 6);
+        if (($task['serial'] !== '' && $before['serial'] !== $task['serial'])
+            || ($task['identity'] !== null && self::identity($before) !== $task['identity'])) { return ['outcome' => 'stale', 'changed' => []]; }
+        if ($task['kind'] === 'inspect') { return ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $before]; }
+        $journal = Outbox::one('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']));
+        if (!$journal || $journal['hash'] !== $task['hash'] || $journal['state'] !== 'executing' || $journal['result'] !== '{}') {
+            throw new \RuntimeException('V6 requires its durable executing journal.');
+        }
+        $attempted = false;
+        Outbox::sql('START TRANSACTION');
+        try {
+            self::lockRows($settings);
+            $before = self::snapshot($settings, 6);
+            if ($before['modification'] !== $task['guard']['modification'] || $before['native_values'] !== $task['guard']['native_values']
+                || self::identity($before) !== $task['identity']) {
+                Outbox::sql('ROLLBACK');
+                return ['outcome' => 'stale', 'changed' => []];
+            }
+            foreach ($task['changes'] as $key => $change) {
+                $field = $before['fields'][$key] ?? null;
+                if (!$field || $field['metadata'] !== $change['metadata'] || $field['type'] !== $change['type'] || $field['value'] !== $change['expected']) {
+                    Outbox::sql('ROLLBACK');
+                    return ['outcome' => 'stale', 'changed' => []];
+                }
+                if ($field['type'] === 'date' && $change['value'] === '' && $field['value'] !== $change['value']) {
+                    $definition = new \PluginFieldsField();
+                    if (!$definition->getFromDB($field['field'])) { throw new \RuntimeException('Fields metadata disappeared.'); }
+                    $computer = ServiceContext::computer($settings);
+                    $mandatory = !empty($definition->fields['mandatory']);
+                    $statusField = \PluginFieldsStatusOverride::getStatusFieldName($settings['itemtype']);
+                    foreach (\PluginFieldsStatusOverride::getOverridesForItemtypeAndStatus($field['container'], $settings['itemtype'],
+                        (int) $computer->fields[$statusField]) as $override) {
+                        if ((int) $override['plugin_fields_fields_id'] === $field['field']) { $mandatory = $mandatory || !empty($override['mandatory']); }
+                    }
+                    if ($mandatory) { throw new \RuntimeException('Mandatory date cannot be cleared.'); }
+                }
+            }
+            $changed = [];
+            foreach ($task['changes'] as $key => $change) {
+                self::validate($task, $settings);
+                self::configuration($settings);
+                $fresh = self::snapshot($settings, 6);
+                $field = $fresh['fields'][$key] ?? null;
+                if (!$field || $field['metadata'] !== $change['metadata'] || $field['value'] !== $change['expected']
+                    || self::identity($fresh) !== $task['identity']) { throw new \RuntimeException('Batch expected field changed.'); }
+                if ($field['value'] === $change['value']) { continue; }
+                $computer = ServiceContext::computer($settings);
+                $history = \Log::getHistoryData($computer, 0, 100);
+                $attempted = true;
+                if (in_array($key, ['name', 'comment'], true)) {
+                    $ok = $computer->update(['id' => (int) $settings['items_id'], $key => $change['value']]);
+                } else {
+                    $container = new \PluginFieldsContainer();
+                    $definition = new \PluginFieldsField();
+                    if (!$container->getFromDB($field['container']) || !$definition->getFromDB($field['field'])) { throw new \RuntimeException('Fields metadata disappeared.'); }
+                    $value = $field['type'] === 'yesno' && $change['value'] === 0 ? '0' : $change['value'];
+                    $ok = $container->updateFieldsValues(['items_id' => (int) $settings['items_id'], 'itemtype' => $settings['itemtype'],
+                        'plugin_fields_containers_id' => $field['container'], $definition->fields['name'] => $value], $settings['itemtype'], false);
+                }
+                $after = self::snapshot($settings, 6);
+                if (!$ok || self::identity($after) !== $task['identity'] || ($after['fields'][$key]['value'] ?? null) !== $change['value']
+                    || ($after['fields'][$key]['metadata'] ?? null) !== $field['metadata']) { throw new \RuntimeException('Model readback failed.'); }
+                $named = array_filter(\Log::getHistoryData($computer, 0, 100), static fn ($row): bool => !in_array($row['id'], array_column($history, 'id'), true)
+                    && $row['field'] === $field['label'] && $row['user_name'] === \User::getNameForLog((int) \Session::getLoginUserID()));
+                if (count($named) !== 1) { throw new \RuntimeException('Named parent history missing.'); }
+                $log = Outbox::one('SELECT * FROM `glpi_logs` WHERE `id` = ' . (int) array_values($named)[0]['id']);
+                $newValues = $field['type'] === 'date' && $change['value'] === '' ? ['', 'NULL'] : [self::historyValue($change['value'], $field['type'])];
+                if (!$log || $log['itemtype'] !== $settings['itemtype'] || (int) $log['items_id'] !== (int) $settings['items_id']
+                    || (int) $log['id_search_option'] !== $field['option'] || $log['itemtype_link'] !== '' || (int) $log['linked_action'] !== 0
+                    || $log['old_value'] !== self::historyValue($field['value'], $field['type']) || !in_array($log['new_value'], $newValues, true)) {
+                    throw new \RuntimeException('Named parent history values mismatch.');
+                }
+                $changed[$key] = (int) $log['id'];
+            }
+            $snapshot = self::snapshot($settings, 6);
+            $snapshot['origin_epoch'] = $task['guard']['origin_epoch'];
+            $result = ['outcome' => $changed === [] ? 'unchanged' : 'verified', 'changed' => $changed, 'snapshot' => $snapshot,
+                'mutation' => ['modification' => $snapshot['modification'], 'native_values' => $snapshot['native_values'], 'origin_epoch' => $task['guard']['origin_epoch']]];
+            if (!$DB->update(TaskJournal::TABLE, ['state' => $result['outcome'], 'result' => json_encode($result, JSON_THROW_ON_ERROR)],
+                ['id' => $task['id'], 'hash' => $task['hash'], 'result' => '{}']) || $DB->affectedRows() !== 1) { throw new \RuntimeException('V6 result storage failed.'); }
+            Outbox::sql('COMMIT');
+            return $result;
+        } catch (\Throwable) {
+            try { $DB->doQuery('ROLLBACK'); } catch (\Throwable) { /* The commit reply may already have been lost. */ }
+            return ['outcome' => $attempted ? 'uncertain' : 'blocked', 'changed' => []];
         }
     }
 

@@ -20,7 +20,7 @@ function plugin_init_assetsync20agent(): void
 
 function plugin_version_assetsync20agent(): array
 {
-    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.5.2',
+    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.5.3',
         'author' => 'DMOS Technologies', 'license' => 'GPLv3+', 'requirements' => [
             'glpi' => ['min' => '11.0.0', 'max' => '12.0.0'], 'php' => ['min' => '8.2.0']]];
 }
