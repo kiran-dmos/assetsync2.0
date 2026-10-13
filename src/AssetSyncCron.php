@@ -44,6 +44,11 @@ final class AssetSyncCron
             return;
         }
 
+        $task = new \CronTask();
+        if ($task->getFromDBByCrit(['itemtype' => self::class, 'name' => self::TASK_NAME])) {
+            return;
+        }
+
         \CronTask::register(self::class, self::TASK_NAME, 300, [
             'state'   => \CronTask::STATE_WAITING,
             'param'   => self::DEFAULT_BATCH_SIZE,

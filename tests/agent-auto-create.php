@@ -227,7 +227,12 @@ foreach (['prepare_create', 'confirm_create', 'create'] as $phase) {
     if ($phase !== 'create') { AgentTask::exchange($request + ['kind' => 'pull'], $token); }
     $DB->update(AgentTask::TABLE, ['expires' => time() - 1], ['id' => $saved['id']]);
     AgentTask::queueMatch('b', 'Computer', 101);
-    AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
+    if ($phase === 'create') {
+        scalarCheck(AssetSyncQueue::claimDue(1) === [], 'Undelivered create waits for first pull without scheduler retries.');
+        AgentTask::exchange($request + ['kind' => 'pull'], $token);
+    } else {
+        AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'autoApplyLocal');
+    }
     $renewed = AgentTask::matchTask('b', 'Computer', 101);
     scalarCheck($renewed['id'] !== $saved['id'] && json_decode($renewed['body'], true)['kind'] === $phase,
         'Expired safe phase renewed: ' . $phase);
@@ -246,6 +251,8 @@ foreach (['prepare_create', 'confirm_create'] as $phase) {
         $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
         if ($expiry === 'successful_result') {
             scalarReceipt($request, $token, $task, TaskJournal::run($task, $settings));
+            // Historical receipts have unknown arrival time and cannot authorize new work.
+            $DB->update(AgentTask::TABLE, ['result_received_at' => null], ['id' => $task['id']]);
         }
         $DB->update(AgentTask::TABLE, ['expires' => time() - 1], ['id' => $task['id']]);
         if ($expiry === 'expired_pull') { AgentTask::exchange($request + ['kind' => 'pull'], $token); }
@@ -291,6 +298,7 @@ autoStart(); autoStep($settings, $request, $token, 'match'); createStep($setting
 $saved = AgentTask::matchTask('b', 'Computer', 101);
 $DB->update(AgentTask::TABLE, ['expires' => time() - 1], ['id' => $saved['id']]);
 AgentTask::queueMatch('b', 'Computer', 101);
+$DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['items_id' => 101]);
 $DB->sql->beforeQuery = static function (string $sql) use ($DB, $saved): void {
     if (!str_starts_with($sql, 'SELECT `connection_id` FROM `' . AgentTask::BINDINGS)) { return; }
     $DB->sql->beforeQuery = null;

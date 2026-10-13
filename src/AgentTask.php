@@ -33,6 +33,8 @@ final class AgentTask
             `created_at` BIGINT NOT NULL, `expires` BIGINT NOT NULL, UNIQUE KEY `outstanding` (`slot`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4');
         if (!$ok) { return false; }
+        if (!$DB->fieldExists(self::TABLE, 'result_received_at', false)
+            && !$DB->doQuery('ALTER TABLE `' . self::TABLE . '` ADD `result_received_at` BIGINT DEFAULT NULL')) { return false; }
         foreach (['identity_basis' => 'TEXT DEFAULT NULL', 'local_fingerprint' => "CHAR(64) NOT NULL DEFAULT ''", 'checked_at' => 'BIGINT NOT NULL DEFAULT 0'] as $column => $definition) {
             if (!$DB->fieldExists(self::PAIRS, $column)
                 && !$DB->doQuery('ALTER TABLE `' . self::PAIRS . '` ADD `' . $column . '` ' . $definition)) { return false; }
@@ -527,6 +529,7 @@ final class AgentTask
         global $DB;
         $scope = self::scope($pair, $job !== null || $kind === 'apply');
         if (self::outstanding($pair['connection_id'], $pair) && $previous === null) { throw new \RuntimeException('This pair has an outstanding task.'); }
+        if ($job !== null) { $context['source_guard'] = self::creationSourceGuard($job); }
         $task = ['version' => 3, 'id' => bin2hex(random_bytes(16)), 'kind' => $kind,
             'installation' => $pair['installation'], 'registration' => $pair['registration'], 'generation' => $scope['registration']['generation'],
             'connection_id' => $pair['connection_id'], 'pair_id' => $pair['id'], 'itemtype' => $pair['itemtype'],
@@ -606,6 +609,17 @@ final class AgentTask
                         if ($task['queue_id'] !== null && !$matching) {
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                             $policyCurrent = $expected['policy'] === self::policy($pair);
+                            if ($task['state'] === 'accepted' && (int) $task['expires'] < time() + 300) {
+                                if (isset($expected['source_guard'])) {
+                                    $policyCurrent = $policyCurrent && self::creationSourceGuard([
+                                        'glpi_b_connection_id' => $pair['connection_id'], 'itemtype' => $pair['itemtype'],
+                                        'items_id' => (int) $pair['local_id']]) === $expected['source_guard'];
+                                } else {
+                                    $current = self::context($pair);
+                                    $policyCurrent = $policyCurrent && $expected['values'] === $current['values']
+                                        && $expected['metadata'] === $current['metadata'];
+                                }
+                            }
                         }
                     } catch (\Throwable) { $policyCurrent = false; }
                     if (($body['version'] ?? 0) >= 4 && !in_array($body['version'], $request['task_versions'] ?? [], true)) {
@@ -615,17 +629,31 @@ final class AgentTask
                                 : 'Verification waiting: upgrade B to agent 0.4.0 (protocol v4), then upgrade A.'],
                                 ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
                         }
-                    } elseif ($body['version'] === 5 && ((int) $task['expires'] < time() || !$policyCurrent)) {
-                        // Do not synthesize a result that would conflict with B's late committed creation evidence.
-                        $state = $body['kind'] === 'create'
-                            ? ($task['state'] === 'executing' ? 'uncertain' : ($policyCurrent ? 'accepted' : 'blocked')) : 'stale';
+                    } elseif (!$policyCurrent || ($task['state'] === 'executing' && (int) $task['expires'] < time())) {
+                        // Keep the result empty so a late actual delivery can still be recorded.
+                        $state = $task['state'] === 'executing' && in_array($body['kind'], ['create', 'apply'], true)
+                            ? 'uncertain' : 'stale';
                         self::write($DB->update(self::TABLE, ['state' => $state], ['id' => $task['id']]));
                         self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
-                    } elseif ((int) $task['expires'] < time() || !$policyCurrent) {
-                        // A delivered task may have written before losing its result. Never issue another write.
-                        $outcome = $task['state'] === 'executing' && $body['kind'] !== 'discover' && !$matching ? 'uncertain' : 'stale';
-                        self::storeResult($task, ['outcome' => $outcome, 'changed' => []]);
                     } else {
+                        if ($task['state'] === 'accepted' && $task['result'] === '{}' && (int) $task['expires'] < time() + 300) {
+                            // First delivery gets a full window; the published record stays immutable.
+                            unset($body['hash']);
+                            $body['id'] = bin2hex(random_bytes(16));
+                            $body['expires'] = time() + 300;
+                            $body['hash'] = self::hash($body);
+                            self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id'], 'slot' => $task['slot']]));
+                            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('First delivery ownership changed.'); }
+                            $replacement = array_replace($task, ['id' => $body['id'], 'hash' => $body['hash'],
+                                'body' => json_encode($body, JSON_THROW_ON_ERROR), 'created_at' => time(),
+                                'expires' => $body['expires'], 'result_received_at' => null]);
+                            self::write($DB->insert(self::TABLE, $replacement));
+                            if ($body['kind'] === 'discover') {
+                                self::write($DB->update(self::BINDINGS, ['discovery_id' => $body['id']],
+                                    ['connection_id' => $binding['connection_id'], 'discovery_id' => $task['id']]));
+                            }
+                            $task = $replacement;
+                        }
                         self::write($DB->update(self::TABLE, ['state' => 'executing'], ['id' => $task['id']]));
                         $response['task'] = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
                     }
@@ -646,6 +674,7 @@ final class AgentTask
                     if (!$task || $task['id'] !== $saved['id']) { throw new \UnexpectedValueException('No matching outstanding task.'); }
                     try { self::validateResult($body, $result); }
                     catch (\RuntimeException $error) { throw new \UnexpectedValueException('Invalid task evidence.', 0, $error); }
+                    self::write($DB->update(self::TABLE, ['result_received_at' => time()], ['id' => $saved['id']]));
                     self::storeResult($saved, $result, $body['version'] === 5 || (int) $saved['expires'] >= time());
                 } elseif (self::hash(json_decode($saved['result'], true)) !== self::hash($result)) {
                     throw new \UnexpectedValueException('Conflicting result replay.');
@@ -714,6 +743,11 @@ final class AgentTask
 
     private static function validateResult(array $task, array $result): void
     {
+        foreach (['snapshot', 'evidence', 'discovery'] as $key) {
+            if (isset($result[$key]['observed_at']) && $result[$key]['observed_at'] > time()) {
+                throw new \RuntimeException('Observation is in the future.');
+            }
+        }
         if ($task['version'] === 5) {
             self::validateCreationResult($task, $result);
             return;
@@ -854,6 +888,24 @@ final class AgentTask
                 self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));
             }
         }
+    }
+
+    /** Receipt proves timely delivery; observations still have only a five-minute useful life. */
+    private static function timelyResult(array $task): bool
+    {
+        $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        $received = $task['result_received_at'] ?? null;
+        $now = time();
+        if ($received === null || (int) $received < $body['expires'] - 300
+            || (int) $received > $body['expires'] || (int) $received > $now) { return false; }
+        $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+        foreach (['snapshot', 'evidence', 'discovery'] as $key) {
+            if (!isset($result[$key])) { continue; }
+            $observed = $result[$key]['observed_at'] ?? null;
+            if (!is_int($observed) || $observed < $body['expires'] - 300 || $observed > $body['expires']
+                || $observed > (int) $received || $observed > $now || $observed < $now - 300) { return false; }
+        }
+        return true;
     }
 
     public static function write(bool $ok): void
@@ -1043,7 +1095,7 @@ final class AgentTask
         if ($task) {
             $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
             if ($body['version'] === 5 && !in_array($task['state'], ['accepted', 'executing'], true)) { return false; }
-            if ((int) $task['expires'] < time()) {
+            if ((int) $task['expires'] < time() && !($task['state'] === 'accepted' && $task['result'] === '{}')) {
                 self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'],
                     ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']));
             }
@@ -1141,8 +1193,9 @@ final class AgentTask
             $scope = self::matchContext($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id']);
             if (!$task) { self::publishMatch($job, $scope); return; }
             if ((int) $task['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Another matching queue owns this task.'); }
-            if ((int) $task['expires'] < time()) { throw new \RuntimeException('Read-only matching expired; retry scheduled.'); }
-            if ($task['result'] === '{}') { self::park($job, $task); return; }
+            if ($task['result'] === '{}' && in_array($task['state'], ['accepted', 'executing'], true)
+                && ($task['state'] === 'accepted' || (int) $task['expires'] >= time())) { self::park($job, $task); return; }
+            if (!self::timelyResult($task)) { throw new \RuntimeException('Read-only matching expired; retry scheduled.'); }
             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
             $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
             $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
@@ -1200,7 +1253,7 @@ final class AgentTask
         try {
             AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
             $fresh = self::matchContext($job['glpi_b_connection_id'], $job['itemtype'], (int) $job['items_id'], true, true);
-            if (!AssetSyncQueue::owns($job) || (int) $task['expires'] < time()
+            if (!AssetSyncQueue::owns($job) || !self::timelyResult($task)
                 || !self::sameMatchScope($fresh, $scope) || $fresh['local_counts'][$choice['method']] !== 1) {
                 throw new \RuntimeException('Fresh local matching scope or claim changed.');
             }
@@ -1360,14 +1413,17 @@ final class AgentTask
             if (!self::sameMatchScope($scope, $expected['scope']) || self::creationSource($job, $scope) !== $expected['source']) {
                 throw new \RuntimeException('Creation source or mapping changed; retained operation requires review.');
             }
-            if ($body['kind'] !== 'create' && (int) $task['expires'] < time()) {
-                // Read-only evidence expires even when its successful result arrived before the worker.
+            if ($task['state'] === 'accepted' && $task['result'] === '{}') {
+                self::park($job, $task);
+                return;
+            }
+            if ($body['kind'] !== 'create' && $task['result'] !== '{}' && !self::timelyResult($task)) {
                 self::publishCreation($job, $scope, $task, $body['kind'], $expected['source'], '', $expected['created']);
                 return;
             }
             if ($task['result'] === '{}') {
                 if ((int) $task['expires'] < time()) {
-                    if ($body['kind'] !== 'create' || $task['state'] === 'accepted') {
+                    if ($body['kind'] !== 'create') {
                         self::publishCreation($job, $scope, $task, $body['kind'], $expected['source'], $body['prerequisites'], $expected['created']);
                         return;
                     }
@@ -1394,10 +1450,6 @@ final class AgentTask
                 self::publishCreation($job, $scope, $task, 'confirm_create', $expected['source'], '',
                     ['task_id' => $body['id'], 'items_id' => $result['created_id']]);
             } else {
-                if ((int) $task['expires'] < time()) {
-                    self::publishCreation($job, $scope, $task, 'confirm_create', $expected['source'], '', $expected['created']);
-                    return;
-                }
                 $choice = self::chooseMatch($scope['identity'], $result['evidence']);
                 if (!isset($choice['candidate']) || $choice['candidate']['items_id'] !== $expected['created']['items_id']
                     || self::identity($choice['candidate']) !== $scope['identity']
@@ -1466,7 +1518,7 @@ final class AgentTask
                 self::write(AssetSyncQueue::waitForAgent($job));
                 return;
             }
-            if ((int) $body['expires'] < time() || $expected['policy'] !== $context['policy'] || $expected['values'] !== $context['values']
+            if (!self::timelyResult($task) || $expected['policy'] !== $context['policy'] || $expected['values'] !== $context['values']
                 || $expected['metadata'] !== $context['metadata']
                 || $body['serial'] !== $pair['serial'] || $body['generation'] !== self::scope($pair)['registration']['generation']) {
                 self::write($DB->update(self::TABLE, ['state' => 'stale'], ['id' => $task['id']]));
@@ -1577,8 +1629,14 @@ final class AgentTask
         global $DB;
         AgentInbox::sql('START TRANSACTION');
         try {
+            AgentInbox::sql('SELECT `connection_id` FROM `' . self::BINDINGS . '` WHERE `connection_id` = ' . $DB->quote($job['glpi_b_connection_id']) . ' FOR UPDATE');
             $current = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' FOR UPDATE');
             if (!$current || !AssetSyncQueue::owns($job)) { throw new \RuntimeException('Task claim changed.'); }
+            if ($current['slot'] !== $task['slot']) {
+                // A first pull may have transferred the slot while this worker held the old row.
+                $current = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `slot` = ' . $DB->quote($task['slot']) . ' FOR UPDATE');
+                if (!$current || (int) $current['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Task slot changed.'); }
+            }
             self::write(AssetSyncQueue::waitForAgent($job));
             // Result receipt takes this same task lock: it either wakes us later or is already visible here.
             if ($current['result'] !== '{}') {

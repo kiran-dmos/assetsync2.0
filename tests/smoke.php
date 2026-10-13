@@ -124,6 +124,17 @@ class CronTask
         return true;
     }
 
+    public function getFromDBByCrit(array $criteria): bool
+    {
+        foreach (self::$registered as $task) {
+            if ($task['itemtype'] === $criteria['itemtype'] && $task['name'] === $criteria['name']) {
+                $this->fields = $task;
+                return true;
+            }
+        }
+        return false;
+    }
+
     public function addVolume($volume): void
     {
         $this->volume += (int) $volume;
@@ -1513,7 +1524,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.6.0',
+    'version' => '0.6.1',
 ];
 
 foreach ($expectations as $key => $expected) {
@@ -1608,6 +1619,17 @@ if (CronTask::$registered === []) {
 }
 
 $registeredTask = CronTask::$registered[0];
+
+foreach ([CronTask::STATE_WAITING, CronTask::STATE_DISABLE] as $state) {
+    CronTask::$registered[0]['frequency'] = 60;
+    CronTask::$registered[0]['options'] = ['state' => $state, 'mode' => 2, 'param' => 37];
+    $beforeUpgrade = CronTask::$registered;
+    \GlpiPlugin\Assetsync20\AssetSyncCron::register();
+    if (CronTask::$registered !== $beforeUpgrade) {
+        throw new RuntimeException('Upgrade must preserve cron state, mode, frequency and batch.');
+    }
+}
+CronTask::$registered[0] = $registeredTask;
 if (
     $registeredTask['itemtype'] !== \GlpiPlugin\Assetsync20\AssetSyncCron::class
     || $registeredTask['name'] !== \GlpiPlugin\Assetsync20\AssetSyncCron::TASK_NAME

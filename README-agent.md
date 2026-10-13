@@ -507,3 +507,25 @@ client-connected systems were untouched. Only new owned lab containers were used
 and are stopped/preserved rather than deleted. Keep all protocol tables on InnoDB
 with durable commit settings; external changes across A/B cannot be one distributed
 transaction, so failures may follow partial mapping writes and retries must converge.
+
+### Controller 0.6.1 queue deadlines
+
+When queueing has shortened its execution window, an undelivered, accepted task
+with no result receives a new task ID and a full 300-second window on its first
+pull. The previous body, hash and result remain intact. Delivered tasks keep
+their original ID and deadline; lost replies and uncertain writes do not
+authorize another execution.
+
+A records the first result receipt in nullable `result_received_at`. Timely
+results can be consumed after the execution deadline while their observations
+are no more than 300 seconds old and current scope/source checks still pass.
+Historical rows remain null; the upgrade does not invent receipt times or reset
+retained stale/uncertain operations. Durable committed creation evidence remains
+available for confirmation without another create.
+
+Upgrade A only; B's protocol and worker are unchanged. Add the nullable column
+before loading the new controller, coordinate with the existing database run
+lock and in-flight HTTP requests, and refresh the serving PHP workers after
+atomic file replacement. Preserve the existing enabled schedule, frequency,
+mode and batch size. Keep backups and verify old task evidence and deployed
+hashes. A code rollback should retain the additive column and task history.
