@@ -61,6 +61,7 @@ namespace {
         public static int $sleep = 0;
         public static int $interval = 2;
         public static bool $failCycle = false;
+        public static bool $cleanupFailure = false;
         public static int $epoch = 1791870528;
         public static int $stopAfterCycles = 1;
         public static array $observedSessions = [];
@@ -72,6 +73,7 @@ namespace {
             self::$calls++;
             self::$now += self::$elapsed;
             $_SESSION['glpi_currenttime'] = 'changed_during_cycle';
+            if (self::$cleanupFailure) { \GlpiPlugin\Assetsync20\AssetUuidOperation::markLockCleanupFailed(); }
             if (self::$failCycle) { throw new RuntimeException('Injected cycle failure.'); }
             return 1;
         }
@@ -93,8 +95,10 @@ namespace {
         }
     }
     class LoopOutput implements Symfony\Component\Console\Output\OutputInterface {
-        public function writeln(string $text): void {}
+        public array $messages = [];
+        public function writeln(string $text): void { $this->messages[] = $text; }
     }
+    require __DIR__ . '/../src/AssetUuidOperation.php';
     require __DIR__ . '/../assetsync20agent/src/Console/WorkerCommand.php';
     require __DIR__ . '/../src/Console/WorkerCommand.php';
     $_SESSION = [];
@@ -203,5 +207,20 @@ namespace {
     } finally {
         date_default_timezone_set($originalTimezone);
     }
+    LoopFixture::$now = LoopFixture::$calls = LoopFixture::$sleep = 0;
+    LoopFixture::$failCycle = LoopFixture::$cleanupFailure = true;
+    $output = new LoopOutput();
+    $caught = null;
+    try {
+        $worker = new GlpiPlugin\Assetsync20\Console\WorkerCommand();
+        (new ReflectionMethod($worker, 'execute'))->invoke($worker, new LoopInput('2'), $output);
+    } catch (RuntimeException $error) { $caught = $error; }
+    if ($caught === null || !str_contains($caught->getMessage(), 'restart this worker')
+        || LoopFixture::$calls !== 1 || LoopFixture::$sleep !== 0
+        || !in_array('<error>AssetSync2.0 cycle failed: Injected cycle failure.</error>', $output->messages, true)
+        || $_SESSION !== LoopFixture::$expectedSession) {
+        throw new RuntimeException('Uncertain cleanup must report the original cycle error and exit before sleeping or starting another cycle.');
+    }
+    $checks++;
     echo "Worker interval tests passed ($checks checks; simulated cycles, no database or transport).\n";
 }

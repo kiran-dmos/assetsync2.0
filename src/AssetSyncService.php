@@ -43,12 +43,14 @@ final class AssetSyncService
     public static function uninstall(): void
     {
         if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
-            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY, self::QUEUE_LAST_VISITED_KEY, self::NEXT_PRIORITY_KEY]);
+            \Config::deleteConfigurationValues(self::SCAN_CONTEXT, [self::SCAN_CURSORS_KEY, self::SCAN_LAST_VISITED_KEY, self::QUEUE_LAST_VISITED_KEY, self::NEXT_PRIORITY_KEY,
+                'wake_phase', 'wake_cursor', 'wake_backoff']);
         }
     }
 
     public function run(int $batchSize = 10, int $timeLimitSeconds = 25, bool $forceInboundRecheck = false): int
     {
+        AssetUuidOperation::assertLockCleanup();
         $started = hrtime(true);
         $this->runMetrics = [
             'total_ms' => 0.0,
@@ -74,6 +76,9 @@ final class AssetSyncService
         $this->pausedConnections = [];
         $db = $this->db();
         $locked = false;
+        $wake = null;
+        $wakeDeadline = $this->runDeadlineNs;
+        $runError = null;
         try {
             // Shared Config cursors need one run at a time, without waiting on another cron.
             $lockResult = null;
@@ -96,6 +101,19 @@ final class AssetSyncService
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
+            try { $wake = AgentWake::plan(false, $wakeDeadline); }
+            catch (\Throwable) {
+                if (AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) {
+                    $wake = ['deferred' => true];
+                } else {
+                    $this->runMetrics['wake'] = ['status' => 0, 'state' => 'unavailable',
+                        'message' => 'HTTPS wake scheduling unavailable; ordinary synchronization continues.'];
+                }
+            }
+            if ($wake !== null) {
+                $this->runMetrics['stop_reason'] = !empty($wake['deferred']) ? 'wake_deferred' : 'wake_turn';
+                return 0;
+            }
             AgentTask::recoverStaleInspections(min($this->runDeadlineNs - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS,
                 hrtime(true) + 1_000_000_000));
             $uuidAvailable = false;
@@ -172,7 +190,24 @@ final class AssetSyncService
             $this->runMetrics['stop_reason'] = hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS + 1_000_000 > $this->runDeadlineNs
                 ? 'deadline' : ($processed >= $batchSize ? 'batch_limit' : ($this->pausedConnections !== [] ? 'connections_paused' : 'no_due_jobs'));
             return $enqueued + $processed;
+        } catch (\Throwable $error) {
+            $runError = $error;
+            throw $error;
         } finally {
+            $cleanupError = null;
+            if ($locked && $wake === null && $runError === null && !isset($this->runMetrics['wake']) && !AssetUuidOperation::hasAssetLocks()) {
+                $settled = $this->runMetrics['jobs_attempted'] === $this->runMetrics['jobs_succeeded'] + $this->runMetrics['jobs_retried']
+                    + $this->runMetrics['jobs_blocked'] + $this->runMetrics['jobs_skipped'];
+                try { $wake = AgentWake::plan(true, $settled ? $wakeDeadline : 0); }
+                catch (\Throwable) {
+                    if (AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) {
+                        $wake = ['deferred' => true];
+                    } else {
+                        $this->runMetrics['wake'] = ['status' => 0, 'state' => 'unavailable',
+                            'message' => 'HTTPS wake scheduling unavailable; ordinary synchronization continues.'];
+                    }
+                }
+            }
             $this->runDeadlineNs = null;
             $this->phaseDeadlineNs = null;
             $this->pausedConnections = null;
@@ -184,10 +219,21 @@ final class AssetSyncService
             FieldsText::endRunCache();
             if ($locked) {
                 try {
-                    $db->doQuery('SELECT RELEASE_LOCK(' . $runLockName . ') AS released');
-                } catch (\Throwable) {
-                    // Lock cleanup must not hide a processing exception or change its result.
+                    $result = $db->doQuery('SELECT RELEASE_LOCK(' . $runLockName . ') AS released');
+                    $row = $result === false ? null : $db->fetchAssoc($result);
+                    if (!in_array($row['released'] ?? null, [1, '1'], true)) {
+                        throw new \RuntimeException('Synchronization run lock release could not be verified.');
+                    }
+                } catch (\Throwable $error) {
+                    AssetUuidOperation::markLockCleanupFailed();
+                    $cleanupError = $error;
                 }
+            }
+            if ($locked && $wake !== null && empty($wake['deferred']) && !AssetUuidOperation::hasAssetLocks()) {
+                try { $this->runMetrics['wake'] = AgentWake::send($wake, $wakeDeadline); }
+                catch (\Throwable) { $this->runMetrics['wake'] = ['status' => 0, 'state' => 'unavailable']; }
+                try { AgentWake::complete($wake, $this->runMetrics['wake'], $wakeDeadline); }
+                catch (\Throwable) { /* The finite reservation retry survives a failed completion update. */ }
             }
             $summary = $this->runMetrics;
             $this->runMetrics = null;
@@ -206,6 +252,7 @@ final class AssetSyncService
                 }
             } catch (\Throwable) {
             }
+            if ($cleanupError !== null && $runError === null) { throw $cleanupError; }
         }
     }
 

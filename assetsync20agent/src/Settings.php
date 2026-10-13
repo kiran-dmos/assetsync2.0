@@ -79,6 +79,36 @@ final class Settings
         }
     }
 
+    /** The independent wake secret is shown once; disable/rotation revokes it immediately. */
+    public static function configureWake(bool $enabled, bool $rotate = false): ?string
+    {
+        $old = self::load();
+        if ($enabled && (($old['mode'] ?? '') !== 'agent' || !self::validEndpoint($old['endpoint'] ?? ''))) {
+            throw new \RuntimeException('Wake requires a configured agent binding.');
+        }
+        if ($enabled) { ServiceContext::httpAccount((int) ($old['service_user'] ?? 0)); }
+        $binding = $enabled ? self::wakeBinding($old) : '';
+        $token = $enabled && ($rotate || empty($old['wake_token_hash']) || ($old['wake_binding'] ?? '') !== $binding) ? bin2hex(random_bytes(32)) : null;
+        $hash = $enabled ? ($token !== null ? hash('sha256', $token) : $old['wake_token_hash']) : '';
+        \Config::setConfigurationValues(self::CONTEXT, ['wake_enabled' => $enabled ? '1' : '0',
+            'wake_token_hash' => $hash, 'wake_binding' => $binding]);
+        $saved = self::load();
+        if (($saved['wake_enabled'] ?? null) !== ($enabled ? '1' : '0') || ($saved['wake_token_hash'] ?? null) !== $hash
+            || ($saved['wake_binding'] ?? null) !== $binding) { throw new \RuntimeException('Wake credential storage unavailable.'); }
+        return $token;
+    }
+
+    public static function wakeBinding(array $settings): string
+    {
+        $binding = [];
+        foreach (['mode', 'installation', 'registration', 'generation', 'connection_id', 'endpoint',
+            'service_user', 'service_profile', 'service_name', 'service_password', 'token'] as $key) {
+            if (!isset($settings[$key]) || (string) $settings[$key] === '') { throw new \RuntimeException('Wake binding is incomplete.'); }
+            $binding[$key] = (string) $settings[$key];
+        }
+        return hash('sha256', json_encode($binding, JSON_THROW_ON_ERROR));
+    }
+
     public static function entities(int $user, int $profile): array
     {
         global $DB;

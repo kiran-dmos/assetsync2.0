@@ -7,7 +7,7 @@ namespace GlpiPlugin\Assetsync20;
 final class GlpiBConnection
 {
     public const HTTP_CLEANUP_RESERVE_NS = 1_000_000_000;
-    private const CONTEXT = 'plugin:assetsync20';
+    public const CONTEXT = 'plugin:assetsync20';
     private const CONNECTIONS_KEY = 'glpib_connections';
     private const CUSTOM_HISTORY_RANGE = '0-20';
     private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
@@ -123,14 +123,14 @@ final class GlpiBConnection
     /**
      * @return list<array{id:string,name:string,base_url:string,app_token:string,user_token:string,active:bool}>
      */
-    public static function loadAll(bool $fresh = false): array
+    public static function loadAll(bool $fresh = false, bool $migrateLegacy = true): array
     {
         if ($fresh) {
             self::invalidateRunCache();
         }
         $connections = self::decodeConnections();
 
-        if ($connections !== []) {
+        if ($connections !== [] || !$migrateLegacy) {
             return $connections;
         }
 
@@ -166,6 +166,13 @@ final class GlpiBConnection
         if (!in_array($mode, ['rest', 'agent'], true)) {
             throw new \InvalidArgumentException('Unsupported connection mode.');
         }
+        $wakeEnabled = $mode === 'agent' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
+        $wakeUrl = trim((string) ($input['wake_url'] ?? $current['wake_url'] ?? ''));
+        $wakeToken = trim((string) ($input['wake_token'] ?? ''));
+        if ($wakeToken === '') { $wakeToken = $current['wake_token'] ?? ''; }
+        if ($wakeEnabled && (!AgentWake::validUrl($wakeUrl) || !preg_match('/^[a-f0-9]{64}$/D', $wakeToken))) {
+            throw new \InvalidArgumentException('Wake requires a direct HTTPS endpoint and a separate wake credential.');
+        }
         return [
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
@@ -174,6 +181,9 @@ final class GlpiBConnection
             'app_token'  => $mode === 'agent' ? '' : $appToken,
             'user_token' => $mode === 'agent' ? '' : $userToken,
             'active'     => !empty($input['active']),
+            'wake_enabled' => $wakeEnabled,
+            'wake_url' => $mode === 'agent' ? $wakeUrl : '',
+            'wake_token' => $mode === 'agent' ? $wakeToken : '',
         ];
     }
 
@@ -1534,6 +1544,9 @@ final class GlpiBConnection
                 'app_token'  => ($savedConnection['mode'] ?? 'rest') === 'agent' ? '' : self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
                 'user_token' => ($savedConnection['mode'] ?? 'rest') === 'agent' ? '' : self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
                 'active'     => !empty($savedConnection['active']),
+                'wake_enabled' => !empty($savedConnection['wake_enabled']),
+                'wake_url' => (string) ($savedConnection['wake_url'] ?? ''),
+                'wake_token' => empty($savedConnection['wake_token']) ? '' : ((new \GLPIKey())->decrypt($savedConnection['wake_token']) ?? ''),
             ];
         }
 
@@ -1557,6 +1570,9 @@ final class GlpiBConnection
                 'app_token'  => self::encryptToken($connection['app_token']),
                 'user_token' => self::encryptToken($connection['user_token']),
                 'active'     => $connection['active'],
+                'wake_enabled' => !empty($connection['wake_enabled']),
+                'wake_url' => (string) ($connection['wake_url'] ?? ''),
+                'wake_token' => empty($connection['wake_token']) ? '' : (new \GLPIKey())->encrypt($connection['wake_token']),
             ];
         }
 

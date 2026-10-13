@@ -29,6 +29,7 @@ namespace GlpiPlugin\Assetsync20agent {
 namespace {
     require __DIR__ . '/agent-sqlite.php';
     require __DIR__ . '/../assetsync20agent/src/Settings.php';
+    require __DIR__ . '/../assetsync20agent/src/Wake.php';
     require __DIR__ . '/../assetsync20agent/src/Worker.php';
 
     use GlpiPlugin\Assetsync20agent\Settings;

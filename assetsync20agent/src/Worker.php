@@ -6,28 +6,33 @@ namespace GlpiPlugin\Assetsync20agent;
 
 final class Worker
 {
-    public function run(): int
+    public const WAKE_VERSION = 1;
+    public function run(?int $deadline = null, ?\Closure $admit = null): int
     {
         global $DB;
-        // A database-scoped lock excludes overlapping CLI workers, with automatic process-death release.
+        // HTTP wakes and CLI workers share one database-scoped lock.
         $lock = 'assetsync20agent:' . substr(hash('sha256', (string) ($DB->dbdefault ?? 'glpi')), 0, 32);
         $quotedLock = $DB->quote($lock);
         if ((int) (Outbox::one("SELECT GET_LOCK({$quotedLock}, 0) AS acquired")['acquired'] ?? 0) !== 1) {
             return 0;
         }
         try {
-            $deadline = hrtime(true) + 20_000_000_000;
-            $settings = Settings::load();
+            $deadline = min($deadline ?? PHP_INT_MAX, hrtime(true) + 20_000_000_000);
+            if (hrtime(true) >= $deadline) { return 0; }
+            if ($admit !== null) { $admit(); }
+            $settings = Wake::settings();
             if (($settings['mode'] ?? 'rest') === 'agent') {
                 TaskJournal::cycle($settings, $deadline);
             }
             try {
-                $this->reconcile();
+                $this->reconcile($deadline);
+            } catch (\UnexpectedValueException $error) {
+                throw $error;
             } catch (\Throwable) {
                 \Config::setConfigurationValues(Settings::CONTEXT, ['reconcile_status' => 'degraded']);
             }
-            $settings = Settings::load();
-            if (Settings::validEndpoint($settings['endpoint'] ?? '') && !empty($settings['token'])
+            $settings = Wake::settings();
+            if (hrtime(true) < $deadline && Settings::validEndpoint($settings['endpoint'] ?? '') && !empty($settings['token'])
                 && (time() - (int) ($settings['health_attempt'] ?? 0) >= 60
                     || ($settings['health_reported_status'] ?? '') !== ($settings['reconcile_status'] ?? 'degraded'))) {
                 $health = ['kind' => 'health', 'registration' => $settings['registration'], 'generation' => $settings['generation'],
@@ -45,10 +50,11 @@ final class Worker
             }
             $count = 0;
             while ($count < 20 && hrtime(true) + 500_000_000 < $deadline) {
-                $settings = Settings::load();
+                $settings = Wake::settings();
                 if (!Settings::validEndpoint($settings['endpoint'] ?? '') || empty($settings['generation']) || empty($settings['token'])) {
                     break;
                 }
+                Wake::assertCurrent();
                 $sent = Outbox::claim($settings);
                 if ($sent === null) {
                     break;
@@ -80,19 +86,21 @@ final class Worker
     }
 
     /** Persistent separate cursors discover changes and tracked purges, at most 50 rows/2 seconds. */
-    public function reconcile(): int
+    public function reconcile(?int $deadline = null): int
     {
         global $DB;
-        $state = Settings::load();
+        $deadline = min($deadline ?? PHP_INT_MAX, hrtime(true) + 2_000_000_000);
+        if (hrtime(true) >= $deadline) { return 0; }
+        $state = Wake::settings();
         if (($state['mode'] ?? 'rest') === 'agent') {
-            $deadline = hrtime(true) + 2_000_000_000;
-            $priorityDeadline = $deadline - 1_000_000_000;
+            $priorityDeadline = min($deadline, hrtime(true) + max(0, (int) (($deadline - hrtime(true)) / 2)));
             $cursor = max(0, (int) ($state['target_cursor'] ?? 0));
             $seen = 0;
             $degraded = false;
             $where = array_intersect_key($state, array_flip(['installation', 'registration', 'generation', 'connection_id']));
             $where += ['active' => 1, 'expires' => ['>', time()]];
             $process = static function (array $target) use ($DB, $state, &$degraded): void {
+                Wake::assertCurrent();
                 $id = (int) $target['items_id'];
                 $type = $target['itemtype'];
                 try {
@@ -131,7 +139,6 @@ final class Worker
             \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor, 'reconcile_status' => $degraded ? 'degraded' : 'ok']);
             return $seen;
         }
-        $deadline = hrtime(true) + 2_000_000_000;
         $count = 0;
         foreach (['scan_cursor' => 'glpi_computers', 'purge_cursor' => Outbox::TABLE] as $key => $table) {
             $column = $key === 'scan_cursor' ? 'id' : 'computer_id';
@@ -167,6 +174,7 @@ final class Worker
 
     public static function send(array $settings, array $sent, int $deadline): array
     {
+        Wake::assertCurrent();
         if (!Settings::validEndpoint($settings['endpoint'])) {
             return ['status' => 0, 'body' => []];
         }

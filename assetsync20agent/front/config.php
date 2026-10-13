@@ -12,15 +12,22 @@ include GLPI_ROOT . '/inc/includes.php';
 require_once __DIR__ . '/../src/autoload.php';
 global $DB;
 Session::checkCentralAccess();
-Session::checkRight('config', UPDATE);
+Session::checkRight('config', READ);
+$canConfigure = Session::haveRight('config', UPDATE);
 header('Cache-Control: no-store');
 $message = '';
+$newWakeToken = null;
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
+    Session::checkRight('config', UPDATE);
     // GLPI 11's controller listener already checked and consumed the form CSRF token.
     try {
         if (isset($_POST['save_settings'])) {
             Settings::save($_POST);
             $message = 'Agent settings saved.';
+        } elseif (isset($_POST['save_wake']) || isset($_POST['rotate_wake']) || isset($_POST['revoke_wake'])) {
+            $enabled = !isset($_POST['revoke_wake']) && (isset($_POST['rotate_wake']) || !empty($_POST['wake_enabled']));
+            $newWakeToken = Settings::configureWake($enabled, isset($_POST['rotate_wake']));
+            $message = $enabled ? 'HTTPS wake enabled.' : 'HTTPS wake disabled and key revoked.';
         }
     } catch (Throwable $error) {
         $message = $error->getMessage();
@@ -42,7 +49,7 @@ echo '<style>.assetsync-agent-setup{max-width:980px;margin:1rem auto 2rem;paddin
 .assetsync-agent-setup td{overflow-wrap:anywhere}.assetsync-agent-setup input,.assetsync-agent-setup select,
 .assetsync-agent-setup .select2-container{max-width:100%;box-sizing:border-box}
 .assetsync-agent-setup .btn{margin:.25rem 0;white-space:normal}</style>';
-echo '<div class="assetsync-agent-setup"><h2>AssetSync2.0 Agent</h2><p>' . $html($message) . '</p><form method="post"><table class="tab_cadre_fixe">';
+echo '<div class="assetsync-agent-setup"><h2>AssetSync2.0 Agent</h2><p>' . $html($message) . '</p><fieldset style="border:0;padding:0;min-width:0"' . ($canConfigure ? '' : ' disabled') . '><form method="post"><table class="tab_cadre_fixe">';
 echo '<tr><th>Installation identity</th><td>' . $html($settings['installation'] ?? 'Install the plugin update first') . '</td></tr>';
 echo '<tr><th><label for="mode">Mode</label></th><td><select id="mode" name="mode">';
 foreach (['rest' => 'Notifications for REST', 'agent' => 'Bounded agent tasks'] as $value => $label) {
@@ -79,6 +86,21 @@ foreach (['token' => 'Token (blank keeps current)', 'service_password' => 'Servi
         . '" type="password" autocomplete="new-password" size="60" value=""></td></tr>';
 }
 echo '</table><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_settings" value="1" class="btn btn-primary btn-sm">Save settings</button></form>';
+
+$wakeEnabled = ($settings['wake_enabled'] ?? '0') === '1';
+$wakeCurrent = false;
+try { $wakeCurrent = $wakeEnabled && hash_equals($settings['wake_binding'] ?? '', Settings::wakeBinding($settings)); }
+catch (Throwable) {}
+echo '<h3>Optional HTTPS wake</h3><p>A background worker is required. B can keep its CLI worker or receive bounded HTTPS wakes. Enabled or enforced service-account MFA is unsupported for HTTPS wake.</p>';
+echo '<p>Status: ' . ($wakeCurrent ? 'Enabled' : ($wakeEnabled ? 'Binding changed; issue a new key' : 'Disabled')) . '</p>';
+echo '<form method="post"><table class="tab_cadre_fixe"><tr><th><label for="wake_enabled">Allow HTTPS wake from A</label></th><td><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . ($wakeEnabled ? ' checked' : '') . '></td></tr></table>';
+echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_wake" value="1" class="btn btn-primary btn-sm">Save wake setting</button> ';
+echo '<button type="submit" name="rotate_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Rotate wake key</button> ';
+echo '<button type="submit" name="revoke_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Disable and revoke</button></form></fieldset>';
+if ($newWakeToken !== null) {
+    echo '<p><label for="new_wake_key">New wake key (shown once)</label></p><input id="new_wake_key" type="text" readonly autocomplete="off" size="72" value="' . $html($newWakeToken) . '">';
+    echo '<p>Store this separate key in A\'s connection wake setting. Rotation immediately revokes the previous key.</p>';
+}
 
 echo '<p>Last worker cycle: ' . (!empty($settings['worker_seen']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['worker_seen'])) . ' UTC' : 'Never') . '</p>';
 echo '<p>Reconciliation: ' . $html(in_array($settings['reconcile_status'] ?? '', ['ok', 'degraded'], true) ? $settings['reconcile_status'] : 'Not recorded')

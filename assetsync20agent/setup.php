@@ -4,6 +4,13 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/src/autoload.php';
 
+function plugin_assetsync20agent_boot(): void
+{
+    \Glpi\Http\SessionManager::registerPluginStatelessPath('assetsync20agent', '#^/front/agent-wake\\.php$#D');
+    \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts('assetsync20agent', '#^/front/agent-wake\\.php$#D',
+        \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
+}
+
 function plugin_init_assetsync20agent(): void
 {
     global $PLUGIN_HOOKS;
@@ -20,7 +27,7 @@ function plugin_init_assetsync20agent(): void
 
 function plugin_version_assetsync20agent(): array
 {
-    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.5.3',
+    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.5.4',
         'author' => 'DMOS Technologies', 'license' => 'GPLv3+', 'requirements' => [
             'glpi' => ['min' => '11.0.0', 'max' => '12.0.0'], 'php' => ['min' => '8.2.0']]];
 }

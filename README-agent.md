@@ -9,6 +9,89 @@ listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
+### Optional HTTPS Wake (A 0.6.5 / B 0.5.4)
+
+HTTPS wake is opt-in and disabled by default on both sides. It lets A's existing
+background CLI worker request one bounded B worker turn. B still pulls and reports
+the existing agent tasks; a wake contains no asset command and adds no REST fallback,
+business policy, table, or task protocol version. Mappings, entity routes, permissions,
+matching, creation and Both authority stay in their existing settings.
+
+Back up both installations and preserve all retained tasks, journals and results.
+During the upgrade stop both AssetSync workers and scheduled AssetSync runs; install
+**B agent 0.5.4 first, then A controller 0.6.5**, using GLPI's plugin Update action.
+No new schema migration is required for wake. Resume A's CLI background worker and
+its existing schedule after both updates succeed. Deploy the complete B plugin
+files and refresh the serving PHP OPcache through the normal deployment procedure
+when necessary; file replacement is not an atomic cache upgrade. The wake endpoint
+rejects a loaded Worker class without the matching wake capability marker, including
+older cached workers that would ignore extra run arguments. Reload A's existing
+CLI worker once after its code upgrade. Enabling or rotating wake later does not
+require restarting B's CLI worker, changing its configuration, or restarting A.
+Do not change worker intervals
+to compensate for an unverified deployment.
+
+1. Finish the existing agent binding and dedicated B service-account setup first.
+   Keep a least-privilege profile with the required exact nonrecursive entity grants.
+   Enabled or enforced service-account MFA is unsupported for HTTP execution.
+   Unreadable MFA policy and interactive authentication steps fail closed; do not
+   weaken global MFA policy to enable wake. Keep using the existing CLI path when
+   the service account cannot use this HTTP path.
+2. Provide direct HTTPS from A to B's
+   `/plugins/assetsync20agent/front/agent-wake.php` (or its `/marketplace/` alias).
+   Provide verified HTTPS from B to A's existing receiver/task endpoints too.
+   Use certificates trusted by the PHP/cURL runtime with matching hostnames. No
+   redirects, insecure certificate overrides, URL credentials, query strings or
+   forwarded-protocol substitutions are supported. B must see server-side HTTPS.
+3. On B's Agent settings page, enable **Allow HTTPS wake from A**. The new independent
+   wake key is shown once in the successful POST response. B stores only its hash;
+   a later page view cannot recover it. Use HTTPS for administration as well.
+4. On A's saved B-agent connection, enter the **B backend HTTPS wake URL**, paste the
+   separate wake key, and enable **Optional HTTPS wake**. This backend URL is separate
+   from the browser Base URL; a localhost browser address does not identify a server
+   reachable from A's runtime. A encrypts the saved key with GLPIKey and never fills
+   the password input with the saved value. Blank keeps the saved key.
+5. Keep `plugins:assetsync20:worker --loop` running on A. Manual web runs do ordinary
+   work and do not reserve or send wakes. B's `plugins:assetsync20agent:worker --loop`
+   remains available and is optional when HTTPS wake is enabled; both paths share
+   the same nonblocking B worker lock.
+
+Rotate the key on B, then replace A's saved wake key. The previous key is revoked
+immediately. **Disable and revoke** on B removes its accepted wake credential;
+disabling A only stops A from sending. Changes to B's binding, registration,
+generation, endpoint, service identity/profile/password or pull credential invalidate
+the bound wake key. Issue a new key and update A after such changes. Setup pages
+require ordinary GLPI configuration permissions and CSRF-protected POST actions;
+read-only users cannot change settings, and key responses use no-store caching.
+
+Ordinary CLI work keeps its full existing 60-second worker or 25-second cron budget.
+After it finishes, A may reserve one wake if about ten seconds plus cleanup time
+remain in that same absolute deadline. When ordinary work uses that time, the next
+eligible turn is wake-only, then ordinary work resumes. A rotates due connections;
+one unavailable peer does not prevent another due peer's turn. Per-connection retry
+delays are 10, 20, 40, then at most 60 seconds. Success or busy responses reset the
+outage count but still wait at least ten seconds before another attempt. Retry
+records contain an attempt marker and binding fingerprint, not plaintext secrets;
+changed or disabled bindings are removed during the next background planning pass.
+B's admission interval remains ten seconds.
+
+The sender caps HTTP at ten seconds; B's turn uses an eight-second cooperative
+deadline. Model calls, database waits and process/tool overhead can exceed soft
+operation budgets. There is no two-second convergence guarantee. A wake response
+`completed` means a worker turn ended, including turns whose tasks were blocked;
+`busy` means another B worker held the lock. Only the existing durable task results
+prove asset outcomes. A timeout or lost response does not prove that B did no work;
+retain the journals and let the existing acknowledgement/recovery path reconcile
+them. Uncertain lock cleanup fences that A process and exits its continuous loop,
+requiring a fresh process/connection. Transaction probes never end caller work;
+their 128-bit private savepoint names are probabilistically unique.
+
+The supported single-connection native/custom Both path has actual HTTPS evidence.
+Three-connection fairness/cost, slow calls, hard process-crash handling, and positive
+CREATE qualification remain separate Gate 4 checks; simulated suites are not proof
+of those runtime outcomes. Snapshot/Docker-inclusive timings must be reported
+separately from HTTP and pipeline latency.
+
 ### Native Both (Protocol V6)
 
 Confirmed existing pairs may use Both for the same native Name or Comments key
@@ -16,7 +99,8 @@ on A and B. Native/custom cross-mappings, custom Both, creation with Both, UUID
 and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
 retain their protocol behavior and permission checks.
 
-Upgrade **B agent 0.5.3 first, then A controller 0.6.4**. B's read-only pull retries with the v1-v5
+Native Both was introduced in **B agent 0.5.3 / A controller 0.6.4**. For the current
+release use the B-first 0.5.4 / A 0.6.5 procedure above. B's read-only pull retries with the v1-v5
 capability list when an older A rejects the additive v6 list. Upgrade A before
 enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
 There is no task downgrade or REST fallback. No new database table or column is

@@ -35,6 +35,58 @@ function lockNameQueries(FakeDB $db, string $function): array
     return array_values(array_filter($db->sqlQueries, static fn (string $sql): bool => str_contains($sql, $function . '(')));
 }
 
+// Each cleanup failure must stay fenced for the lifetime of its own process.
+if (($argv[1] ?? '') === '--cleanup-failure') {
+    $entrypoint = $argv[2]; $failure = $argv[3]; $original = ($argv[4] ?? '') === 'original';
+    $db = lockNameDb();
+    $db->queryResult = static function (string $sql) use ($entrypoint, $failure) {
+        $prefix = $entrypoint === 'asset' ? "SELECT RELEASE_LOCK('as20:" : "SELECT RELEASE_LOCK('assetsync20:run:";
+        if (!str_starts_with($sql, $prefix)) { return null; }
+        return match ($failure) {
+            'false' => false,
+            'throws' => throw new RuntimeException('Release query failed'),
+            'no_row' => [],
+            'missing' => [[]],
+            'null' => [['released' => null]],
+            default => [['released' => 0]],
+        };
+    };
+    if ($entrypoint === 'run' && $original) {
+        $db->afterTableExists = static function (string $table): void {
+            if ($table === \GlpiPlugin\Assetsync20\AgentTask::TABLE) { throw new RuntimeException('Original work error'); }
+        };
+    }
+    $caught = null;
+    try {
+        if ($entrypoint === 'asset') {
+            AssetUuidOperation::withAssetLock('Computer', 123, static function () use ($original): void {
+                if ($original) { throw new RuntimeException('Original work error'); }
+            });
+        } else { (new AssetSyncService())->run(1); }
+    } catch (RuntimeException $error) { $caught = $error; }
+    lockNameCheck($caught !== null, 'Cleanup-only failure is surfaced.');
+    if ($original) { lockNameCheck($caught->getMessage() === 'Original work error', 'Original exception survives failed cleanup.'); }
+    lockNameCheck(AssetUuidOperation::hasAssetLocks(), 'Uncertain cleanup fences wakes.');
+    if ($entrypoint === 'asset') {
+        $locks = (new ReflectionProperty(AssetUuidOperation::class, 'assetLocks'))->getValue();
+        lockNameCheck(isset($locks[hash('sha256', 'Computer:123')]), 'Failed release retains the owned asset entry.');
+    }
+    $beforeQueries = $db->sqlQueries; $worked = false;
+    $db->queryResult = null; $db->afterTableExists = null;
+    foreach (['same_asset', 'new_asset', 'next_cycle'] as $retry) {
+        $rejected = false;
+        try {
+            if ($retry === 'next_cycle') { (new AssetSyncService())->run(1); }
+            else { AssetUuidOperation::withAssetLock('Computer', $retry === 'same_asset' ? 123 : 456,
+                static function () use (&$worked): void { $worked = true; }); }
+        } catch (RuntimeException) { $rejected = true; }
+        lockNameCheck($rejected && !$worked && $db->sqlQueries === $beforeQueries,
+            'Latch rejects shortcuts and later cycles before SQL: ' . $retry);
+    }
+    echo "Cleanup failure checks passed ($checks).\n";
+    exit;
+}
+
 foreach ([
     ['glpi', '41ece51526515624ff89973668497d00'],
     ['GLPI', 'd6d85810e9a0e36c0a729e64b455eee5'],
@@ -164,5 +216,17 @@ lockNameCheck(lockNameQueries($db, 'RELEASE_LOCK') === ["SELECT RELEASE_LOCK('" 
 
 foreach (['AssetSyncService.php', 'AssetUuidService.php', 'AssetUuidOperation.php'] as $file) {
     lockNameCheck(!preg_match('/\bMD5\s*\(/i', file_get_contents(__DIR__ . '/../src/' . $file)), 'Runtime lock call sites contain no SQL MD5: ' . $file);
+}
+foreach (['asset', 'run'] as $entrypoint) {
+    foreach (['false', 'throws', 'no_row', 'missing', 'null', 'zero'] as $failure) {
+        foreach (['clean', 'original'] as $work) {
+            $process = proc_open([PHP_BINARY, __FILE__, '--cleanup-failure', $entrypoint, $failure, $work],
+                [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+            fclose($pipes[0]);
+            $output = stream_get_contents($pipes[1]); fclose($pipes[1]);
+            $error = stream_get_contents($pipes[2]); fclose($pipes[2]);
+            lockNameCheck(proc_close($process) === 0, 'Isolated cleanup case ' . "$entrypoint/$failure/$work: " . $output . $error);
+        }
+    }
 }
 echo 'Advisory lock name tests passed (' . $checks . " checks).\n";

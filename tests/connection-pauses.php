@@ -235,5 +235,12 @@ namespace {
     pauseCheck($service->processQueue(1, PauseClock::$wall + 25) === 1 && $remote->reads === ['a'], 'Standalone public epoch deadline must become one monotonic deadline at entry.');
     pauseEnded($service);
 
+    [$service, $remote] = pauseSetup(['a' => 1]);
+    Config::$values[GlpiBConnection::CONTEXT]['wake_backoff'] = '{malformed';
+    $service->run(1);
+    pauseCheck($remote->reads === ['a'] && pauseSummary()['jobs_succeeded'] === 1,
+        'Malformed retained wake state without active wakes cannot stop a real ordinary REST job.');
+    pauseEnded($service);
+
     echo "Connection pause tests passed ($checks checks).\n";
 }

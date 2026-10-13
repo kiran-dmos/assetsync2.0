@@ -1028,6 +1028,11 @@ final class AgentTask
             }
             if (!in_array($result['outcome'], ['partial', 'uncertain'], true)) {
                 self::write($DB->update(self::TABLE, ['slot' => null], ['id' => $task['id']]));
+                $pair = self::taskPair($task);
+                if ($fresh && $pair && isset($result['snapshot']) && in_array($result['outcome'], ['verified', 'unchanged'], true)) {
+                    self::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['itemtype' => $pair['itemtype'],
+                        'items_id' => (int) $pair['local_id'], 'glpi_b_connection_id' => $pair['connection_id'], 'status' => 'waiting_agent']));
+                }
             }
         }
     }
@@ -1813,6 +1818,10 @@ final class AgentTask
         $task = $pair ? self::outstanding($job['glpi_b_connection_id'], $pair) : null;
         $recovering = false;
         $fieldConflict = false;
+        if ($task && (int) $task['queue_id'] !== (int) $job['id']) {
+            self::write(AssetSyncQueue::retry($job, 'Waiting for another agent operation on this pair.'));
+            return;
+        }
         try {
             if ($task && $task['state'] === 'finalizing') {
                 self::write($DB->update(self::TABLE, ['state' => 'uncertain'], ['id' => $task['id'], 'state' => 'finalizing']));
@@ -1827,7 +1836,6 @@ final class AgentTask
                 self::publish($pair, 'inspect', [], $job, $context);
                 return;
             }
-            if ((int) $task['queue_id'] !== (int) $job['id']) { throw new \RuntimeException('Another agent operation is outstanding.'); }
             $recovery = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR)['recovery_proof'] ?? null;
             if ($task['state'] === 'stale' && $recovery !== null) {
                 $recovering = true;

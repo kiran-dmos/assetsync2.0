@@ -41,13 +41,17 @@ class ScalarDB
 class Config
 {
     public static array $values = [];
+    public static bool $failWakeWrites = false;
+    public static ?Closure $readHook = null;
     public static function getConfigurationValues($context, array $names = []): array
     {
+        if (self::$readHook !== null) { (self::$readHook)($context); }
         $values = self::$values[$context] ?? [];
         return $names === [] ? $values : array_intersect_key($values, array_flip($names));
     }
     public static function setConfigurationValues($context, array $values): void
     {
+        if (self::$failWakeWrites && (isset($values['wake_phase']) || isset($values['wake_backoff']) || isset($values['wake_last_attempt']))) { return; }
         self::$values[$context] = array_replace(self::$values[$context] ?? [], $values);
     }
 }
@@ -94,7 +98,8 @@ class User
 {
     public array $fields = [];
     public static bool $active = true;
-    public function getFromDB($id): bool { $this->fields = ['is_active' => self::$active, 'is_deleted' => 0]; return true; }
+    public static array $httpFields = [];
+    public function getFromDB($id): bool { $this->fields = ['is_active' => self::$active, 'is_deleted' => 0] + self::$httpFields; return true; }
     public static function getNameForLog($id): string { return 'Scalar service (' . $id . ')'; }
 }
 class Profile

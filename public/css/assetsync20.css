@@ -26,6 +26,14 @@
     max-width: 100%;
 }
 
+.assetsync-connection-form table { table-layout: fixed; }
+.assetsync-connection-form th,
+.assetsync-connection-form td { display: table-cell; vertical-align: top; overflow-wrap: anywhere; }
+.assetsync-connection-form td:first-child { width: 30%; }
+.assetsync-connection-form input[type="text"],
+.assetsync-connection-form input[type="url"],
+.assetsync-connection-form input[type="password"] { width: 100%; min-width: 0; }
+
 .assetsync-table-scroll {
     max-width: 980px;
     margin: 0 auto;

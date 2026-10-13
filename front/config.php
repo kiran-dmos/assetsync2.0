@@ -19,6 +19,8 @@ require_once __DIR__ . '/../src/autoload.php';
 if (class_exists('Session') && method_exists('Session', 'checkRight')) {
     Session::checkRight('config', defined('READ') ? READ : 1);
 }
+header('Cache-Control: no-store');
+$canConfigure = Session::haveRight('config', defined('UPDATE') ? UPDATE : 2);
 
 $message = null;
 $messageClass = 'info';
@@ -73,21 +75,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if (isset($_POST['save'])) {
-        $connectionInput = GlpiBConnection::fromInput([
-            'mode'       => $_POST['mode'] ?? 'rest',
-            'id'         => $_POST['id'] ?? '',
-            'name'       => $_POST['name'] ?? '',
-            'base_url'   => $_POST['base_url'] ?? '',
-            'app_token'  => $_POST['app_token'] ?? '',
-            'user_token' => $_POST['user_token'] ?? '',
-            'active'     => $_POST['active'] ?? '',
-        ]);
+        try {
+            $connectionInput = GlpiBConnection::fromInput([
+                'mode'       => $_POST['mode'] ?? 'rest',
+                'id'         => $_POST['id'] ?? '',
+                'name'       => $_POST['name'] ?? '',
+                'base_url'   => $_POST['base_url'] ?? '',
+                'app_token'  => $_POST['app_token'] ?? '',
+                'user_token' => $_POST['user_token'] ?? '',
+                'active'     => $_POST['active'] ?? '',
+                'wake_enabled' => $_POST['wake_enabled'] ?? '0',
+                'wake_url' => $_POST['wake_url'] ?? '',
+                'wake_token' => $_POST['wake_token'] ?? '',
+            ]);
 
-        GlpiBConnection::save($connectionInput);
+            GlpiBConnection::save($connectionInput);
 
-        $message = 'GLPI B connection saved.';
-        $messageClass = 'success';
-        $editConnection = GlpiBConnection::find($connectionInput['id']);
+            $message = 'GLPI B connection saved.';
+            $messageClass = 'success';
+            $editConnection = GlpiBConnection::find($connectionInput['id']);
+        } catch (\InvalidArgumentException $error) {
+            $message = $error->getMessage();
+            $messageClass = 'warning';
+            $editConnection = GlpiBConnection::find((string) ($_POST['id'] ?? ''));
+        } catch (\Throwable) {
+            $message = 'Could not save the GLPI B connection.';
+            $messageClass = 'warning';
+        }
     }
 
     if (isset($_POST['test'])) {
@@ -148,6 +162,7 @@ $html = static function (string $value): string {
 };
 
 echo '<div class="assetsync-page assetsync-config">';
+echo '<fieldset style="border:0;padding:0;min-width:0"' . ($canConfigure ? '' : ' disabled') . '>';
 echo '<h2>' . $html(Plugin::NAME) . '</h2>';
 
 if ($message !== null) {
@@ -289,7 +304,7 @@ echo '</table>';
 echo '</div>';
 
 /* Add or edit GLPI B connection */
-echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
+echo '<form class="assetsync-connection-form" method="post" action="' . $html(Menu::configUrl()) . '">';
 echo '<input type="hidden" name="id" value="' . $html($connection['id']) . '">';
 echo '<table class="tab_cadre_fixe">';
 echo '<tr><th colspan="2">' . ($connection['id'] !== '' ? 'Edit GLPI B connection' : 'Add GLPI B connection') . '</th></tr>';
@@ -304,6 +319,12 @@ foreach (['rest' => 'REST', 'agent' => 'B agent (Computer and Printer pairs)'] a
     echo '<option value="' . $mode . '"' . (($connection['mode'] ?? 'rest') === $mode ? ' selected' : '') . '>' . $label . '</option>';
 }
 echo '</select> <a href="' . $html(dirname(Menu::configUrl()) . '/agent-pair.php') . '">Agent Pair</a></td></tr>';
+
+echo '<tr><td><label for="wake_enabled">Optional HTTPS wake</label></td><td><input type="hidden" name="wake_enabled" value="0"><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . (!empty($connection['wake_enabled']) ? ' checked' : '') . '> Enabled for B agent mode</td></tr>';
+echo '<tr><td><label for="wake_url">B backend HTTPS wake URL</label></td><td><input type="url" id="wake_url" name="wake_url" value="' . $html($connection['wake_url'] ?? '') . '" size="60" placeholder="https://glpi-b.example.com/plugins/assetsync20agent/front/agent-wake.php"><br><small>Direct verified TLS endpoint reachable by A, separate from the browser Base URL.</small></td></tr>';
+echo '<tr><td><label for="wake_token">Separate wake key</label></td><td><input type="password" id="wake_token" name="wake_token" value="" autocomplete="new-password" size="60"><br><small>Blank keeps the saved key. Generate or rotate this key on B; it is separate from registration and REST tokens.</small></td></tr>';
+echo '<tr><td>Saved wake key</td><td>' . (!empty($connection['wake_token']) ? 'Yes' : 'No') . '</td></tr>';
+echo '<tr><td>Wake worker</td><td>A\'s background CLI worker must remain running. B\'s CLI worker is optional. A manual web run does ordinary work; it does not send a wake.</td></tr>';
 
 echo '<tr><td><label for="app_token">App token</label></td>';
 echo '<td><input type="password" id="app_token" name="app_token" value="" size="60" autocomplete="new-password"></td></tr>';
@@ -363,7 +384,7 @@ if ($connection['id'] !== '') {
     echo '</table>';
 }
 
-echo '</div>';
+echo '</fieldset></div>';
 
 if (class_exists('Html') && method_exists('Html', 'footer')) {
     Html::footer();

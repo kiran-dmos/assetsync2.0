@@ -18,10 +18,30 @@ final class ServiceContext
         $type = $settings['itemtype'] ?? 'Computer';
         TargetScope::model($type);
         \Glpi\Search\SearchOption::clearSearchOptionCache($type);
+        $http = PHP_SAPI !== 'cli';
+        $temporarySessionId = '';
+        $sessionOptions = [];
+        if ($http) {
+            if ($sessionStatus === PHP_SESSION_ACTIVE) { throw new \RuntimeException('HTTP service execution requires a stateless request.'); }
+            self::httpAccount((int) $settings['service_user']);
+        }
         try {
+            if ($http) {
+                foreach (['session.use_cookies', 'session.use_only_cookies', 'session.use_trans_sid'] as $option) {
+                    $previous = ini_get($option);
+                    if ($previous === false) { throw new \RuntimeException('HTTP service session policy unavailable.'); }
+                    $sessionOptions[$option] = $previous;
+                    if ((ini_set($option, '0') === false && $previous !== '0')
+                        || ini_get($option) !== '0') {
+                        throw new \RuntimeException('HTTP service session isolation unavailable.');
+                    }
+                }
+                session_id('');
+            }
             self::account((int) $settings['service_user']);
             \Session::destroy();
             \Session::start();
+            if ($http) { $temporarySessionId = session_id(); }
             $auth = new \Auth();
             if (!$auth->login($settings['service_name'], $settings['service_password'], true)
                 || (int) \Session::getLoginUserID() !== (int) $settings['service_user']) {
@@ -37,11 +57,22 @@ final class ServiceContext
                 throw new \RuntimeException('Service entity activation failed.');
             }
             return $operation();
+        } catch (\Glpi\Exception\RedirectException $error) {
+            throw new \RuntimeException('Service authentication requires an interactive step.', 0, $error);
         } finally {
             try {
-                \Session::destroy();
+                if ($http) {
+                    $currentId = session_id();
+                    if (session_status() === PHP_SESSION_ACTIVE) { session_destroy(); }
+                    if ($temporarySessionId !== '' && $temporarySessionId !== $currentId) {
+                        session_id($temporarySessionId);
+                        session_start();
+                        session_destroy();
+                    }
+                } else { \Session::destroy(); }
                 session_write_close();
                 session_id($sessionId);
+                foreach ($sessionOptions as $option => $value) { ini_set($option, $value); }
                 if ($sessionStatus === PHP_SESSION_ACTIVE) {
                     \Session::start();
                 }
@@ -53,6 +84,24 @@ final class ServiceContext
             } finally {
                 \Glpi\Search\SearchOption::clearSearchOptionCache($type);
             }
+        }
+    }
+
+    /** Official MFA helpers can return false for an unreadable secret; persisted data also fences login. */
+    public static function httpAccount(int $id): void
+    {
+        global $CFG_GLPI;
+        self::account($id);
+        $user = new \User();
+        if (!$user->getFromDB($id) || !array_key_exists('2fa', $user->fields)
+            || !array_key_exists('2fa_unenforced', $user->fields)
+            || !in_array($user->fields['2fa_unenforced'], [0, 1, '0', '1'], true)
+            || !in_array($CFG_GLPI['2fa_enforced'] ?? null, [0, 1, '0', '1'], true)
+            || !class_exists(\Glpi\Security\TOTPManager::class)) { throw new \RuntimeException('HTTP MFA policy unavailable.'); }
+        $mfa = new \Glpi\Security\TOTPManager();
+        if ($mfa->is2FAEnabled($id) || $mfa->get2FAEnforcement($id) !== \Glpi\Security\TOTPManager::ENFORCEMENT_OPTIONAL
+            || ($user->fields['2fa'] !== null && $user->fields['2fa'] !== '')) {
+            throw new \RuntimeException('HTTP service login requires optional, unconfigured MFA.');
         }
     }
 

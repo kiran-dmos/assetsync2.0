@@ -58,7 +58,7 @@ namespace {
         if (!$ok) { throw new RuntimeException($message); }
     };
     $settings = ['endpoint' => 'https://controller.invalid/plugins/assetsync20/front/agent-notify.php', 'token' => str_repeat('a', 64)];
-    $check(plugin_version_assetsync20agent()['version'] === '0.5.3', 'B advertises the v6 feature package version.');
+    $check(plugin_version_assetsync20agent()['version'] === '0.5.4', 'B advertises the HTTPS wake feature package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
@@ -87,6 +87,7 @@ namespace {
     $hook = file_get_contents(__DIR__ . '/../assetsync20agent/src/ChangeHook.php');
     $check(!str_contains($hook, 'Worker::') && !str_contains($hook, 'curl_') && !str_contains($hook, 'http'), 'Save hooks have no HTTP/worker path.');
     require __DIR__ . '/../setup.php';
+    plugin_assetsync20_boot();
     plugin_init_assetsync20();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
         $check((preg_match($pattern, '/front/agent-notify.php') === 1 || preg_match($pattern, '/front/agent-task.php') === 1) && preg_match($pattern, '/front/agents.php') === 0

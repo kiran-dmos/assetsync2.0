@@ -132,4 +132,14 @@ $custom->fields = ['id' => 99, 'itemtype' => 'Unsupported', 'items_id' => 101];
 AssetChangeHook::onUpdate($custom);
 hookCheck(hookRows() === [] && Config::$reads === [], 'Unknown items and invalid custom parents must be ignored cheaply.');
 
+$item = hookSetup();
+GlpiBConnection::save(['id' => '123', 'active' => true]);
+EntitySyncRoute::save(['id' => 'numeric', 'glpi_b_connection_id' => '123',
+    'glpi_a_source_entity_id' => '1', 'glpi_b_target_entity_id' => '100',
+    'asset_types' => ['Computer'], 'active' => true]);
+AssetChangeHook::onAdd($item);
+hookCheck(in_array('123', array_column(hookRows(), 'glpi_b_connection_id'), true), 'Numeric connection keys must notify with string identities.');
+AssetChangeHook::onUpdate($item);
+hookCheck(count(array_filter(hookRows(), static fn ($row) => $row['glpi_b_connection_id'] === '123')) === 1, 'Numeric connection retry must keep one queue identity.');
+
 echo "Hook notification tests passed ($checks checks).\n";

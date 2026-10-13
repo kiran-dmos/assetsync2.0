@@ -6,6 +6,7 @@ namespace GlpiPlugin\Assetsync20\Console;
 
 use Glpi\Console\AbstractCommand;
 use GlpiPlugin\Assetsync20\AssetSyncService;
+use GlpiPlugin\Assetsync20\AssetUuidOperation;
 use GlpiPlugin\Assetsync20\Config\WorkerSettings;
 use GlpiPlugin\Assetsync20\GlpiBConnection;
 use Symfony\Component\Console\Input\InputInterface;
@@ -55,6 +56,8 @@ final class WorkerCommand extends AbstractCommand
             $cycleStartedAt = hrtime(true);
 
             $this->runOneCycle($output);
+            // Uncertain lock cleanup requires a fresh process and database connection.
+            AssetUuidOperation::assertLockCleanup();
 
             $elapsed = (hrtime(true) - $cycleStartedAt) / 1_000_000_000;
             $sleepMicroseconds = max(0, (int) round(($interval - $elapsed) * 1_000_000));

@@ -11,18 +11,15 @@ use GlpiPlugin\Assetsync20\FieldMapping;
  * GLPI bootstrap for the assetsync2.0 plugin.
  */
 
-define('PLUGIN_ASSETSYNC20_VERSION', '0.6.4');
+define('PLUGIN_ASSETSYNC20_VERSION', '0.6.5');
 define('PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION', '11.0.0');
 define('PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION', '12.0.0');
 define('PLUGIN_ASSETSYNC20_MIN_PHP_VERSION', '8.2.0');
 
 require_once __DIR__ . '/src/autoload.php';
 
-function plugin_init_assetsync20(): void
+function plugin_assetsync20_boot(): void
 {
-    global $PLUGIN_HOOKS;
-
-    $PLUGIN_HOOKS['csrf_compliant'][Plugin::KEY] = true;
     if (class_exists(\Glpi\Http\SessionManager::class)) {
         // This single machine endpoint authenticates its own bearer credential, without cookies.
         \Glpi\Http\SessionManager::registerPluginStatelessPath(Plugin::KEY, '#^/front/agent-notify\\.php$#D');
@@ -32,6 +29,12 @@ function plugin_init_assetsync20(): void
         \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(Plugin::KEY, '#^/front/agent-task\\.php$#D',
             \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
     }
+}
+
+function plugin_init_assetsync20(): void
+{
+    global $PLUGIN_HOOKS;
+    $PLUGIN_HOOKS['csrf_compliant'][Plugin::KEY] = true;
     $PLUGIN_HOOKS['config_page'][Plugin::KEY] = 'front/config.php';
     $PLUGIN_HOOKS['add_css'][Plugin::KEY] = 'css/assetsync20.css';
     $PLUGIN_HOOKS['menu_toadd'][Plugin::KEY] = [

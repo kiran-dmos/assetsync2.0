@@ -207,4 +207,46 @@ AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['
 agentCheck(AgentTask::outstanding('recovery') === null && AgentTask::recent('recovery')[0]['state'] === 'blocked',
     'Standalone failure remains visible after its outstanding slot is released.');
 
+foreach (['accepted', 'executing', 'finalizing'] as $state) {
+    taskSetup();
+    AgentTask::inspect('b');
+    $inspection = AgentTask::outstanding('b');
+    $DB->update(AgentTask::TABLE, ['state' => $state], ['id' => $inspection['id']]);
+    $before = AgentTask::outstanding('b');
+    AssetSyncQueue::notify('Computer', 101, 'b');
+    $job = AssetSyncQueue::claimDue(1)[0];
+    AgentTask::process($job, static function (): void { throw new LogicException('Unowned operation must not write.'); });
+    agentCheck(AgentTask::outstanding('b') === $before, 'Unrelated queue claim preserves the full standalone operation in ' . $state . '.');
+    $queued = $DB->firstRow(AssetSyncQueue::TABLE, ['id' => $job['id']]);
+    agentCheck($queued['status'] === 'retry', 'Unrelated claim uses the existing bounded retry in ' . $state . '.');
+
+    taskSetup();
+    AgentTask::inspect('b');
+    $inspection = AgentTask::outstanding('b');
+    $DB->update(AgentTask::TABLE, ['state' => $state], ['id' => $inspection['id']]);
+    $before = AgentTask::outstanding('b');
+    AssetSyncQueue::notify('Computer', 101, 'b');
+    $job = AssetSyncQueue::claimDue(1)[0];
+    $DB->failOn = 'UPDATE `' . AssetSyncQueue::TABLE . '`';
+    try {
+        AgentTask::process($job, static function (): void { throw new LogicException('No unowned asset write.'); });
+        throw new LogicException('Queue retry storage failure must be reported.');
+    } catch (RuntimeException $error) {
+        agentCheck($error->getMessage() === 'Agent task storage write failed.', 'Current claim reports failed retry storage in ' . $state . '.');
+    } finally { $DB->failOn = null; }
+    agentCheck(AgentTask::outstanding('b') === $before, 'Retry storage failure preserves foreign body/state/hash/result in ' . $state . '.');
+    agentCheck($DB->firstRow(AssetSyncQueue::TABLE, ['id' => $job['id']])['status'] === 'running', 'A failed retry cannot pretend the current claim was parked.');
+}
+
+[$credentials, $request, $snapshot] = taskSetup();
+AgentTask::inspect('b');
+AssetSyncQueue::notify('Computer', 101, 'b');
+$parked = AssetSyncQueue::claimDue(1)[0];
+agentCheck(AssetSyncQueue::waitForAgent($parked), 'Reproduce a legacy queue parked beside a standalone read.');
+$inspection = AgentTask::exchange($request, $credentials['token'])['task'];
+AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $inspection['id'], 'hash' => $inspection['hash'],
+    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), $credentials['token']);
+agentCheck(AgentTask::outstanding('b') === null && $DB->firstRow(AssetSyncQueue::TABLE, ['id' => $parked['id']])['status'] === 'pending',
+    'A fresh completed standalone observation wakes the exact parked pair without erasing queue evidence.');
+
 echo "Bounded agent task tests passed ({$checks} total checks including existing prototype coverage).\n";

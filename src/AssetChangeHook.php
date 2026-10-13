@@ -176,6 +176,7 @@ final class AssetChangeHook
             }
             $connectionIds = array_unique(array_merge(array_keys($eligible), AssetSyncQueue::connectionIdsForAsset($itemtype, $itemsId)));
             foreach ($connectionIds as $connectionId) {
+                $connectionId = (string) $connectionId;
                 try {
                     if (!AssetSyncQueue::notify($itemtype, $itemsId, $connectionId, isset($eligible[$connectionId]))) {
                         self::logFailure(new \RuntimeException('Could not notify an asset queue entry.'));

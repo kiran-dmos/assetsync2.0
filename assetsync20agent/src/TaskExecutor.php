@@ -643,6 +643,7 @@ final class TaskExecutor
 
     public static function configuration(array $settings, bool $legacy = false): void
     {
+        Wake::assertCurrent();
         $current = Settings::load();
         $keys = ['mode', 'registration', 'generation', 'installation', 'connection_id',
             'service_user', 'service_profile', 'service_name', 'service_password'];

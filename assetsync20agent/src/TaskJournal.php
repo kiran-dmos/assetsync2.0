@@ -29,6 +29,7 @@ final class TaskJournal
     public static function run(array $task, array $settings): array
     {
         global $DB;
+        Wake::assertCurrent();
         $id = $task['id'] ?? '';
         TaskExecutor::validate($task, $settings, false);
         if (!is_string($id) || !preg_match('/^[a-f0-9]{32}$/D', $id)) { throw new \RuntimeException('Invalid task ID.'); }
@@ -184,6 +185,7 @@ final class TaskJournal
 
     public static function send(array $settings, array $payload, int $deadline, bool $legacyPull = false): array
     {
+        Wake::assertCurrent();
         if (!Settings::validEndpoint($settings['endpoint'] ?? '') || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
         if (($payload['kind'] ?? '') === 'pull') {
             $payload['task_versions'] = $legacyPull ? [1, 2, 3, 4, 5] : [1, 2, 3, 4, 5, 6];

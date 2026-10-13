@@ -11,6 +11,7 @@ final class AssetUuidOperation
     private const CURSOR = 'uuid_link_cursor';
     private const WATERMARK = 'uuid_link_watermark';
     private static array $assetLocks = [];
+    private static bool $lockCleanupFailed = false;
 
     public static function available(): bool
     {
@@ -213,8 +214,26 @@ final class AssetUuidOperation
     }
 
     /** Ordinary preparation, direct jobs and UUID work share the same per-asset mutex. */
+    public static function hasAssetLocks(): bool
+    {
+        return self::$lockCleanupFailed || self::$assetLocks !== [];
+    }
+
+    public static function markLockCleanupFailed(): void
+    {
+        self::$lockCleanupFailed = true;
+    }
+
+    public static function assertLockCleanup(): void
+    {
+        if (self::$lockCleanupFailed) {
+            throw new \RuntimeException('Lock cleanup is uncertain; restart this worker before continuing.');
+        }
+    }
+
     public static function withAssetLock(string $itemtype, int $itemsId, callable $work): mixed
     {
+        self::assertLockCleanup();
         if (!self::available()) {
             return $work();
         }
@@ -230,11 +249,24 @@ final class AssetUuidOperation
             throw new \RuntimeException('Asset synchronization is already running or its lock is unavailable.');
         }
         self::$assetLocks[$key] = true;
+        $workError = null;
         try {
             return $work();
+        } catch (\Throwable $error) {
+            $workError = $error;
+            throw $error;
         } finally {
-            unset(self::$assetLocks[$key]);
-            $db->doQuery('SELECT RELEASE_LOCK(' . $name . ') AS released');
+            try {
+                $result = $db->doQuery('SELECT RELEASE_LOCK(' . $name . ') AS released');
+                $row = $result === false ? null : $db->fetchAssoc($result);
+                if (!in_array($row['released'] ?? null, [1, '1'], true)) {
+                    throw new \RuntimeException('Asset lock release could not be verified.');
+                }
+                unset(self::$assetLocks[$key]);
+            } catch (\Throwable $error) {
+                self::markLockCleanupFailed();
+                if ($workError === null) { throw $error; }
+            }
         }
     }
 }
