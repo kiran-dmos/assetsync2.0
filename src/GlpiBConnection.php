@@ -161,6 +161,8 @@ final class GlpiBConnection
         if ($userToken === '') {
             $userToken = $current['user_token'];
         }
+        $agentToken = trim((string) ($input['agent_token'] ?? ''));
+        if ($agentToken === '') { $agentToken = $current['agent_token'] ?? ''; }
 
         return [
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
@@ -168,6 +170,9 @@ final class GlpiBConnection
             'base_url'   => self::cleanBaseUrl((string) ($input['base_url'] ?? '')),
             'app_token'  => $appToken,
             'user_token' => $userToken,
+            'agent_endpoint' => rtrim(trim((string) ($input['agent_endpoint'] ?? ($current['agent_endpoint'] ?? ''))), '/'),
+            'agent_token' => $agentToken,
+            'agent_allow_lab_http' => !empty($input['agent_allow_lab_http']),
             'active'     => !empty($input['active']),
         ];
     }
@@ -180,7 +185,7 @@ final class GlpiBConnection
         self::invalidateRunCache();
         $connection = self::fromInput($input);
         $previous = self::find($connection['id']);
-        if ($previous !== null && AgentInbox::identity($previous) !== AgentInbox::identity($connection)) {
+        if ($previous !== null && class_exists(AgentInbox::class) && AgentInbox::identity($previous) !== AgentInbox::identity($connection)) {
             AgentInbox::invalidate($connection['id']);
         }
         $connections = self::loadAll();
@@ -205,7 +210,9 @@ final class GlpiBConnection
     {
         self::invalidateRunCache();
         $id = self::connectionId($id);
-        AgentInbox::invalidate($id);
+        if (class_exists(AgentInbox::class)) {
+            AgentInbox::invalidate($id);
+        }
         $connections = [];
 
         foreach (self::loadAll() as $connection) {
@@ -274,14 +281,9 @@ final class GlpiBConnection
      */
     public static function test(array $connection): array
     {
-        return self::withSession($connection, static function (string $sessionToken) use ($connection): array {
-            $fullSession = self::request('GET', self::apiUrl($connection['base_url'], 'getFullSession'), [
-                'App-Token: ' . $connection['app_token'],
-                'Session-Token: ' . $sessionToken,
-            ]);
-            if (!$fullSession['success']) {
-                return $fullSession;
-            }
+        return self::withSession($connection, static function (): array {
+            // initSession already authenticated the app and service user. Some GLPI
+            // versions/profiles reject getFullSession even after a valid login.
             return ['success' => true, 'message' => 'Connection to GLPI B succeeded.'];
         });
     }
@@ -1447,6 +1449,9 @@ final class GlpiBConnection
             'base_url'   => '',
             'app_token'  => '',
             'user_token' => '',
+            'agent_endpoint' => '',
+            'agent_token' => '',
+            'agent_allow_lab_http' => false,
             'active'     => false,
         ];
     }
@@ -1511,6 +1516,9 @@ final class GlpiBConnection
                 'base_url'   => (string) ($savedConnection['base_url'] ?? ''),
                 'app_token'  => self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
                 'user_token' => self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
+            'agent_endpoint' => (string) ($savedConnection['agent_endpoint'] ?? ''),
+            'agent_token' => self::decryptToken((string) ($savedConnection['agent_token'] ?? '')),
+            'agent_allow_lab_http' => !empty($savedConnection['agent_allow_lab_http']),
                 'active'     => !empty($savedConnection['active']),
             ];
         }
@@ -1533,6 +1541,9 @@ final class GlpiBConnection
                 'base_url'   => self::cleanBaseUrl($connection['base_url']),
                 'app_token'  => self::encryptToken($connection['app_token']),
                 'user_token' => self::encryptToken($connection['user_token']),
+                'agent_endpoint' => rtrim((string) ($connection['agent_endpoint'] ?? ''), '/'),
+                'agent_token' => self::encryptToken((string) ($connection['agent_token'] ?? '')),
+                'agent_allow_lab_http' => !empty($connection['agent_allow_lab_http']),
                 'active'     => $connection['active'],
             ];
         }
@@ -1979,7 +1990,12 @@ final class GlpiBConnection
         if ($statusCode < 200 || $statusCode >= 300) {
             return [
                 'success'     => false,
-                'message'     => 'GLPI B returned HTTP ' . $statusCode . '.',
+                // Preserve the failing endpoint and GLPI response in the activity log.
+                // This is deliberately bounded: it helps operators distinguish an
+                // identity read, mapping lookup, or an unintended write without
+                // exposing request credentials.
+                'message'     => 'GLPI B ' . $method . ' ' . (string) (parse_url($url, PHP_URL_PATH) ?: $url)
+                    . ' returned HTTP ' . $statusCode . ': ' . substr(trim((string) $rawBody), 0, 500),
                 'body'        => $body,
                 'status_code' => $statusCode,
                 'transient'   => self::isTransientStatusCode($statusCode),

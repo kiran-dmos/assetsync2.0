@@ -75,7 +75,7 @@ $assets = static function (array $row) use ($activity, $html): string {
 };
 
 echo '<div class="assetsync-page assetsync-activity"><h2>Sync Activity</h2>';
-\GlpiPlugin\Assetsync20\AgentActivity::render();
+
 echo '<div class="assetsync-activity-actions"><a href="' . $html(Menu::configUrl()) . '">Back to dashboard</a><a class="submit" href="' . $html($url(['id' => ''])) . '">Refresh activity</a></div>';
 echo '<h3>Current Work</h3><p class="assetsync-activity-note">Latest queue state only. Finished jobs do not prove field changes; retrying or blocked jobs may follow partial updates.</p>';
 if ($unavailable) {
@@ -152,6 +152,8 @@ if ($filters['id'] !== '') {
             'Connection' => $activity->connectionName($detail['glpi_b_connection_id']),
             'Stored route ID' => SyncActivity::validKey($detail['route_id']) ? $detail['route_id'] : 'Not recorded',
             'Attempts (current queue row only)' => (string) max(0, (int) $detail['attempts']),
+            'Stored execution message' => trim((string) ($detail['last_error'] ?? '')) !== '' ? (string) $detail['last_error'] : 'Not recorded',
+            'Stored link message' => trim((string) ($detail['link_last_error'] ?? '')) !== '' ? (string) $detail['link_last_error'] : 'Not recorded',
             'Queued GLPI B ID' => (int) $detail['remote_items_id'] > 0 ? (string) (int) $detail['remote_items_id'] : 'Not recorded',
             'Linked GLPI B ID' => (int) $detail['link_remote_items_id'] > 0 ? (string) (int) $detail['link_remote_items_id'] : 'Not recorded',
             'Last verified field success' => 'Not recorded',

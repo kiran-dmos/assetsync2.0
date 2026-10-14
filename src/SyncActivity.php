@@ -330,13 +330,13 @@ final class SyncActivity
             ['FKEY' => [$q => 'glpi_b_connection_id', $l => 'glpi_b_connection_id']],
         ]];
         $query['SELECT'] = [];
-        foreach (['id', 'itemtype', 'items_id', 'glpi_b_connection_id', 'route_id', 'remote_items_id', 'status', 'needs_recheck', 'attempts', 'started_at', 'finished_at', 'available_at', 'date_mod'] as $column) {
+        foreach (['id', 'itemtype', 'items_id', 'glpi_b_connection_id', 'route_id', 'remote_items_id', 'status', 'needs_recheck', 'attempts', 'started_at', 'finished_at', 'available_at', 'last_error', 'date_mod'] as $column) {
             $query['SELECT'][] = $column === 'needs_recheck' && !$this->recheckRecorded ? new QueryExpression('NULL', 'needs_recheck') : $q . '.' . $column;
         }
         $query['SELECT'][] = new QueryExpression('`' . self::ASSETS[$type] . '`.`name`', 'asset_name');
         $query['SELECT'][] = self::ASSETS[$type] . '.entities_id';
         $query['SELECT'][] = 'glpi_entities.completename';
-        foreach (['id', 'remote_items_id', 'route_id', 'status', 'last_sync_at'] as $column) {
+        foreach (['id', 'remote_items_id', 'route_id', 'status', 'last_error', 'last_sync_at'] as $column) {
             $query['SELECT'][] = new QueryExpression('`' . $l . '`.`' . $column . '`', 'link_' . $column);
         }
         return $query;

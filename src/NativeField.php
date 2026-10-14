@@ -171,9 +171,18 @@ final class NativeField
         if (!empty($row['is_deleted']) || !empty($row['is_template'])) {
             return false;
         }
-        if ($descriptor['relation'] === 'State' && (!isset($row['entities_id'], $row['is_recursive'])
-            || ($requireVisibility && !in_array($row['is_visible_' . strtolower($descriptor['itemtype'])] ?? null, [1, '1', true], true)))) {
-            return false;
+        if ($descriptor['relation'] === 'State') {
+            if (!isset($row['entities_id'], $row['is_recursive'])) {
+                return false;
+            }
+            // GLPI 11 states no longer expose per-item visibility columns such
+            // as is_visible_computer. Honour those flags on installations that
+            // provide them, while accepting GLPI 11's entity-scoped states.
+            $visibilityKey = 'is_visible_' . strtolower($descriptor['itemtype']);
+            if ($requireVisibility && array_key_exists($visibilityKey, $row)
+                && !in_array($row[$visibilityKey], [1, '1', true], true)) {
+                return false;
+            }
         }
         if (array_key_exists('entities_id', $row)) {
             if ($row['entities_id'] === null || !in_array($row['is_recursive'] ?? 0, [0, 1, '0', '1', false, true], true)) {
@@ -210,7 +219,13 @@ final class NativeField
                 throw new \RuntimeException('Local reference disappeared during catalog read.');
             }
             if (method_exists($dropdown, 'can') && !$dropdown->can($id, defined('READ') ? READ : 1)) {
-                continue;
+                // The queue worker has no interactive GLPI session.  It runs on
+                // GLPI A itself and only needs the source label in order to
+                // resolve a configured mapping; it does not mutate the dropdown.
+                // Keep normal UI/session permission filtering intact.
+                if (!empty($_SESSION['glpiID'])) {
+                    continue;
+                }
             }
             if (isset($dropdown->fields['entities_id']) && count($path) === 1) {
                 $path = self::localEntityPath($entityId);

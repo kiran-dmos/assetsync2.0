@@ -8,6 +8,7 @@ use GlpiPlugin\Assetsync20\AssetSyncCron;
 use GlpiPlugin\Assetsync20\FieldMapping;
 use GlpiPlugin\Assetsync20\GlpiBConnection;
 use GlpiPlugin\Assetsync20\Config\WorkerSettings;
+use GlpiPlugin\Assetsync20\Config\LocalExecutionSettings;
 
 if (!defined('GLPI_ROOT')) {
     define('GLPI_ROOT', dirname(__DIR__, 3));
@@ -72,6 +73,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
 
+    if (isset($_POST['save_local_execution_settings'])) {
+        $userId = filter_var($_POST['local_execution_user_id'] ?? null, FILTER_VALIDATE_INT);
+        if ($userId === false || $userId === null) {
+            $message = 'Please enter a valid GLPI A service user ID.';
+            $messageClass = 'warning';
+        } else {
+            try {
+                LocalExecutionSettings::saveServiceUserId($userId);
+                $message = 'GLPI A service user saved successfully.';
+                $messageClass = 'success';
+            } catch (\Throwable $exception) {
+                $message = $exception->getMessage();
+                $messageClass = 'warning';
+            }
+        }
+    }
+
     if (isset($_POST['save'])) {
         $connectionInput = GlpiBConnection::fromInput([
             'id'         => $_POST['id'] ?? '',
@@ -79,6 +97,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'base_url'   => $_POST['base_url'] ?? '',
             'app_token'  => $_POST['app_token'] ?? '',
             'user_token' => $_POST['user_token'] ?? '',
+            'agent_endpoint' => $_POST['agent_endpoint'] ?? '',
+            'agent_token' => $_POST['agent_token'] ?? '',
+            'agent_allow_lab_http' => $_POST['agent_allow_lab_http'] ?? '',
             'active'     => $_POST['active'] ?? '',
         ]);
 
@@ -130,6 +151,7 @@ $connection = $editConnection ?? [
 ];
 
 $workerInterval = WorkerSettings::getInterval();
+$localExecutionUserId = LocalExecutionSettings::getServiceUserId();
 
 if (class_exists('Html') && method_exists('Html', 'header')) {
     $previousCronTimer = $_SESSION['glpicrontimer'] ?? null;
@@ -188,8 +210,6 @@ echo '</tr>';
 echo '</table>';
 
 echo '<p class="assetsync-actions"><a class="submit" href="' . $html(Menu::syncActivityUrl()) . '">Open Sync Activity</a></p>';
-\GlpiPlugin\Assetsync20\AgentActivity::render();
-
 /* Worker settings */
 echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
 echo '<table class="tab_cadre_fixe">';
@@ -209,6 +229,19 @@ if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
 
 echo '<button type="submit" name="save_worker_settings" value="1" class="submit">Save Worker Settings</button>';
 echo '</td></tr>';
+echo '</table>';
+echo '</form>';
+
+/* GLPI A internal execution identity */
+echo '<form method="post" action="' . $html(Menu::configUrl()) . '">';
+echo '<table class="tab_cadre_fixe">';
+echo '<tr><th colspan="2">GLPI A authorised representative (inbound writes)</th></tr>';
+echo '<tr><td><label for="local_execution_user_id">GLPI A service user ID</label></td>';
+echo '<td><input type="number" id="local_execution_user_id" name="local_execution_user_id" min="1" step="1" required value="' . $localExecutionUserId . '"><br><small>Used only when a GLPI B-owned mapped field updates GLPI A. GLPI A History records this user.</small></td></tr>';
+if (class_exists('Session') && method_exists('Session', 'getNewCSRFToken')) {
+    echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">';
+}
+echo '<tr><td colspan="2" class="center"><button type="submit" name="save_local_execution_settings" value="1" class="submit">Save GLPI A service user</button></td></tr>';
 echo '</table>';
 echo '</form>';
 
@@ -309,6 +342,12 @@ echo '<td><input type="password" id="user_token" name="user_token" value="" size
 
 echo '<tr><td>Saved user token</td>';
 echo '<td>' . ($connection['user_token'] !== '' ? 'Yes' : 'No') . '</td></tr>';
+
+echo '<tr><th colspan="2">Optional: Agent B execution (recommended for writes)</th></tr>';
+echo '<tr><td><label for="agent_endpoint">Agent B command URL</label></td><td><input type="url" id="agent_endpoint" name="agent_endpoint" value="' . $html($connection['agent_endpoint'] ?? '') . '" size="60" placeholder="https://glpi-b.example/plugins/assetsync20agent/front/agent-command.php"><br><small>When configured, Computer Comment updates are executed and verified by Agent B.</small></td></tr>';
+echo '<tr><td><label for="agent_token">Agent B command token</label></td><td><input type="password" id="agent_token" name="agent_token" value="" size="60" autocomplete="new-password"></td></tr>';
+echo '<tr><td>Saved Agent B command token</td><td>' . (($connection['agent_token'] ?? '') !== '' ? 'Yes' : 'No') . '</td></tr>';
+echo '<tr><td><label for="agent_allow_lab_http">Allow local-lab HTTP</label></td><td><input type="checkbox" id="agent_allow_lab_http" name="agent_allow_lab_http" value="1"' . (!empty($connection['agent_allow_lab_http']) ? ' checked' : '') . '> Local Docker only; never production.</td></tr>';
 
 echo '<tr><td><label for="active">Active</label></td>';
 echo '<td><input type="checkbox" id="active" name="active" value="1"' . ($connection['active'] ? ' checked' : '') . '></td></tr>';

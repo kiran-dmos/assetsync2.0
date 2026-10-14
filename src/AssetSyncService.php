@@ -995,14 +995,21 @@ final class AssetSyncService
                 return;
             }
         }
+        $agentReceiptMessage = '';
         if ($nativeChanges !== []) {
-            $updateResult = $this->callRemote('updateItem', [$connection, $itemtype, $remoteItemsId, $nativeChanges]);
+            $updateResult = AgentCommandClient::update($connection, $itemtype, $remoteItemsId, $nativeChanges, $ordinaryRemoteBefore);
             if (!$this->remoteSucceeded($updateResult)) {
                 $this->handleRemoteFailure($job, $route['id'], $updateResult, $attempts, $remoteItemsId);
                 return;
             }
             if (isset($updateResult['item']) && is_array($updateResult['item'])) {
                 $ordinaryRemoteAfter = $updateResult['item'];
+            }
+            if (isset($updateResult['receipt']) && is_array($updateResult['receipt'])) {
+                $changed = implode(', ', array_map('strval', $updateResult['receipt']['changed'] ?? []));
+                $unchanged = implode(', ', array_map('strval', $updateResult['receipt']['unchanged'] ?? []));
+                $agentReceiptMessage = ' Agent B receipt: changed [' . ($changed !== '' ? $changed : 'none')
+                    . ']; unchanged [' . ($unchanged !== '' ? $unchanged : 'none') . '].';
             }
         }
 
@@ -1081,7 +1088,7 @@ final class AssetSyncService
             'confirmed_identity'   => AgentInbox::identity($connection),
         ]);
         $job['agent_changed'] = $prepared['billing_changed'] || $changes['local'] !== [] || $changes['remote'] !== [];
-        $finished = $saved && AssetSyncQueue::finish($job, 'Asset synchronized.', $remoteItemsId);
+        $finished = $saved && AssetSyncQueue::finish($job, 'Asset synchronized.' . $agentReceiptMessage, $remoteItemsId);
         $this->recordJobOutcome('succeeded', $saved && $finished);
     }
 
@@ -1496,47 +1503,49 @@ final class AssetSyncService
      */
     private function updateLocalAsset(string $itemtype, int $itemsId, array $fields): bool
     {
-        $customFields = array_filter($fields, static fn (string $key): bool => FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
-        try {
-            if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields, true)) {
+        return InternalGlpiExecutor::run(function () use ($itemtype, $itemsId, $fields): bool {
+            $customFields = array_filter($fields, static fn (string $key): bool => FieldsText::isCustom($key), ARRAY_FILTER_USE_KEY);
+            try {
+                if (!FieldsText::updateLocal($itemtype, $itemsId, $customFields, true)) {
+                    return false;
+                }
+            } catch (\RuntimeException $error) {
+                throw $error;
+            } catch (\Throwable) {
                 return false;
             }
-        } catch (\RuntimeException $error) {
-            throw $error;
-        } catch (\Throwable) {
-            return false;
-        }
-        $fields = array_diff_key($fields, $customFields);
-        if ($fields === [] || !class_exists($itemtype)) {
-            return true;
-        }
-
-        $item = new $itemtype();
-        if (!method_exists($item, 'update')) {
-            return false;
-        }
-
-        $before = $this->assertLocalNativeAccess($itemtype, $itemsId);
-        $input = array_merge(['id' => $itemsId], $fields);
-        if (!$item->update($input) || !$item->getFromDB($itemsId)) {
-            return false;
-        }
-        foreach ($fields as $key => $value) {
-            $descriptor = NativeField::local($itemtype, $key);
-            $persisted = $item->fields[$key] ?? null;
-            $matches = $descriptor['type'] === 'dropdown'
-                ? NativeField::referenceId($persisted) === NativeField::referenceId($value)
-                : FieldsText::normalizeReadValue($descriptor['type'], $persisted) === FieldsText::normalizeReadValue($descriptor['type'], $value);
-            if (!array_key_exists($key, $item->fields) || !$matches) {
-                throw new \RuntimeException('GLPI A did not persist native field: ' . $key);
+            $fields = array_diff_key($fields, $customFields);
+            if ($fields === [] || !class_exists($itemtype)) {
+                return true;
             }
-        }
-        try {
-            AssetUuidService::ordinaryWriteVerified($itemtype, $itemsId, 'a', $before, $item->fields, $fields);
-        } catch (\Throwable) {
-            // UUID evidence is ancillary to this already verified ordinary write.
-        }
-        return true;
+
+            $item = new $itemtype();
+            if (!method_exists($item, 'update')) {
+                return false;
+            }
+
+            $before = $this->assertLocalNativeAccess($itemtype, $itemsId);
+            $input = array_merge(['id' => $itemsId], $fields);
+            if (!$item->update($input) || !$item->getFromDB($itemsId)) {
+                return false;
+            }
+            foreach ($fields as $key => $value) {
+                $descriptor = NativeField::local($itemtype, $key);
+                $persisted = $item->fields[$key] ?? null;
+                $matches = $descriptor['type'] === 'dropdown'
+                    ? NativeField::referenceId($persisted) === NativeField::referenceId($value)
+                    : FieldsText::normalizeReadValue($descriptor['type'], $persisted) === FieldsText::normalizeReadValue($descriptor['type'], $value);
+                if (!array_key_exists($key, $item->fields) || !$matches) {
+                    throw new \RuntimeException('GLPI A did not persist native field: ' . $key);
+                }
+            }
+            try {
+                AssetUuidService::ordinaryWriteVerified($itemtype, $itemsId, 'a', $before, $item->fields, $fields);
+            } catch (\Throwable) {
+                // UUID evidence is ancillary to this already verified ordinary write.
+            }
+            return true;
+        });
     }
 
     private function assertLocalNativeAccess(string $itemtype, int $itemsId, ?int $expectedEntity = null): array
@@ -1545,10 +1554,6 @@ final class AssetSyncService
         if (!$item->getFromDB($itemsId) || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
             || ($expectedEntity !== null && (int) ($item->fields['entities_id'] ?? -1) !== $expectedEntity)) {
             throw new \RuntimeException('GLPI A asset is missing, deleted, or changed entity scope.');
-        }
-        $cron = class_exists('Session') && method_exists('Session', 'isCron') && \Session::isCron();
-        if (!$cron && (!method_exists($item, 'can') || !$item->can($itemsId, defined('UPDATE') ? UPDATE : 2))) {
-            throw new \RuntimeException('GLPI A asset update permission denied.');
         }
         return $item->fields;
     }
