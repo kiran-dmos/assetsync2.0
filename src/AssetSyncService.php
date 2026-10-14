@@ -810,7 +810,7 @@ final class AssetSyncService
                     }
                     $customMetadata = $validation['metadata'] ?? [];
                 }
-                $createResult = $this->callRemote('createItem', [$connection, $itemtype, $createInput]);
+                $createResult = AgentCommandClient::create($connection, $itemtype, $createInput);
                 if ((int) ($createResult['id'] ?? 0) > 0 && AssetSyncQueue::owns($job)) {
                     // A later readback or custom write can fail after the native POST succeeded.
                     if (!AssetSyncLink::saveStatus($itemtype, $itemsId, $connectionId, $route['id'],

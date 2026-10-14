@@ -9,12 +9,54 @@ final class InternalGlpiExecutor
 {
     /** @var array<string,string> */
     private const ALLOWED_FIELDS = [
+        'entities_id'       => 'int',
+        'serial'            => 'string',
         'name'              => 'string',
         'otherserial'       => 'string',
         'comment'           => 'string',
         'computertypes_id'  => 'int',
         'computermodels_id' => 'int',
     ];
+
+    /**
+     * Creates one Computer as the dedicated Agent B account. The serial is checked again
+     * locally so a retry or concurrent worker can never manufacture a second match.
+     *
+     * @param array<string,mixed> $input
+     * @return array{changed:list<string>,unchanged:list<string>,before:array<string,mixed>,after:array<string,mixed>,id:int}
+     */
+    public static function createComputer(int $serviceUserId, array $input): array
+    {
+        if (!isset($input['entities_id'], $input['serial']) || trim((string) $input['serial']) === '' || array_diff_key($input, self::ALLOWED_FIELDS) !== []) {
+            throw new \RuntimeException('Creation requires an entity, immutable serial, and only approved Computer fields.');
+        }
+        $user = self::serviceUser($serviceUserId);
+        $write = [];
+        foreach ($input as $field => $value) {
+            $type = self::ALLOWED_FIELDS[$field];
+            if (($type === 'string' && !is_string($value)) || ($type === 'int' && filter_var($value, FILTER_VALIDATE_INT) === false)) {
+                throw new \RuntimeException('Invalid value for Computer field: ' . $field);
+            }
+            $write[$field] = self::normalise($field, $value);
+        }
+        if ((int) $write['entities_id'] < 0) { throw new \RuntimeException('Invalid target entity.'); }
+        self::assertSerialAvailable((string) $write['serial']);
+        $computer = new \Computer();
+        $id = self::runAs($user, static function () use ($computer, $write): int {
+            $id = $computer->add($write);
+            if (!is_numeric($id) || (int) $id <= 0) { throw new \RuntimeException('GLPI B rejected the internal Computer creation.'); }
+            return (int) $id;
+        });
+        if (!$computer->getFromDB($id) || !empty($computer->fields['is_deleted']) || !empty($computer->fields['is_template'])) {
+            throw new \RuntimeException('GLPI B did not persist the Computer creation.');
+        }
+        $after = [];
+        foreach ($write as $field => $value) {
+            $after[$field] = self::normalise($field, $computer->fields[$field] ?? null);
+            if ($after[$field] !== $value) { throw new \RuntimeException('GLPI B did not persist Computer field: ' . $field); }
+        }
+        return ['id' => $id, 'changed' => array_keys($write), 'unchanged' => [], 'before' => [], 'after' => $after];
+    }
 
     /**
      * Executes the approved Computer fields through GLPI's own update API.
@@ -29,10 +71,7 @@ final class InternalGlpiExecutor
         if ($serviceUserId <= 0) {
             throw new \RuntimeException('Agent B service user is not configured.');
         }
-        $user = new \User();
-        if (!$user->getFromDB($serviceUserId) || !empty($user->fields['is_deleted'])) {
-            throw new \RuntimeException('Agent B service user is unavailable.');
-        }
+        $user = self::serviceUser($serviceUserId);
         $computer = new \Computer();
         if (!$computer->getFromDB($computerId) || !empty($computer->fields['is_deleted']) || !empty($computer->fields['is_template'])) {
             throw new \RuntimeException('Target Computer is unavailable.');
@@ -90,7 +129,24 @@ final class InternalGlpiExecutor
     }
 
     /** Ensures GLPI's own History records the dedicated service account. */
-    private static function runAs(\User $user, callable $operation): void
+    private static function serviceUser(int $serviceUserId): \User
+    {
+        if ($serviceUserId <= 0) { throw new \RuntimeException('Agent B service user is not configured.'); }
+        $user = new \User();
+        if (!$user->getFromDB($serviceUserId) || !empty($user->fields['is_deleted'])) { throw new \RuntimeException('Agent B service user is unavailable.'); }
+        return $user;
+    }
+
+    private static function assertSerialAvailable(string $serial): void
+    {
+        global $DB;
+        if (!isset($DB) || !method_exists($DB, 'request')) { throw new \RuntimeException('Cannot verify the Computer serial before creation.'); }
+        foreach ($DB->request(['SELECT' => ['id'], 'FROM' => 'glpi_computers', 'WHERE' => ['serial' => $serial, 'is_deleted' => 0, 'is_template' => 0], 'LIMIT' => 1]) as $_row) {
+            throw new \RuntimeException('A GLPI B Computer already uses this serial.');
+        }
+    }
+
+    private static function runAs(\User $user, callable $operation): mixed
     {
         $saved = [];
         foreach (['glpiID', 'glpiname', 'glpifriendlyname'] as $key) {

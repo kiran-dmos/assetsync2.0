@@ -55,7 +55,7 @@ foreach (['command_token' => 'Command token shared with GLPI A (blank keeps curr
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key . '" type="password" autocomplete="off" size="72"></td></tr>';
 }
 echo '</table><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_execution" value="1" class="submit">Save authorised-representative settings</button></form>';
-echo '<p>Command receiver URL: <code>/plugins/assetsync20agent/front/agent-command.php</code>. First release accepts only Computer Comment updates and returns a verified receipt.</p>';
+echo '<p>Command receiver URL: <code>/plugins/assetsync20agent/front/agent-command.php</code>. It accepts approved Computer updates and safe creation (entity, immutable Serial, Name, Inventory Number, Type, Model, and Comment), returning a verified receipt.</p>';
 echo '<p>Last worker cycle: ' . (!empty($settings['worker_seen']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['worker_seen'])) . ' UTC' : 'Never') . '</p>';
 echo '<p>Reconciliation: ' . $html(in_array($settings['reconcile_status'] ?? '', ['ok', 'degraded'], true) ? $settings['reconcile_status'] : 'Not recorded')
     . '. Last health acknowledgement: ' . (!empty($settings['health_ack']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['health_ack'])) . ' UTC' : 'Never') . '</p>';
