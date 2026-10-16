@@ -11,7 +11,7 @@ use GlpiPlugin\Assetsync20\FieldMapping;
  * GLPI bootstrap for the assetsync2.0 plugin.
  */
 
-define('PLUGIN_ASSETSYNC20_VERSION', '0.6.5');
+define('PLUGIN_ASSETSYNC20_VERSION', '0.7.0');
 define('PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION', '11.0.0');
 define('PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION', '12.0.0');
 define('PLUGIN_ASSETSYNC20_MIN_PHP_VERSION', '8.2.0');
@@ -21,6 +21,9 @@ require_once __DIR__ . '/src/autoload.php';
 function plugin_assetsync20_boot(): void
 {
     if (class_exists(\Glpi\Http\SessionManager::class)) {
+        \Glpi\Http\SessionManager::registerPluginStatelessPath('assetsync20', '#^/front/agent-api\\.php$#D');
+        \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts('assetsync20', '#^/front/agent-api\\.php$#D',
+            \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
         // This single machine endpoint authenticates its own bearer credential, without cookies.
         \Glpi\Http\SessionManager::registerPluginStatelessPath(Plugin::KEY, '#^/front/agent-notify\\.php$#D');
         \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(Plugin::KEY, '#^/front/agent-notify\\.php$#D',

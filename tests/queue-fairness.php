@@ -220,7 +220,11 @@ namespace {
     AssetSyncQueue::enqueue('Computer', 501, 'removed', 'removed', 'hash', null);
     AssetSyncQueue::enqueue('Computer', 502, 'disabled', 'disabled', 'hash', null);
     fairCheck(AssetSyncQueue::dueConnectionIds() === ['disabled', 'removed'], 'Queue discovery must include disabled and orphan IDs, with no config join.');
-    fairCheck($service->processQueue(2) === 2 && array_column($GLOBALS['DB']->tables[AssetSyncQueue::TABLE], 'status') === ['blocked', 'blocked'], 'Missing/inactive connections must be handled and blocked, not stranded.');
+    $disabled = $GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['glpi_b_connection_id' => 'disabled']);
+    fairCheck($service->processQueue(2) === 1 && array_column($GLOBALS['DB']->tables[AssetSyncQueue::TABLE], 'status') === ['blocked', 'pending'],
+        'Orphan jobs must be blocked; deliberately disabled connection jobs remain pending without a claim.');
+    fairCheck($GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['glpi_b_connection_id' => 'disabled']) === $disabled,
+        'Disabled pending work preserves every retained field while orphan work is handled.');
 
     $service = fairSetup(['a' => 1, 'b' => 0, 'c' => 0]);
     fairAsset(201, 2);

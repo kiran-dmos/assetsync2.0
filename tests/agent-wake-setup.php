@@ -30,7 +30,7 @@ namespace {
     }
     class User {
         public array $fields = [];
-        public function getFromDB(int $id): bool { $this->fields = ['is_active' => 1, 'is_deleted' => 0, '2fa' => null, '2fa_unenforced' => 0]; return true; }
+        public function getFromDB(int $id): bool { $this->fields = ['name' => 'fixture', 'is_active' => 1, 'is_deleted' => 0, '2fa' => null, '2fa_unenforced' => 0]; return true; }
         public static function dropdown(array $options): void { echo '<select name="service_user"><option>Fixture</option></select>'; }
     }
     class Dropdown {

@@ -442,9 +442,10 @@ namespace {
     require __DIR__ . '/../assetsync20agent/setup.php';
     plugin_assetsync20agent_boot();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
-        scalarCheck(preg_match($pattern, '/front/agent-wake.php') === 1
-            && preg_match($pattern, '/front/agent-wake.php/other') === 0 && preg_match($pattern, '/front/config.php') === 0,
-            'Actual boot registration exempts only the exact wake route.');
+        scalarCheck((preg_match($pattern, '/front/agent-wake.php') === 1 || preg_match($pattern, '/front/agent-api.php') === 1)
+            && preg_match($pattern, '/front/agent-wake.php/other') === 0 && preg_match($pattern, '/front/config.php') === 0
+            && preg_match($pattern, '/front/agent-api.php/other') === 0 && preg_match($pattern, '/front/agent-api.phpx') === 0,
+            'Actual boot registration exempts only the exact machine routes.');
     }
     WakeWire::$wallOffset += 10;
     $attempt = AgentWake::plan(true, hrtime(true) + 20_000_000_000);

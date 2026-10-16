@@ -174,7 +174,7 @@ final class TaskJournal
     {
         global $DB;
         $response = self::send($settings, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'], 'result' => $result], $deadline);
-        if (in_array($response['status'], [401, 403, 409], true)) {
+        if (empty($response['auth_failed']) && in_array($response['status'], [401, 403, 409], true)) {
             // Retain the result and rejection separately. Rejected report is not an ACK or write authorization.
             return $DB->update(self::TABLE, ['report_status' => 'rejected'], ['id' => $task['id'], 'hash' => $task['hash']]);
         }
@@ -186,12 +186,19 @@ final class TaskJournal
     public static function send(array $settings, array $payload, int $deadline, bool $legacyPull = false): array
     {
         Wake::assertCurrent();
-        if (!Settings::validEndpoint($settings['endpoint'] ?? '') || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
+        if (!in_array($settings['agent_auth'] ?? 'legacy_bearer', ['legacy_bearer', 'glpi_session'], true)) {
+            return ['status' => 0, 'body' => []];
+        }
+        if ((($settings['agent_auth'] ?? 'legacy_bearer') !== 'glpi_session' && !Settings::validEndpoint($settings['endpoint'] ?? ''))
+            || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
         if (($payload['kind'] ?? '') === 'pull') {
             $payload['task_versions'] = $legacyPull ? [1, 2, 3, 4, 5] : [1, 2, 3, 4, 5, 6];
             $payload['recovery_version'] = 1;
         }
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $payload[$key] = $settings[$key]; }
+        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
+            return AgentSession::send($settings, 'task', $payload, $deadline);
+        }
         $encoded = json_encode($payload, JSON_THROW_ON_ERROR);
         if (strlen($encoded) > 65536) { throw new \RuntimeException('Task body exceeds limit.'); }
         $url = substr($settings['endpoint'], 0, -strlen('agent-notify.php')) . 'agent-task.php';

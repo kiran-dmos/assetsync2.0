@@ -554,7 +554,8 @@ final class AssetSyncService
                         break;
                     }
                     $this->saveLastQueueVisit($connectionId);
-                    if (isset($this->pausedConnections[$connectionId])) {
+                    $connection = GlpiBConnection::find($connectionId);
+                    if (isset($this->pausedConnections[$connectionId]) || ($connection !== null && !$connection['active'])) {
                         unset($connectionIds[$index]);
                         continue;
                     }

@@ -97,10 +97,13 @@ foreach (['outscope', 'deleted', 'missing', 'disabled'] as $kind) {
         foreach (['a', 'b', 'conflicted'] as $id) { GlpiBConnection::save(['id' => $id, 'active' => false]); }
     }
     $GLOBALS['DB']->sqlQueries = [];
+    $disabled = $GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['glpi_b_connection_id' => 'disabled']);
     AssetChangeHook::onUpdate($item);
     hookCheck(array_column(hookRows(), 'glpi_b_connection_id') === ['removed', 'disabled'], 'Unscoped/deleted/missing/disabled assets must only notify existing queue identities.');
     $writes = array_values(array_filter($GLOBALS['DB']->sqlQueries, static fn ($sql) => str_starts_with($sql, 'UPDATE `')));
-    hookCheck(count($writes) === 2, 'Existing removed/disabled identities must be notified with UPDATE only.');
+    hookCheck(count($writes) === 1, 'Only the orphan identity is notified; deliberately disabled retained work receives no UPDATE.');
+    hookCheck($GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['glpi_b_connection_id' => 'disabled']) === $disabled,
+        'Asset-save hooks preserve every field of a disabled connection queue identity.');
 }
 
 $item = hookSetup();

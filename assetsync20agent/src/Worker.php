@@ -18,6 +18,7 @@ final class Worker
         }
         try {
             $deadline = min($deadline ?? PHP_INT_MAX, hrtime(true) + 20_000_000_000);
+            AgentSession::begin($deadline);
             if (hrtime(true) >= $deadline) { return 0; }
             if ($admit !== null) { $admit(); }
             $settings = Wake::settings();
@@ -32,7 +33,7 @@ final class Worker
                 \Config::setConfigurationValues(Settings::CONTEXT, ['reconcile_status' => 'degraded']);
             }
             $settings = Wake::settings();
-            if (hrtime(true) < $deadline && Settings::validEndpoint($settings['endpoint'] ?? '') && !empty($settings['token'])
+            if (hrtime(true) < $deadline && Settings::transportReady($settings)
                 && (time() - (int) ($settings['health_attempt'] ?? 0) >= 60
                     || ($settings['health_reported_status'] ?? '') !== ($settings['reconcile_status'] ?? 'degraded'))) {
                 $health = ['kind' => 'health', 'registration' => $settings['registration'], 'generation' => $settings['generation'],
@@ -51,7 +52,7 @@ final class Worker
             $count = 0;
             while ($count < 20 && hrtime(true) + 500_000_000 < $deadline) {
                 $settings = Wake::settings();
-                if (!Settings::validEndpoint($settings['endpoint'] ?? '') || empty($settings['generation']) || empty($settings['token'])) {
+                if (!Settings::transportReady($settings) || empty($settings['generation'])) {
                     break;
                 }
                 Wake::assertCurrent();
@@ -81,6 +82,7 @@ final class Worker
             \Config::setConfigurationValues(Settings::CONTEXT, ['worker_seen' => (string) time()]);
             return $count;
         } finally {
+            AgentSession::end();
             Outbox::sql("SELECT RELEASE_LOCK({$quotedLock})");
         }
     }
@@ -175,7 +177,10 @@ final class Worker
     public static function send(array $settings, array $sent, int $deadline): array
     {
         Wake::assertCurrent();
-        if (!Settings::validEndpoint($settings['endpoint'])) {
+        if (!in_array($settings['agent_auth'] ?? 'legacy_bearer', ['legacy_bearer', 'glpi_session'], true)) {
+            return ['status' => 0, 'body' => []];
+        }
+        if (($settings['agent_auth'] ?? 'legacy_bearer') !== 'glpi_session' && !Settings::validEndpoint($settings['endpoint'])) {
             return ['status' => 0, 'body' => []];
         }
         $timeout = min(5000, max(1, (int) (($deadline - hrtime(true)) / 1_000_000)));
@@ -184,6 +189,9 @@ final class Worker
             : ['registration', 'generation', 'computer_id', 'revision', 'lifecycle'];
         if (($settings['mode'] ?? 'rest') === 'agent' && ($sent['kind'] ?? '') !== 'health') { $keys[] = 'itemtype'; }
         $payload = array_intersect_key($sent, array_flip($keys));
+        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
+            return AgentSession::send($settings, 'notify', $payload, $deadline);
+        }
         $curl = curl_init($settings['endpoint']);
         $body = '';
         try {

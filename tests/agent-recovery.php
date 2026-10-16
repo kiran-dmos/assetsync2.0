@@ -206,6 +206,18 @@ namespace {
     AgentTask::process(AssetSyncQueue::claimDue(1)[0], 'scalarApplyLocal');
     $old = AgentTask::outstanding('b');
     $DB->update(AgentTask::TABLE, ['state' => 'stale'], ['id' => $old['id']]);
+    $retained = $DB->firstRow(AgentTask::TABLE, ['id' => $old['id']]);
+    $savedConnections = Config::$values['plugin:assetsync20']['glpib_connections'];
+    $disabledConnections = json_decode($savedConnections, true, 32, JSON_THROW_ON_ERROR);
+    foreach ($disabledConnections as &$connection) { if ($connection['id'] === 'b') { $connection['active'] = false; } }
+    unset($connection);
+    Config::$values['plugin:assetsync20']['glpib_connections'] = json_encode($disabledConnections, JSON_THROW_ON_ERROR);
+    \GlpiPlugin\Assetsync20\GlpiBConnection::loadAll(true, false);
+    AgentTask::recoverStaleInspections(hrtime(true) + 1_000_000_000);
+    scalarCheck($DB->firstRow(AgentTask::TABLE, ['id' => $old['id']]) === $retained,
+        'Disabled connection recovery leaves all retained context and task state identical.');
+    Config::$values['plugin:assetsync20']['glpib_connections'] = $savedConnections;
+    \GlpiPlugin\Assetsync20\GlpiBConnection::loadAll(true, false);
     AgentTask::recoverStaleInspections(hrtime(true) - 1);
     scalarCheck(AgentTask::outstanding('b')['id'] === $old['id'], 'Expired recovery budget does no work.');
     AgentTask::recoverStaleInspections(hrtime(true) + 1_000_000_000);

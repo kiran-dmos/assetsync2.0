@@ -170,10 +170,15 @@ final class GlpiBConnection
         $wakeUrl = trim((string) ($input['wake_url'] ?? $current['wake_url'] ?? ''));
         $wakeToken = trim((string) ($input['wake_token'] ?? ''));
         if ($wakeToken === '') { $wakeToken = $current['wake_token'] ?? ''; }
-        if ($wakeEnabled && (!AgentWake::validUrl($wakeUrl) || !preg_match('/^[a-f0-9]{64}$/D', $wakeToken))) {
+        $agent = AgentSession::configuration($input, $current);
+        if ($agent['agent_auth'] === 'glpi_session' && $mode !== 'agent') {
+            throw new \InvalidArgumentException('Native agent authentication requires agent mode.');
+        }
+        if ($wakeEnabled && $agent['agent_auth'] === 'legacy_bearer'
+            && (!AgentWake::validUrl($wakeUrl) || !preg_match('/^[a-f0-9]{64}$/D', $wakeToken))) {
             throw new \InvalidArgumentException('Wake requires a direct HTTPS endpoint and a separate wake credential.');
         }
-        return [
+        return $agent + [
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
@@ -1538,6 +1543,14 @@ final class GlpiBConnection
 
             $connections[] = [
                 'mode'       => (string) ($savedConnection['mode'] ?? 'rest'),
+                'agent_auth' => (string) ($savedConnection['agent_auth'] ?? 'legacy_bearer'),
+                'agent_api_url' => (string) ($savedConnection['agent_api_url'] ?? ''),
+                'agent_peer_user' => (string) ($savedConnection['agent_peer_user'] ?? ''),
+                'agent_peer_api_client' => (string) ($savedConnection['agent_peer_api_client'] ?? ''),
+                'agent_peer_profile' => (string) ($savedConnection['agent_peer_profile'] ?? ''),
+                'agent_peer_entity' => (string) ($savedConnection['agent_peer_entity'] ?? ''),
+                'agent_app_token' => empty($savedConnection['agent_app_token']) ? '' : ((new \GLPIKey())->decrypt($savedConnection['agent_app_token']) ?? ''),
+                'agent_user_token' => empty($savedConnection['agent_user_token']) ? '' : ((new \GLPIKey())->decrypt($savedConnection['agent_user_token']) ?? ''),
                 'id'         => self::connectionId((string) ($savedConnection['id'] ?? '')),
                 'name'       => (string) ($savedConnection['name'] ?? ''),
                 'base_url'   => (string) ($savedConnection['base_url'] ?? ''),
@@ -1564,6 +1577,14 @@ final class GlpiBConnection
         foreach ($connections as $connection) {
             $savedConnections[] = [
                 'mode'       => (string) ($connection['mode'] ?? 'rest'),
+                'agent_auth' => (string) ($connection['agent_auth'] ?? 'legacy_bearer'),
+                'agent_api_url' => (string) ($connection['agent_api_url'] ?? ''),
+                'agent_peer_user' => (string) ($connection['agent_peer_user'] ?? ''),
+                'agent_peer_api_client' => (string) ($connection['agent_peer_api_client'] ?? ''),
+                'agent_peer_profile' => (string) ($connection['agent_peer_profile'] ?? ''),
+                'agent_peer_entity' => (string) ($connection['agent_peer_entity'] ?? ''),
+                'agent_app_token' => empty($connection['agent_app_token']) ? '' : (new \GLPIKey())->encrypt($connection['agent_app_token']),
+                'agent_user_token' => empty($connection['agent_user_token']) ? '' : (new \GLPIKey())->encrypt($connection['agent_user_token']),
                 'id'         => self::connectionId($connection['id']),
                 'name'       => $connection['name'],
                 'base_url'   => self::cleanBaseUrl($connection['base_url']),

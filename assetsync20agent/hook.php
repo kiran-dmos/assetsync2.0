@@ -15,6 +15,7 @@ function plugin_assetsync20agent_uninstall(): bool
 {
     // Watermarks and unacknowledged work survive uninstall. Reinstall requires new credentials.
     \Config::deleteConfigurationValues('plugin:assetsync20agent', ['endpoint', 'registration', 'generation', 'token', 'service_password',
-        'wake_enabled', 'wake_token_hash', 'wake_binding']);
+        'wake_enabled', 'wake_token_hash', 'wake_binding', 'agent_auth', 'agent_api_url', 'agent_app_token', 'agent_user_token',
+        'agent_peer_user', 'agent_peer_api_client', 'agent_peer_profile', 'agent_peer_entity']);
     return true;
 }

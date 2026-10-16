@@ -218,10 +218,10 @@ final class AgentInbox
     }
 
     /** No field values or caller-selected local IDs, routes, URLs or entities enter admission. */
-    public static function receive(array $event, string $token): array
+    public static function receive(array $event, string $token, ?AgentApi $api = null): array
     {
         global $DB;
-        if (!preg_match('/^[a-f0-9]{64}$/D', $token)) {
+        if ($api === null && !preg_match('/^[a-f0-9]{64}$/D', $token)) {
             return ['status' => 401];
         }
         self::sql('START TRANSACTION');
@@ -230,12 +230,14 @@ final class AgentInbox
                 . $DB->quote($event['registration']) . ' FOR UPDATE');
             $connection = $registration ? self::connection($registration['connection_id']) : null;
             if (!$registration || !$registration['active'] || !$connection
-                || !hash_equals($registration['token_hash'], hash('sha256', $token))
+                || ($api === null && (($connection['agent_auth'] ?? 'legacy_bearer') !== 'legacy_bearer'
+                    || !hash_equals($registration['token_hash'], hash('sha256', $token))))
                 || !hash_equals($registration['generation'], $event['generation'])
                 || !hash_equals($registration['connection_identity'], self::identity($connection))) {
                 self::sql('ROLLBACK');
                 return ['status' => 401];
             }
+            if ($api !== null) { $api->assertPeer($connection); }
             if (($event['kind'] ?? '') === 'health') {
                 $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
                 $routes = array_column(EntitySyncRoute::loadAll(true), null, 'id');
@@ -300,6 +302,7 @@ final class AgentInbox
             return self::ack($event);
         } catch (\Throwable $error) {
             $DB->doQuery('ROLLBACK');
+            if ($api !== null && ($error instanceof AgentApiResponse || $error instanceof \UnexpectedValueException)) { throw $error; }
             throw new \RuntimeException('Notification storage unavailable.', 0, $error);
         }
     }

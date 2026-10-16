@@ -56,7 +56,30 @@ foreach (['rest' => 'Notifications for REST', 'agent' => 'Bounded agent tasks'] 
     echo '<option value="' . $value . '"' . (($display['mode'] ?? 'rest') === $value ? ' selected' : '') . '>' . $label . '</option>';
 }
 echo '</select></td></tr>';
-foreach (['endpoint' => 'GLPI A HTTPS receiver URL', 'registration' => 'Registration', 'generation' => 'Generation'] as $key => $label) {
+echo '<tr><th><label for="agent_auth">Agent authentication</label></th><td><select id="agent_auth" name="agent_auth">';
+foreach (['legacy_bearer' => 'Legacy bearer', 'glpi_session' => 'GLPI native session'] as $value => $label) {
+    echo '<option value="' . $value . '"' . (($display['agent_auth'] ?? 'legacy_bearer') === $value ? ' selected' : '') . '>' . $label . '</option>';
+}
+echo '</select></td></tr>';
+echo '<tr><th><label for="agent_api_url">GLPI A Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
+    . $html($display['agent_api_url'] ?? '') . '"></td></tr>';
+foreach (['agent_app_token' => 'GLPI A app token', 'agent_user_token' => 'GLPI A user API token'] as $key => $label) {
+    echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key
+        . '" value="" autocomplete="new-password" size="60"> Saved: ' . (!empty($display[$key]) ? 'Yes' : 'No') . '</td></tr>';
+}
+echo '<tr><th>GLPI B user used by A</th><td>';
+User::dropdown(['name' => 'agent_peer_user', 'value' => (int) ($display['agent_peer_user'] ?? 0),
+    'right' => 'all', 'entity' => -1, 'condition' => ['is_active' => 1, 'is_deleted' => 0]]);
+echo '</td></tr><tr><th>GLPI B API client used by A</th><td>';
+Dropdown::show('APIClient', ['name' => 'agent_peer_api_client', 'value' => (int) ($display['agent_peer_api_client'] ?? 0),
+    'condition' => ['is_active' => 1]]);
+echo '</td></tr><tr><th>GLPI B profile used by A</th><td>';
+Dropdown::show('Profile', ['name' => 'agent_peer_profile', 'value' => (int) ($display['agent_peer_profile'] ?? 0),
+    'condition' => ['interface' => 'central']]);
+echo '</td></tr><tr><th>GLPI B exact entity grant used by A</th><td>';
+Dropdown::show('Entity', ['name' => 'agent_peer_entity', 'value' => (int) ($display['agent_peer_entity'] ?? -1)]);
+echo '</td></tr>';
+foreach (['endpoint' => 'Legacy GLPI A HTTPS receiver URL', 'registration' => 'Registration', 'generation' => 'Generation'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
         . '" type="' . ($key === 'token' ? 'password' : 'text') . '" autocomplete="off" size="72" value="'
         . ($key === 'token' ? '' : $html($display[$key] ?? '')) . '"></td></tr>';
@@ -81,7 +104,7 @@ try { $entities = Settings::entities($serviceUser, $serviceProfile); }
 catch (Throwable $error) { $entities = []; echo $html($error->getMessage()); }
 echo $html(implode(', ', $entities));
 echo '</td></tr>';
-foreach (['token' => 'Token (blank keeps current)', 'service_password' => 'Service password (blank keeps current)'] as $key => $label) {
+foreach (['token' => 'Legacy registration bearer token (blank keeps current)', 'service_password' => 'Service password (blank keeps current)'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
         . '" type="password" autocomplete="new-password" size="60" value=""></td></tr>';
 }
@@ -92,10 +115,12 @@ $wakeCurrent = false;
 try { $wakeCurrent = $wakeEnabled && hash_equals($settings['wake_binding'] ?? '', Settings::wakeBinding($settings)); }
 catch (Throwable) {}
 echo '<h3>Optional HTTPS wake</h3><p>A background worker is required. B can keep its CLI worker or receive bounded HTTPS wakes. Enabled or enforced service-account MFA is unsupported for HTTPS wake.</p>';
-echo '<p>Status: ' . ($wakeCurrent ? 'Enabled' : ($wakeEnabled ? 'Binding changed; issue a new key' : 'Disabled')) . '</p>';
+echo '<p>Status: ' . ($wakeCurrent ? 'Enabled' : ($wakeEnabled ? 'Binding changed; save wake setting again' : 'Disabled')) . '</p>';
 echo '<form method="post"><table class="tab_cadre_fixe"><tr><th><label for="wake_enabled">Allow HTTPS wake from A</label></th><td><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . ($wakeEnabled ? ' checked' : '') . '></td></tr></table>';
 echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_wake" value="1" class="btn btn-primary btn-sm">Save wake setting</button> ';
-echo '<button type="submit" name="rotate_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Rotate wake key</button> ';
+if (($settings['agent_auth'] ?? 'legacy_bearer') === 'legacy_bearer') {
+    echo '<button type="submit" name="rotate_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Rotate legacy wake key</button> ';
+}
 echo '<button type="submit" name="revoke_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Disable and revoke</button></form></fieldset>';
 if ($newWakeToken !== null) {
     echo '<p><label for="new_wake_key">New wake key (shown once)</label></p><input id="new_wake_key" type="text" readonly autocomplete="off" size="72" value="' . $html($newWakeToken) . '">';

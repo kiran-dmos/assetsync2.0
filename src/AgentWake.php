@@ -54,7 +54,9 @@ final class AgentWake
         // Wake eligibility is read-only; the ordinary loader may migrate legacy REST settings.
         foreach (GlpiBConnection::loadAll(false, false) as $connection) {
             if ($connection['active'] && GlpiBConnection::isAgent($connection) && !empty($connection['wake_enabled'])
-                && self::validUrl($connection['wake_url'] ?? '') && preg_match('/^[a-f0-9]{64}$/D', $connection['wake_token'] ?? '')) {
+                && (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session'
+                    ? AgentSession::validUrl($connection['agent_api_url'] ?? '')
+                    : (self::validUrl($connection['wake_url'] ?? '') && preg_match('/^[a-f0-9]{64}$/D', $connection['wake_token'] ?? '')))) {
                 try {
                     $binding = AgentTask::binding($connection['id']);
                     if (!$binding) { continue; }
@@ -109,7 +111,7 @@ final class AgentWake
     private static function fingerprint(array $work): string
     {
         return hash('sha256', json_encode([$work['request'], $work['connection']['wake_url'],
-            hash('sha256', $work['connection']['wake_token'])], JSON_THROW_ON_ERROR));
+            hash('sha256', $work['connection']['wake_token'] ?? ''), AgentSession::fingerprint($work['connection'])], JSON_THROW_ON_ERROR));
     }
 
     private static function backoff(array $state): array
@@ -182,7 +184,10 @@ final class AgentWake
         $connection = GlpiBConnection::find($work['connection']['id']);
         if (!$connection || !$connection['active'] || !GlpiBConnection::isAgent($connection) || empty($connection['wake_enabled'])
             || $connection['wake_url'] !== $work['connection']['wake_url'] || $connection['wake_token'] !== $work['connection']['wake_token']
-            || !self::validUrl($connection['wake_url']) || hrtime(true) >= $deadline) { return ['status' => 0, 'state' => 'deferred']; }
+            || AgentSession::fingerprint($connection) !== AgentSession::fingerprint($work['connection'])
+            || (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session'
+                ? !AgentSession::validUrl($connection['agent_api_url'] ?? '') : !self::validUrl($connection['wake_url']))
+            || hrtime(true) >= $deadline) { return ['status' => 0, 'state' => 'deferred']; }
         $binding = AgentTask::binding($connection['id']);
         if (!$binding) { return ['status' => 0, 'state' => 'deferred']; }
         $registration = AgentTask::registration($binding);
@@ -196,6 +201,18 @@ final class AgentWake
         if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
         if (AssetUuidOperation::hasAssetLocks() || !self::transactionIdle() || hrtime(true) >= $deadline) {
             return ['status' => 0, 'state' => 'deferred'];
+        }
+        if (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
+            $response = AgentSession::send($connection, 'wake', $work['request'], $deadline);
+            $body = $response['body'];
+            if ($response['status'] !== 200 || ($body['version'] ?? null) !== 1
+                || !in_array($body['state'] ?? '', ['completed', 'busy'], true)) {
+                return ['status' => $response['status'], 'state' => 'unavailable'];
+            }
+            foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
+                if (($body[$key] ?? null) !== $work['request'][$key]) { return ['status' => 0, 'state' => 'unavailable']; }
+            }
+            return ['status' => 200, 'state' => $body['state']];
         }
         $timeout = min(10000, max(1, (int) (($deadline - hrtime(true)) / 1_000_000)));
         $curl = curl_init($connection['wake_url']);

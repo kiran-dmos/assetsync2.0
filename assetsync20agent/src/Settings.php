@@ -13,7 +13,20 @@ final class Settings
         $settings = \Config::getConfigurationValues(self::CONTEXT);
         $settings['token'] = (new \GLPIKey())->decrypt($settings['token'] ?? '') ?? '';
         $settings['service_password'] = (new \GLPIKey())->decrypt($settings['service_password'] ?? '') ?? '';
+        foreach (['agent_app_token', 'agent_user_token'] as $key) {
+            $settings[$key] = (new \GLPIKey())->decrypt($settings[$key] ?? '') ?? '';
+        }
         return $settings;
+    }
+
+    public static function transportReady(array $settings): bool
+    {
+        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
+            return AgentSession::validUrl($settings['agent_api_url'] ?? '')
+                && !empty($settings['agent_app_token']) && !empty($settings['agent_user_token']);
+        }
+        return ($settings['agent_auth'] ?? 'legacy_bearer') === 'legacy_bearer'
+            && self::validEndpoint($settings['endpoint'] ?? '') && !empty($settings['token']);
     }
 
     public static function validEndpoint(string $url): bool
@@ -28,20 +41,28 @@ final class Settings
     public static function save(array $input): void
     {
         $old = self::load();
-        $settings = [];
+        $settings = AgentSession::configuration($input, $old);
         $settings['mode'] = (string) ($input['mode'] ?? $old['mode'] ?? 'rest');
+        if ($settings['agent_auth'] === 'glpi_session' && $settings['mode'] !== 'agent') {
+            throw new \InvalidArgumentException('Native agent authentication requires agent mode.');
+        }
         if (!in_array($settings['mode'], ['rest', 'agent'], true)) {
             throw new \RuntimeException('Invalid agent mode.');
         }
         foreach (['endpoint', 'registration', 'generation', 'token'] as $key) {
             $settings[$key] = trim((string) ($input[$key] ?? ''));
         }
+        if ($settings['agent_auth'] === 'glpi_session' && $settings['endpoint'] === '') {
+            $settings['endpoint'] = (string) ($old['endpoint'] ?? '');
+        }
         if ($settings['token'] === '' && $settings['registration'] === ($old['registration'] ?? '')
             && $settings['generation'] === ($old['generation'] ?? '')) {
             $settings['token'] = $old['token'];
         }
-        if (!self::validEndpoint($settings['endpoint']) || !preg_match('/^[a-f0-9]{32}$/D', $settings['registration'])
-            || !preg_match('/^[a-f0-9]{32}$/D', $settings['generation']) || !preg_match('/^[a-f0-9]{64}$/D', $settings['token'])) {
+        if (!preg_match('/^[a-f0-9]{32}$/D', $settings['registration'])
+            || !preg_match('/^[a-f0-9]{32}$/D', $settings['generation'])
+            || ($settings['agent_auth'] === 'legacy_bearer' && (!self::validEndpoint($settings['endpoint'])
+                || !preg_match('/^[a-f0-9]{64}$/D', $settings['token'])))) {
             throw new \RuntimeException('Enter a direct HTTPS receiver URL and valid registration credentials.');
         }
         // The generation is part of each outbox claim; old requests cannot acknowledge a reset.
@@ -68,6 +89,9 @@ final class Settings
             $settings['service_password'] = (new \GLPIKey())->encrypt($password);
         }
         $settings['token'] = (new \GLPIKey())->encrypt($settings['token']);
+        foreach (['agent_app_token', 'agent_user_token'] as $key) {
+            $settings[$key] = (new \GLPIKey())->encrypt($settings[$key]);
+        }
         \Config::setConfigurationValues(self::CONTEXT, $settings);
     }
 
@@ -83,13 +107,14 @@ final class Settings
     public static function configureWake(bool $enabled, bool $rotate = false): ?string
     {
         $old = self::load();
-        if ($enabled && (($old['mode'] ?? '') !== 'agent' || !self::validEndpoint($old['endpoint'] ?? ''))) {
+        if ($enabled && (($old['mode'] ?? '') !== 'agent' || !self::transportReady($old))) {
             throw new \RuntimeException('Wake requires a configured agent binding.');
         }
         if ($enabled) { ServiceContext::httpAccount((int) ($old['service_user'] ?? 0)); }
         $binding = $enabled ? self::wakeBinding($old) : '';
-        $token = $enabled && ($rotate || empty($old['wake_token_hash']) || ($old['wake_binding'] ?? '') !== $binding) ? bin2hex(random_bytes(32)) : null;
-        $hash = $enabled ? ($token !== null ? hash('sha256', $token) : $old['wake_token_hash']) : '';
+        $native = ($old['agent_auth'] ?? 'legacy_bearer') === 'glpi_session';
+        $token = !$native && $enabled && ($rotate || empty($old['wake_token_hash']) || ($old['wake_binding'] ?? '') !== $binding) ? bin2hex(random_bytes(32)) : null;
+        $hash = $enabled ? ($token !== null ? hash('sha256', $token) : ($old['wake_token_hash'] ?? '')) : '';
         \Config::setConfigurationValues(self::CONTEXT, ['wake_enabled' => $enabled ? '1' : '0',
             'wake_token_hash' => $hash, 'wake_binding' => $binding]);
         $saved = self::load();
@@ -101,11 +126,14 @@ final class Settings
     public static function wakeBinding(array $settings): string
     {
         $binding = [];
-        foreach (['mode', 'installation', 'registration', 'generation', 'connection_id', 'endpoint',
-            'service_user', 'service_profile', 'service_name', 'service_password', 'token'] as $key) {
+        $keys = ['mode', 'installation', 'registration', 'generation', 'connection_id',
+            'service_user', 'service_profile', 'service_name', 'service_password'];
+        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'legacy_bearer') { $keys = array_merge($keys, ['endpoint', 'token']); }
+        foreach ($keys as $key) {
             if (!isset($settings[$key]) || (string) $settings[$key] === '') { throw new \RuntimeException('Wake binding is incomplete.'); }
             $binding[$key] = (string) $settings[$key];
         }
+        $binding['transport'] = AgentSession::fingerprint($settings);
         return hash('sha256', json_encode($binding, JSON_THROW_ON_ERROR));
     }
 

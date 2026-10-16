@@ -58,7 +58,7 @@ namespace {
         if (!$ok) { throw new RuntimeException($message); }
     };
     $settings = ['endpoint' => 'https://controller.invalid/plugins/assetsync20/front/agent-notify.php', 'token' => str_repeat('a', 64)];
-    $check(plugin_version_assetsync20agent()['version'] === '0.5.4', 'B advertises the HTTPS wake feature package version.');
+    $check(plugin_version_assetsync20agent()['version'] === '0.6.0', 'B advertises the native session feature package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
@@ -90,10 +90,12 @@ namespace {
     plugin_assetsync20_boot();
     plugin_init_assetsync20();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
-        $check((preg_match($pattern, '/front/agent-notify.php') === 1 || preg_match($pattern, '/front/agent-task.php') === 1) && preg_match($pattern, '/front/agents.php') === 0
+        $check((preg_match($pattern, '/front/agent-notify.php') === 1 || preg_match($pattern, '/front/agent-task.php') === 1
+            || preg_match($pattern, '/front/agent-api.php') === 1) && preg_match($pattern, '/front/agents.php') === 0
             && preg_match($pattern, '/front/agent-notify.php/other') === 0 && preg_match($pattern, '/front/agent-notify.phpx') === 0,
             'Actual GLPI stateless/firewall patterns exempt only the two exact machine endpoints.');
         $check(preg_match($pattern, '/front/agent-task.php/other') === 0 && preg_match($pattern, '/front/agent-task.phpx') === 0
+            && preg_match($pattern, '/front/agent-api.php/other') === 0 && preg_match($pattern, '/front/agent-api.phpx') === 0
             && preg_match($pattern, '/front/agent-pair.php') === 0, 'Task endpoint exemption excludes suffixes and protected pairing.');
     }
     $endpoint = file_get_contents(__DIR__ . '/../front/agent-notify.php');

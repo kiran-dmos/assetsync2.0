@@ -589,11 +589,45 @@ final class AgentTask
         return $task;
     }
 
+    public static function decode(string $body): array
+    {
+        if (strlen($body) > 65536) { throw new \InvalidArgumentException(); }
+        $request = json_decode($body, true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($request)) { throw new \InvalidArgumentException(); }
+        $keys = ($request['kind'] ?? '') === 'pull' ? ['kind', 'registration', 'generation', 'installation', 'connection_id']
+            : ['kind', 'registration', 'generation', 'installation', 'connection_id', 'id', 'hash', ($request['kind'] ?? '') === 'recovery' ? 'proof' : 'result'];
+        if (($request['kind'] ?? '') === 'pull' && array_key_exists('recovery_version', $request)) {
+            if ($request['recovery_version'] !== 1) { throw new \InvalidArgumentException(); }
+            $keys[] = 'recovery_version';
+        }
+        if (($request['kind'] ?? '') === 'recovery') {
+            if (!is_string($request['id'] ?? null) || !preg_match('/^[a-f0-9]{32}$/D', $request['id'])
+                || !is_string($request['hash'] ?? null) || !preg_match('/^[a-f0-9]{64}$/D', $request['hash'])
+                || !is_array($request['proof'] ?? null)) { throw new \InvalidArgumentException(); }
+        }
+        if (($request['kind'] ?? '') === 'pull' && array_key_exists('subscriptions_only', $request)) {
+            if (!is_bool($request['subscriptions_only'])) { throw new \InvalidArgumentException(); }
+            $keys[] = 'subscriptions_only';
+        }
+        if (($request['kind'] ?? '') === 'pull' && array_key_exists('task_versions', $request)) {
+            if (!is_array($request['task_versions']) || !array_is_list($request['task_versions'])
+                || count($request['task_versions']) > 6 || array_diff($request['task_versions'], [1, 2, 3, 4, 5, 6]) !== []
+                || count(array_filter($request['task_versions'], 'is_int')) !== count($request['task_versions'])) { throw new \InvalidArgumentException(); }
+            $keys[] = 'task_versions';
+        }
+        if (array_diff(array_keys($request), $keys) !== [] || array_diff($keys, array_keys($request)) !== []) { throw new \InvalidArgumentException(); }
+        foreach (['registration', 'generation', 'installation'] as $key) {
+            if (!is_string($request[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $request[$key])) { throw new \InvalidArgumentException(); }
+        }
+        if (!is_string($request['connection_id']) || strlen($request['connection_id']) > 255) { throw new \InvalidArgumentException(); }
+        return $request;
+    }
+
     /** Auth is checked for every pull/result, independently of notification ACKs. */
-    public static function exchange(array $request, string $token): array
+    public static function exchange(array $request, string $token, ?AgentApi $api = null): array
     {
         global $DB;
-        if (!preg_match('/^[a-f0-9]{64}$/D', $token) || !in_array($request['kind'] ?? '', ['pull', 'result', 'recovery'], true)) {
+        if (($api === null && !preg_match('/^[a-f0-9]{64}$/D', $token)) || !in_array($request['kind'] ?? '', ['pull', 'result', 'recovery'], true)) {
             return ['status' => 401];
         }
         AgentInbox::sql('START TRANSACTION');
@@ -602,7 +636,11 @@ final class AgentTask
             if (!$binding) { throw new \UnexpectedValueException('Unknown installation.'); }
             try { $registration = self::registration($binding); }
             catch (\RuntimeException $error) { throw new \UnexpectedValueException('Current registration unavailable.', 0, $error); }
-            if (!hash_equals($registration['token_hash'], hash('sha256', $token))
+            $connection = AgentInbox::connection($binding['connection_id']);
+            if (!$connection) { throw new \UnexpectedValueException('Agent connection unavailable.'); }
+            if ($api !== null) { $api->assertPeer($connection); }
+            if (($api === null && (($connection['agent_auth'] ?? 'legacy_bearer') !== 'legacy_bearer'
+                    || !hash_equals($registration['token_hash'], hash('sha256', $token))))
                 || ($request['generation'] ?? '') !== $registration['generation']
                 || ($request['installation'] ?? '') !== $binding['installation'] || ($request['connection_id'] ?? '') !== $binding['connection_id']) {
                 throw new \UnexpectedValueException('Task authentication failed.');
@@ -610,8 +648,14 @@ final class AgentTask
             $task = null;
             if ($request['kind'] === 'pull') {
                 $response = ['status' => 200, 'task' => null];
-                $task = ($request['subscriptions_only'] ?? false) === true ? null : AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
-                    . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 1 FOR UPDATE');
+                if (($request['subscriptions_only'] ?? false) !== true) {
+                    $candidates = AgentInbox::sql('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
+                        . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT '
+                        . ($api === null ? 1 : 50) . ' FOR UPDATE');
+                    while ($candidate = $DB->fetchAssoc($candidates)) {
+                        if (self::readableApiTask($api, $candidate)) { $task = $candidate; break; }
+                    }
+                }
                 if ($task && in_array($task['state'], ['accepted', 'executing'], true)) {
                     $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
                     if ($body['registration'] !== $registration['id'] || $body['generation'] !== $registration['generation']
@@ -701,6 +745,7 @@ final class AgentTask
                         'state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
                         'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.recovery_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]) as $candidate) {
                         $body = json_decode($candidate['body'], true, 32, JSON_THROW_ON_ERROR);
+                        if (!self::readableApiTask($api, $candidate)) { continue; }
                         // Rotate every examined row, including ineligible older bindings and kinds.
                         $candidateContext = json_decode($candidate['context'], true, 32, JSON_THROW_ON_ERROR);
                         $candidateContext['recovery_checked_at'] = (int) (microtime(true) * 1_000_000);
@@ -798,7 +843,7 @@ final class AgentTask
             }
             if ($request['kind'] === 'pull') {
                 $budget = 65536 - strlen(json_encode($response, JSON_THROW_ON_ERROR)) - 32;
-                if ($budget >= 512) { $response['subscriptions'] = self::subscriptions($binding, $registration, $budget); }
+                if ($budget >= 512) { $response['subscriptions'] = self::subscriptions($binding, $registration, $budget, $api); }
             }
             if (strlen(json_encode($response, JSON_THROW_ON_ERROR)) > 65536) { throw new \RuntimeException('Task response exceeds transport budget.'); }
             AgentInbox::sql('COMMIT');
@@ -807,7 +852,18 @@ final class AgentTask
     }
 
     /** The caller holds the binding lock. Lost pages replay fixed A-issued expiries on a later pass. */
-    private static function subscriptions(array $binding, array $registration, int $budget): array
+    private static function readableApiTask(?AgentApi $api, array $task): bool
+    {
+        if ($api === null) { return true; }
+        $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        if ($body['kind'] === 'discover') { return true; }
+        $pair = self::isMatch($body) ? null : self::taskPair($task);
+        $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+        $localId = (int) ($pair['local_id'] ?? $context['local_id'] ?? 0);
+        return $api->activateReadAsset($body['itemtype'] ?? 'Computer', $localId);
+    }
+
+    private static function subscriptions(array $binding, array $registration, int $budget, ?AgentApi $api = null): array
     {
         global $DB;
         $page = ['installation' => $binding['installation'], 'registration' => $registration['id'],
@@ -818,7 +874,7 @@ final class AgentTask
         $full = false;
         foreach ($DB->request(['FROM' => self::PAIRS, 'WHERE' => ['connection_id' => $binding['connection_id'],
             'id' => ['>', $cursor]], 'ORDER' => 'id ASC', 'LIMIT' => 50]) as $pair) {
-            try { self::scope($pair); $active = true; }
+            try { self::scope($pair); $active = $api === null || $api->activateReadAsset($pair['itemtype'], (int) $pair['local_id']); }
             catch (\Throwable) { $active = false; }
             if (!$active && (int) $pair['subscription_revision'] === 0) {
                 $cursor = $pair['id'];
@@ -844,6 +900,7 @@ final class AgentTask
         }
         if (!$full && $count < 50) { $cursor = ''; }
         self::write($DB->update(self::BINDINGS, ['subscription_cursor' => $cursor, 'subscription_revision' => $revision], ['connection_id' => $binding['connection_id']]));
+        $api?->restoreReadScope();
         return $page;
     }
 
@@ -2099,7 +2156,11 @@ final class AgentTask
     {
         global $DB;
         if (!$DB || !method_exists($DB, 'tableExists') || !$DB->tableExists(self::TABLE) || hrtime(true) >= $deadline) { return; }
-        $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+        $connections = array_column(array_filter(GlpiBConnection::loadAll(false, false),
+            static fn (array $connection): bool => $connection['active']), 'id');
+        if ($connections === []) { return; }
+        $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $connections,
+            'state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
             'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]);
         foreach ($tasks as $task) {
             if (hrtime(true) >= $deadline) { break; }

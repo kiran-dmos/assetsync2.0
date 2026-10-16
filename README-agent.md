@@ -1,5 +1,74 @@
 # GLPI B Agent
 
+## Native GLPI Session Authentication Prototype
+
+Controller **0.7.0** and agent **0.6.0** add an explicit transport selection under
+the existing agent mode. Existing installations default to **Legacy bearer**.
+Upgrade **B first, then A**, using GLPI's plugin Update action with AssetSync
+workers and automatic actions paused. Do not upgrade GLPI or Fields for this
+change, reset the existing installation identity, or discard journals and pending
+task evidence.
+
+Select **GLPI native session** on both installations. The peer HTTPS Agent API
+URL is the other installation's exact
+/plugins/assetsync20/front/agent-api.php (A) or
+/plugins/assetsync20agent/front/agent-api.php (B), including any GLPI URL prefix.
+The marketplace alias is also accepted. These URLs require direct HTTPS with a
+trusted certificate and matching hostname; redirects are disabled.
+
+For each direction configure the destination's native app token and user API
+token. Enable GLPI's legacy REST API and external-token authentication, and
+configure the API client's IP restrictions for the actual caller. On the receiver,
+explicitly select the expected **local user**, **local API client**, **profile** and
+**exact entity grant**. These are local selections, not IDs inferred from the peer.
+The profile must use the central interface and have a direct nonrecursive grant
+to the selected entity. Transport does not require global configuration-write
+permission. Existing pair, route, mapping and asset permissions still govern the
+operations, with profile/entity state loaded afresh on every request. Enabled or
+enforced peer MFA is unsupported and rejected before creating a native session.
+
+Native mode does not require a custom registration bearer token, a custom wake
+key, or the legacy notification URL. Registration, generation, installation and
+connection bindings are still required. B's dedicated local service account,
+profile and password remain necessary for its existing real GLPI model execution.
+Saved native app/user tokens and the service password are encrypted with GLPIKey;
+session tokens are held only in memory for one bounded turn.
+
+B reuses an A session across task pulls, results, recovery, notifications and health.
+A uses a B session for its bounded wake attempt. Native initialization and
+termination use the GLPI core API methods through narrow plugin adapters. The
+adapter allows only those lifecycle operations and the named plugin operations,
+never stock asset CRUD. It accepts credentials only in headers, rejects cookies
+and query credentials, and releases the API session lock before B executes local
+models. There are no REST asset writes or SQL asset writes added by this mode.
+
+Enable B's optional HTTPS wake after saving the complete native configuration,
+then enable wake on A's connection. Native wake does not generate a separate key.
+A transport or identity change invalidates admitted wake/subscription transport
+state; save the wake setting again before resuming. Task bodies, hashes, journals,
+asset-link identity and the existing glpi_a/glpi_b/native Both authority, matching,
+creation and metadata paths are retained.
+
+To roll back, explicitly select **Legacy bearer** on both sides, restore/confirm
+the saved legacy receiver URL and wake settings, and re-enable wake as needed.
+Retained custom secrets are available for rollback; a new native-only installation
+must configure legacy credentials before selecting legacy mode. Native mode never
+falls back to bearer or stock REST asset calls. Authentication failures retain
+durable results for a later worker turn; ambiguous operations are not automatically
+replayed.
+
+Offline verification:
+- php tests/agent-native-session.php
+- php tests/agent-native-api.php
+- php tests/agent-native-settings.php
+- php tests/agent-native-legacy.php
+
+These tests use mocked HTTP/core sessions and SQLite/GLPI doubles. They do not
+qualify actual HTTPS, core authentication, InnoDB concurrency, local model History,
+or deployed A/B interoperability. Count session initialization/termination
+separately from protocol operations when measuring requests; no live performance
+claim is made by the offline fixtures.
+
 This branch provides a separate `assetsync20agent` plugin for GLPI B. Install the
 controller (`assetsync20`) only on A. B stores typed asset fingerprints and a durable
 outbox; it has no mappings and cannot run the controller. In default REST mode A remains responsible
@@ -450,6 +519,26 @@ mocked transport, not live traffic measurement. These tests do not certify live
 GLPI/Fields behavior or InnoDB locking. The scalar executor uses Computer's own
 UPDATE permission check, avoiding a helper absent from Fields 1.24.2 and 1.24.4;
 independent verification on those installed versions remains required.
+
+Native transport accounts should be separate from B's local service writer.
+Give transport accounts only asset/container READ within their exact entity,
+without config UPDATE or asset UPDATE/CREATE. B's writer password stays on B;
+do not configure its user token on A, because that token also grants its ordinary
+GLPI REST permissions. A's selected entity is the initial session context. Each
+disclosed task or subscription requires a fresh direct, nonrecursive profile grant
+on its actual A source entity, asset READ and mapped Fields READ. Connections can
+retain routes across multiple directly granted entities. Revoking one route's
+read scope withholds its work; health and durable result receipts remain available.
+Native task admission examines at most 50 candidates per pull. Fifty denied
+candidates can hide an authorized later candidate; this bounded partial-permission
+case is not scale-qualified. The local prototype verifies two directly granted
+routes, not large mixed-permission queues. Disabled connections retain pending
+queue and task evidence: ordinary claim/recovery selection and asset-save hooks
+skip them before mutation; orphaned queue identities still block normally.
+
+The plugin endpoint issues a native core-authenticated session marked for its
+configured connection. A session created through stock `apirest.php/initSession`
+does not have that marker and is deliberately rejected by plugin operations.
 
 ## REST Notification Mode Setup
 

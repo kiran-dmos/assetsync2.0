@@ -242,5 +242,14 @@ namespace {
         'Malformed retained wake state without active wakes cannot stop a real ordinary REST job.');
     pauseEnded($service);
 
+    [$service, $remote] = pauseSetup(['a' => 1, 'b' => 1]);
+    GlpiBConnection::save(['id' => 'a', 'active' => false]);
+    $retained = $GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['glpi_b_connection_id' => 'a']);
+    pauseCheck($service->processQueue(10) === 1 && $remote->reads === ['b'],
+        'Normal queue processing skips disabled connections before claiming retained work.');
+    pauseCheck($GLOBALS['DB']->firstRow(AssetSyncQueue::TABLE, ['id' => $retained['id']]) === $retained,
+        'Disabled connection pending state, attempts, claim and timestamps remain identical.');
+    pauseEnded($service);
+
     echo "Connection pause tests passed ($checks checks).\n";
 }

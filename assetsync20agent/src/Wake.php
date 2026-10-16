@@ -31,7 +31,7 @@ final class Wake
         return $current;
     }
 
-    public static function authorize(array $request, string $token, array $settings): void
+    public static function authorize(array $request, string $token, array $settings, ?AgentApi $api = null): void
     {
         $keys = array_keys($request); sort($keys);
         if ($keys !== ['connection_id', 'generation', 'installation', 'kind', 'registration', 'version']
@@ -42,28 +42,30 @@ final class Wake
         if (!is_string($request['connection_id']) || $request['connection_id'] === '' || strlen($request['connection_id']) > 255
             || preg_match('/[\x00-\x20\x7f]/', $request['connection_id'])) { throw new \InvalidArgumentException('Invalid connection binding.'); }
         if (($settings['wake_enabled'] ?? '0') !== '1' || ($settings['mode'] ?? '') !== 'agent'
-            || !preg_match('/^[a-f0-9]{64}$/D', $token) || !preg_match('/^[a-f0-9]{64}$/D', $settings['wake_token_hash'] ?? '')
-            || !hash_equals($settings['wake_token_hash'], hash('sha256', $token))
+            || ($api === null && (($settings['agent_auth'] ?? 'legacy_bearer') !== 'legacy_bearer'
+                || !preg_match('/^[a-f0-9]{64}$/D', $token) || !preg_match('/^[a-f0-9]{64}$/D', $settings['wake_token_hash'] ?? '')
+                || !hash_equals($settings['wake_token_hash'], hash('sha256', $token))))
             || !hash_equals($settings['wake_binding'] ?? '', Settings::wakeBinding($settings))) {
             throw new \UnexpectedValueException('Wake authorization unavailable.');
         }
+        if ($api !== null) { $api->assertPeer($settings); }
         foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
             if ($request[$key] !== (string) ($settings[$key] ?? '')) { throw new \UnexpectedValueException('Wake binding changed.'); }
         }
     }
 
-    public static function receive(array $request, string $token): array
+    public static function receive(array $request, string $token, ?AgentApi $api = null): array
     {
         if (!defined(Worker::class . '::WAKE_VERSION') || Worker::WAKE_VERSION !== 1) {
             throw new \RuntimeException('HTTPS wake requires the upgraded worker.');
         }
         $deadline = hrtime(true) + self::SECONDS * 1_000_000_000;
-        self::authorize($request, $token, Settings::load());
+        self::authorize($request, $token, Settings::load(), $api);
         $admitted = false;
         try {
-            $count = (new Worker())->run($deadline, static function () use ($request, $token, &$admitted): void {
+            $count = (new Worker())->run($deadline, static function () use ($request, $token, $api, &$admitted): void {
             $current = Settings::load();
-            self::authorize($request, $token, $current);
+            self::authorize($request, $token, $current, $api);
             ServiceContext::httpAccount((int) $current['service_user']);
             $last = $current['wake_last_attempt'] ?? '0';
             if (!is_string($last) || !ctype_digit($last) || (int) $last > time()
@@ -72,7 +74,7 @@ final class Wake
             \Config::setConfigurationValues(Settings::CONTEXT, ['wake_last_attempt' => $now]);
             if ((Settings::load()['wake_last_attempt'] ?? null) !== $now) { throw new \RuntimeException('Wake rate storage unavailable.'); }
             $current = Settings::load();
-            self::authorize($request, $token, $current);
+            self::authorize($request, $token, $current, $api);
             self::$admittedSettings = $current;
             $admitted = true;
             });
