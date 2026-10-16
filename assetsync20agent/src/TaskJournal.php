@@ -49,18 +49,19 @@ final class TaskJournal
             try {
                 if (!$DB->insert(self::TABLE, ['id' => $id, 'hash' => $task['hash'], 'body' => json_encode($task, JSON_THROW_ON_ERROR),
                     'state' => 'executing', 'result' => '{}', 'created_at' => time(), 'registration' => $task['registration'],
-                    'generation' => $task['generation'], 'installation' => $task['installation'], 'connection_id' => $task['connection_id']])) { throw new \RuntimeException('Journal unavailable.'); }
+                    'generation' => $task['generation'], 'installation' => $task['installation'], 'connection_id' => $task['connection_id'],
+                    'report_status' => $task['version'] === 7 ? 'rest' : 'pending'])) { throw new \RuntimeException('Journal unavailable.'); }
                 Outbox::sql('COMMIT');
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
             $result = TaskExecutor::execute($task, $settings);
         }
-        if (($task['version'] === 5 && $task['kind'] === 'create') || ($task['version'] === 6 && $task['kind'] === 'apply')) {
+        if (($task['version'] === 5 && $task['kind'] === 'create') || (in_array($task['version'], [6, 7], true) && $task['kind'] === 'apply')) {
             // Creation and v6 apply write their result in the same transaction as their models.
             // A failed/ambiguous COMMIT must not report inferred success from an in-memory result.
             $saved = Outbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($id));
             if (!$saved) { throw new \RuntimeException($task['version'] === 5 ? 'Creation journal disappeared.' : 'V6 journal disappeared.'); }
             if ($saved['result'] !== '{}') { return json_decode($saved['result'], true, 32, JSON_THROW_ON_ERROR); }
-            if ($result['outcome'] === 'verified' || ($task['version'] === 6 && $result['outcome'] === 'unchanged')) { $result = ['outcome' => 'uncertain', 'changed' => []]; }
+            if ($result['outcome'] === 'verified' || (in_array($task['version'], [6, 7], true) && $result['outcome'] === 'unchanged')) { $result = ['outcome' => 'uncertain', 'changed' => []]; }
         }
         Outbox::sql('START TRANSACTION');
         try {

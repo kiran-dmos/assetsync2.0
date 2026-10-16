@@ -9,11 +9,13 @@ final class ServiceContext
 {
     public static function run(array $settings, callable $operation): mixed
     {
-        global $CFG_GLPI;
+        global $CFG_GLPI, $TRANSLATE;
         $session = $_SESSION ?? [];
         $sessionId = session_id();
         $sessionStatus = session_status();
         $config = $CFG_GLPI;
+        $translation = $TRANSLATE ?? null;
+        $request = $_REQUEST;
         $timezone = date_default_timezone_get();
         $type = $settings['itemtype'] ?? 'Computer';
         TargetScope::model($type);
@@ -82,6 +84,11 @@ final class ServiceContext
                 $_SESSION = $session;
                 date_default_timezone_set($timezone);
             } finally {
+                $_SESSION = $session;
+                $CFG_GLPI = $config;
+                $TRANSLATE = $translation;
+                $_REQUEST = $request;
+                date_default_timezone_set($timezone);
                 \Glpi\Search\SearchOption::clearSearchOptionCache($type);
             }
         }

@@ -8,7 +8,8 @@ function plugin_assetsync20agent_install(): bool
 {
     \GlpiPlugin\Assetsync20agent\Settings::install();
     return \GlpiPlugin\Assetsync20agent\Outbox::install() && \GlpiPlugin\Assetsync20agent\TaskJournal::install()
-        && \GlpiPlugin\Assetsync20agent\TargetScope::install();
+        && \GlpiPlugin\Assetsync20agent\TargetScope::install()
+        && \GlpiPlugin\Assetsync20agent\RestSettings::install() && \GlpiPlugin\Assetsync20agent\RestWork::install();
 }
 
 function plugin_assetsync20agent_uninstall(): bool

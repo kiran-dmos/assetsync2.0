@@ -168,7 +168,13 @@ final class GlpiBConnection
         }
         $wakeEnabled = $mode === 'agent' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
         $agent = $mode === 'agent' ? AgentSession::configuration($input, $current) : [];
+        $restPair = trim((string) ($input['agent_rest_pair'] ?? $current['agent_rest_pair'] ?? ''));
+        $restUrl = trim((string) ($input['agent_rest_url'] ?? $current['agent_rest_url'] ?? ''));
+        if ($restPair !== '' && ($mode !== 'agent' || !preg_match('/^[a-f0-9]{32}$/D', $restPair) || !RestSession::validUrl($restUrl))) {
+            throw new \InvalidArgumentException('REST records require an agent connection, confirmed pair ID and direct HTTPS apirest.php URL.');
+        }
         return $agent + [
+            'agent_rest_pair' => $restPair, 'agent_rest_url' => $restUrl,
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
@@ -1554,6 +1560,8 @@ final class GlpiBConnection
                 'mode'       => (string) ($savedConnection['mode'] ?? 'rest'),
                 'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($savedConnection['agent_api_url'] ?? ''),
+                'agent_rest_pair' => (string) ($savedConnection['agent_rest_pair'] ?? ''),
+                'agent_rest_url' => (string) ($savedConnection['agent_rest_url'] ?? ''),
                 'agent_peer_user' => (string) ($savedConnection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($savedConnection['agent_peer_api_client'] ?? ''),
                 'agent_peer_profile' => (string) ($savedConnection['agent_peer_profile'] ?? ''),
@@ -1586,6 +1594,8 @@ final class GlpiBConnection
                 'mode'       => (string) ($connection['mode'] ?? 'rest'),
                 'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($connection['agent_api_url'] ?? ''),
+                'agent_rest_pair' => (string) ($connection['agent_rest_pair'] ?? ''),
+                'agent_rest_url' => (string) ($connection['agent_rest_url'] ?? ''),
                 'agent_peer_user' => (string) ($connection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($connection['agent_peer_api_client'] ?? ''),
                 'agent_peer_profile' => (string) ($connection['agent_peer_profile'] ?? ''),

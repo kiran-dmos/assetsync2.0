@@ -306,6 +306,7 @@ final class AgentTask
         }
         $where = ['connection_id' => $connection];
         if (!empty($binding['discovery_id'])) { $where['id'] = $binding['discovery_id']; }
+        $where[] = new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') <> 7");
         $rows = $DB->request(['FROM' => self::TABLE, 'WHERE' => $where, 'ORDER' => 'created_at DESC, id DESC', 'LIMIT' => 100]);
         foreach ($rows as $row) {
             $body = json_decode($row['body'], true, 32, JSON_THROW_ON_ERROR);
@@ -640,7 +641,7 @@ final class AgentTask
                 $response = ['status' => 200, 'task' => null];
                 if (($request['subscriptions_only'] ?? false) !== true) {
                     $candidates = AgentInbox::sql('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
-                        . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 50 FOR UPDATE');
+                        . ' AND JSON_EXTRACT(`body`, \'$.version\') <> 7 AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 50 FOR UPDATE');
                     while ($candidate = $DB->fetchAssoc($candidates)) {
                         if (self::readableApiTask($api, $candidate)) { $task = $candidate; break; }
                     }
@@ -731,7 +732,8 @@ final class AgentTask
                 }
                 if (!$task && ($request['recovery_version'] ?? 0) === 1) {
                     foreach ($DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $binding['connection_id'],
-                        'state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+                        'state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL'),
+                        new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') <> 7")],
                         'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.recovery_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]) as $candidate) {
                         $body = json_decode($candidate['body'], true, 32, JSON_THROW_ON_ERROR);
                         if (!self::readableApiTask($api, $candidate)) { continue; }
@@ -749,7 +751,7 @@ final class AgentTask
                     }
                 }
             } elseif ($request['kind'] === 'recovery') {
-                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) ($request['id'] ?? '')) . ' FOR UPDATE');
+                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) ($request['id'] ?? '')) . ' AND JSON_EXTRACT(`body`, \'$.version\') <> 7 FOR UPDATE');
                 $proof = $request['proof'] ?? null;
                 $proofKeys = ['version', 'observed_at', 'journal', 'result_hash'];
                 if (is_array($proof) && ($proof['journal'] ?? '') === 'verified') { $proofKeys[] = 'result'; }
@@ -809,7 +811,7 @@ final class AgentTask
                 $response = ['status' => 200, 'recorded' => true, 'id' => $saved['id'], 'hash' => $saved['hash']];
             } else {
                 $id = $request['id'] ?? '';
-                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' FOR UPDATE');
+                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' AND JSON_EXTRACT(`body`, \'$.version\') <> 7 FOR UPDATE');
                 $result = $request['result'] ?? null;
                 if (!$saved || $saved['connection_id'] !== $binding['connection_id'] || ($request['hash'] ?? '') !== $saved['hash']
                     || !is_array($result) || !in_array($result['outcome'] ?? '', ['verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'], true)
@@ -844,6 +846,7 @@ final class AgentTask
     private static function readableApiTask(AgentApi $api, array $task): bool
     {
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        if (($body['version'] ?? 0) === 7) { return false; }
         if ($body['kind'] === 'discover') { return true; }
         $pair = self::isMatch($body) ? null : self::taskPair($task);
         $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
@@ -1223,7 +1226,7 @@ final class AgentTask
     {
         global $DB;
         $anchors = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $pair['connection_id'],
-            new \Glpi\DBAL\QueryExpression('JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
+            new \Glpi\DBAL\QueryExpression('JSON_EXTRACT(`body`, \'$.version\') <> 7 AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
                 . ' AND (JSON_EXTRACT(`context`, \'$.local_mutation\') IS NOT NULL OR JSON_EXTRACT(`context`, \'$.field_conflict\') IS NOT NULL)')], 'ORDER' => 'created_at DESC,id DESC', 'LIMIT' => 32]);
         $seen = false;
         $latestHistory = 0;
@@ -2041,7 +2044,7 @@ final class AgentTask
         }
     }
 
-    private static function finish(array $task, array $job, string $outcome, bool $recheck, ?string $fingerprint = null): void
+    public static function finish(array $task, array $job, string $outcome, bool $recheck, ?string $fingerprint = null): void
     {
         global $DB;
         AgentInbox::sql('START TRANSACTION');
@@ -2057,6 +2060,11 @@ final class AgentTask
                 throw new \RuntimeException('Pair changed before finalization.');
             }
             $scope = self::scope($pair);
+            $restBody = json_decode($current['body'], true, 32, JSON_THROW_ON_ERROR);
+            if (($restBody['version'] ?? 0) === 7) {
+                $lockedAsset = AgentInbox::one('SELECT * FROM `glpi_computers` WHERE `id` = ' . (int) $pair['local_id'] . ' FOR UPDATE');
+                RestWork::assertSource($pair, $restBody['source_hash'], $lockedAsset ?? []);
+            }
             $link = AssetSyncLink::find($pair['itemtype'], (int) $pair['local_id'], $pair['connection_id']);
             if (!$link || (int) $link['remote_items_id'] !== (int) $pair['computer_id'] || $link['route_id'] !== $pair['route_id']) {
                 throw new \RuntimeException('Confirmed link changed before finalization.');
@@ -2148,7 +2156,8 @@ final class AgentTask
             static fn (array $connection): bool => $connection['active']), 'id');
         if ($connections === []) { return; }
         $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $connections,
-            'state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL')],
+            'state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL'),
+            new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') <> 7")],
             'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]);
         foreach ($tasks as $task) {
             if (hrtime(true) >= $deadline) { break; }

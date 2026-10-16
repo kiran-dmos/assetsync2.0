@@ -235,6 +235,10 @@ final class AssetSyncService
                 try { AgentWake::complete($wake, $this->runMetrics['wake'], $wakeDeadline); }
                 catch (\Throwable) { /* The finite reservation retry survives a failed completion update. */ }
             }
+            if ($locked && $cleanupError === null && $runError === null) {
+                try { RestWork::sendPending($wakeDeadline); }
+                catch (\Throwable) { /* The durable request and finite dispatch lease survive failures. */ }
+            }
             $summary = $this->runMetrics;
             $this->runMetrics = null;
             $summary['http'] = GlpiBConnection::finishHttpMetrics();
@@ -412,6 +416,10 @@ final class AssetSyncService
                 return AgentTask::queueMatch($connectionId, $itemtype, $itemsId);
             }
             $pair = AgentTask::pair($connectionId, $itemtype, $itemsId);
+            $connection = $this->activeConnection($connectionId);
+            if ($pair && $connection && RestWork::handles($connection, $itemtype, $itemsId)) {
+                return RestWork::needsWork($pair, $forceInboundRecheck) ? AssetSyncQueue::notify($itemtype, $itemsId, $connectionId) : false;
+            }
             if (!$pair) {
                 return $deadline !== null && $scanDeadline !== null
                     ? AgentTask::queueMatch($connectionId, $itemtype, $itemsId) : false;
@@ -623,6 +631,10 @@ final class AssetSyncService
         }
 
         $agentConnection = $this->activeConnection($connectionId);
+        if ($agentConnection !== null && RestWork::handles($agentConnection, $itemtype, $itemsId)) {
+            RestWork::process($job);
+            return;
+        }
         if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {
             AgentTask::process($job, function (array $changes, array $mappings) use ($itemtype, $itemsId): bool {
                 return AssetChangeHook::withoutQueue(function () use ($itemtype, $itemsId, $changes, $mappings): bool {

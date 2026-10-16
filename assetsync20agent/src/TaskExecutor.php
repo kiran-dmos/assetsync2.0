@@ -13,6 +13,18 @@ final class TaskExecutor
 
     public static function validate(array $task, array $settings, bool $execution = true): void
     {
+        if (($task['version'] ?? null) === 7) {
+            $original = $task; unset($original['hash']);
+            if (($task['kind'] ?? '') !== 'apply' || ($task['itemtype'] ?? '') !== 'Computer'
+                || array_keys($task['changes'] ?? []) !== ['name'] || !is_string($task['rest_work_hash'] ?? null)
+                || !hash_equals(self::hash($original), $task['hash'] ?? '')) { throw new \RuntimeException('Invalid internal Name task.'); }
+            RestWork::authorizeTask($task, $execution);
+            unset($task['rest_work_hash']); $task['version'] = 6;
+            $task['guard']['native_values']['comment'] = '';
+            unset($task['hash']); $task['hash'] = self::hash($task);
+            self::validate($task, $settings, $execution);
+            return;
+        }
         $hash = $task['hash'] ?? '';
         unset($task['hash']);
         $keys = ['version', 'id', 'kind', 'installation', 'registration', 'generation', 'connection_id', 'computer_id', 'entity_id', 'serial', 'policy', 'expires', 'changes'];
@@ -143,6 +155,7 @@ final class TaskExecutor
     /** Keys and generated model classes come only from fresh local official metadata. */
     public static function snapshot(array $settings, int $version = 2): array
     {
+        if ($version === 7) { return self::nameSnapshot($settings); }
         global $DB;
         $type = $settings['itemtype'] ?? 'Computer';
         $model = TargetScope::model($type);
@@ -240,6 +253,32 @@ final class TaskExecutor
         return $snapshot;
     }
 
+    /** Core Name metadata only: never invoke plugin search options or enumerate Fields containers. */
+    private static function nameSnapshot(array $settings): array
+    {
+        global $DB;
+        $item = ServiceContext::computer($settings);
+        $id = (int) $settings['items_id'];
+        $raw = $item->rawSearchOptions();
+        $options = array_filter($raw, static fn ($o): bool => is_array($o)
+            && ($o['table'] ?? '') === 'glpi_computers' && ($o['field'] ?? '') === 'name');
+        if (count($options) !== 1) { throw new \RuntimeException('Core Name metadata unavailable.'); }
+        $option = array_values($options)[0];
+        $row = Outbox::one('SELECT *, (SELECT COALESCE(MAX(`id`), 0) FROM `glpi_logs` WHERE `itemtype` = \'Computer\'
+            AND `items_id` = ' . $id . ') AS history_id FROM `glpi_computers` WHERE `id` = ' . $id);
+        if (!$row || (int) $row['entities_id'] !== (int) $settings['entity_id'] || !empty($row['is_deleted']) || !empty($row['is_template'])) {
+            throw new \RuntimeException('Name target changed.');
+        }
+        $name = (string) $row['name'];
+        return ['itemtype' => 'Computer', 'items_id' => $id, 'pair_id' => $settings['pair_id'],
+            'entity_id' => (int) $row['entities_id'], 'serial' => self::identity($row)['serial'], 'otherserial' => self::identity($row)['otherserial'],
+            'name' => $name, 'observed_at' => time(), 'fields' => ['name' => ['key' => 'name', 'label' => $option['name'],
+                'type' => 'text', 'group' => 'Native', 'option' => (int) $option['id'], 'metadata' => self::hash(['name', $option]), 'value' => $name]],
+            'modification' => ['epoch' => null, 'untrusted_date_mod' => $row['date_mod'],
+                'history' => ['id' => (int) $row['history_id'], 'epoch' => null, 'field' => '']],
+            'native_values' => ['name' => $name], 'origin_epoch' => null];
+    }
+
     public static function execute(array $task, array $settings): array
     {
         $changed = [];
@@ -257,7 +296,7 @@ final class TaskExecutor
             self::configuration($settings, $task['version'] < 3);
             return ServiceContext::run($settings, static function () use ($task, $settings, &$changed, &$attempted): array {
                 if ($task['version'] === 5) { return Creation::execute($task, $settings); }
-                if ($task['version'] === 6) { return self::executeBoth($task, $settings); }
+                if (in_array($task['version'], [6, 7], true)) { return self::executeBoth($task, $settings); }
                 if ($task['kind'] === 'discover') {
                     return ['outcome' => 'unchanged', 'changed' => [], 'discovery' => self::discover($task, $settings)];
                 }
@@ -463,7 +502,7 @@ final class TaskExecutor
     private static function executeBoth(array $task, array $settings): array
     {
         global $DB;
-        $before = self::snapshot($settings, 6);
+        $before = self::snapshot($settings, $task['version']);
         if (($task['serial'] !== '' && $before['serial'] !== $task['serial'])
             || ($task['identity'] !== null && self::identity($before) !== $task['identity'])) { return ['outcome' => 'stale', 'changed' => []]; }
         if ($task['kind'] === 'inspect') { return ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $before]; }
@@ -474,8 +513,8 @@ final class TaskExecutor
         $attempted = false;
         Outbox::sql('START TRANSACTION');
         try {
-            self::lockRows($settings);
-            $before = self::snapshot($settings, 6);
+            self::lockRows($settings, $task['version'] === 7);
+            $before = self::snapshot($settings, $task['version']);
             if ($before['modification'] !== $task['guard']['modification'] || $before['native_values'] !== $task['guard']['native_values']
                 || self::identity($before) !== $task['identity']) {
                 Outbox::sql('ROLLBACK');
@@ -504,7 +543,7 @@ final class TaskExecutor
             foreach ($task['changes'] as $key => $change) {
                 self::validate($task, $settings);
                 self::configuration($settings);
-                $fresh = self::snapshot($settings, 6);
+                $fresh = self::snapshot($settings, $task['version']);
                 $field = $fresh['fields'][$key] ?? null;
                 if (!$field || $field['metadata'] !== $change['metadata'] || $field['value'] !== $change['expected']
                     || self::identity($fresh) !== $task['identity']) { throw new \RuntimeException('Batch expected field changed.'); }
@@ -522,7 +561,7 @@ final class TaskExecutor
                     $ok = $container->updateFieldsValues(['items_id' => (int) $settings['items_id'], 'itemtype' => $settings['itemtype'],
                         'plugin_fields_containers_id' => $field['container'], $definition->fields['name'] => $value], $settings['itemtype'], false);
                 }
-                $after = self::snapshot($settings, 6);
+                $after = self::snapshot($settings, $task['version']);
                 if (!$ok || self::identity($after) !== $task['identity'] || ($after['fields'][$key]['value'] ?? null) !== $change['value']
                     || ($after['fields'][$key]['metadata'] ?? null) !== $field['metadata']) { throw new \RuntimeException('Model readback failed.'); }
                 $named = array_filter(\Log::getHistoryData($computer, 0, 100), static fn ($row): bool => !in_array($row['id'], array_column($history, 'id'), true)
@@ -537,7 +576,7 @@ final class TaskExecutor
                 }
                 $changed[$key] = (int) $log['id'];
             }
-            $snapshot = self::snapshot($settings, 6);
+            $snapshot = self::snapshot($settings, $task['version']);
             $snapshot['origin_epoch'] = $task['guard']['origin_epoch'];
             $result = ['outcome' => $changed === [] ? 'unchanged' : 'verified', 'changed' => $changed, 'snapshot' => $snapshot,
                 'mutation' => ['modification' => $snapshot['modification'], 'native_values' => $snapshot['native_values'], 'origin_epoch' => $task['guard']['origin_epoch']]];
@@ -618,7 +657,7 @@ final class TaskExecutor
         throw new \UnexpectedValueException('Unsupported database statement timeout.');
     }
 
-    private static function lockRows(array $settings): void
+    private static function lockRows(array $settings, bool $nameOnly = false): void
     {
         global $DB;
         $id = (int) ($settings['items_id'] ?? $settings['computer_id']);
@@ -626,7 +665,7 @@ final class TaskExecutor
         $model = TargetScope::model($type);
         $parentTable = $model::getTable();
         $tables = [$parentTable];
-        $containers = \Plugin::isPluginActive('fields') ? Snapshot::containers($type) : [];
+        $containers = !$nameOnly && \Plugin::isPluginActive('fields') ? Snapshot::containers($type) : [];
         foreach ($containers as $container) { $tables[] = $container['table']; }
         // Fail closed when locking cannot protect the official update-or-add implementation.
         foreach (array_unique($tables) as $table) {

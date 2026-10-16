@@ -86,6 +86,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'active'     => $_POST['active'] ?? '',
                 'wake_enabled' => $_POST['wake_enabled'] ?? '0',
                 'agent_api_url' => $_POST['agent_api_url'] ?? '',
+                'agent_rest_pair' => $_POST['agent_rest_pair'] ?? '',
+                'agent_rest_url' => $_POST['agent_rest_url'] ?? '',
                 'agent_app_token' => $_POST['agent_app_token'] ?? '',
                 'agent_user_token' => $_POST['agent_user_token'] ?? '',
                 'agent_peer_user' => $_POST['agent_peer_user'] ?? '',
@@ -328,6 +330,10 @@ echo '</select> <a href="' . $html(dirname(Menu::configUrl()) . '/agent-pair.php
 echo '<tr><td><label for="wake_enabled">Optional HTTPS wake</label></td><td><input type="hidden" name="wake_enabled" value="0"><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . (!empty($connection['wake_enabled']) ? ' checked' : '') . '> Enabled for B agent mode</td></tr>';
 echo '<tr><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($connection['agent_api_url'] ?? '') . '"></td></tr>';
+echo '<tr><th><label for="agent_rest_pair">Name REST confirmed pair ID</label></th><td><input id="agent_rest_pair" name="agent_rest_pair" size="36" value="'
+    . $html($connection['agent_rest_pair'] ?? '') . '"></td></tr>';
+echo '<tr><th><label for="agent_rest_url">Name REST API URL</label></th><td><input id="agent_rest_url" name="agent_rest_url" size="60" value="'
+    . $html($connection['agent_rest_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI B app token', 'agent_user_token' => 'GLPI B user API token'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key
         . '" value="" autocomplete="new-password" size="60"> Saved: ' . (!empty($connection[$key]) ? 'Yes' : 'No') . '</td></tr>';

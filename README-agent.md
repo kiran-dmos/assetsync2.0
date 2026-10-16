@@ -1,8 +1,67 @@
 # GLPI B Agent
 
+## Optional Name REST Records (Wave 1)
+
+After updating B first, A can opt one existing independently confirmed Computer
+pair into stock GLPI REST records. On that A agent connection, set **Name REST
+confirmed pair ID** and the direct HTTPS **Name REST API URL** ending in
+`/apirest.php`. Leave the pair ID blank to keep the existing transport. Reuse the
+connection's native B app/user tokens; B's outgoing HTTP credentials are not used
+by this path. The selected pair must have exactly one saved mapping, native
+Name to Name with `glpi_a` authority. Additional mappings, creation, other types
+and other authorities reject explicitly. Other pairs keep their current path.
+
+A's normal worker/scanner/hook queue publishes immutable, secret-free
+`GlpiPlugin\Assetsync20agent\RestSettings` records only when needed. They identify
+the approved route/entities and Name mapping by version/ID/hash. Each immutable
+`GlpiPlugin\Assetsync20agent\RestWork` record pins that settings ID/hash and the
+confirmed target. The normal work exchange is one Work POST and one Work GET,
+plus native init/kill lifecycle requests. Settings publication is a separate
+setup/change request. Network calls occur after A releases its run/asset locks
+and transactions; finalization reacquires a fresh queue claim and checks scope
+and source again. A newer source edit remains pending for a subsequent request.
+
+The initial Work POST commits acceptance before attempting one bounded local
+pass. If busy or unstarted, A first reconciles with a successful GET, then can
+POST the identical Work ID/body/hash as continuation. Failed GET is unknown,
+never absence. Duplicate terminal requests read the existing outcome; an
+unresolved mutation intent is uncertain and never rerun. GET does not execute.
+Stock POST returns its ordinary record ID, not proof of asset mutation. The
+persisted journal result/readback supplies that proof. Native no-op skips update
+and asset History. Unstarted expired work reports expiry. Investigate retained
+uncertain evidence before switching transport; disabling the opt-in cannot send
+pending REST work through the legacy executor.
+
+If local service login or permissions prevent compilation after acceptance, Work
+remains `accepted` with no mutation journal or result. A displays waiting work and
+retries after GET reconciliation; it does not retain the POST's specific error
+text. Restoring permissions before expiry permits the identical Work to continue.
+Otherwise unstarted work expires and A retains a stale result for inspection.
+
+Resource admission rechecks the pinned native account, exact profile/entity
+grant, native READ, account/MFA policy and App-Token on every operation. An app
+token shared by multiple active API clients rejects. The separate local writer
+still uses its native password and fresh READ/UPDATE permission. Stable local
+peer/service identities bind records; secret rotation alone does not change the
+B record binding. Name snapshots use core metadata and parent-only locking;
+unrelated Fields containers and unmapped Comments are not loaded/exported.
+
+POST accepts exactly one input object and a bounded body. Use JSON
+`session_write: false`; writable PHP sessions and string boolean values reject.
+GET collections require an explicit range of at most ten records and apply SQL
+scope before pagination. Resource records are immutable through PUT/DELETE.
+The internal Name compiler uses journal envelope 7 with `report_status=rest` and
+`acknowledged=0`; it is excluded from legacy pull/report/recovery selection.
+Existing protocol 1-6 bodies, hashes, results and default behavior are retained.
+
+Focused offline checks: `tests/agent-rest-acl.php`, `tests/agent-rest-name.php`,
+`tests/agent-rest-coexistence.php`, `tests/agent-rest-journal.php` and
+`tests/agent-rest-observation.php`. Actual core
+REST, TLS, native model/History and concurrency require isolated integration QA.
+
 ## Native-Only Setup And Upgrade
 
-Controller **0.8.0** and agent **0.7.0** use GLPI-native authentication for all
+Controller **0.9.0** and agent **0.8.0** use GLPI-native authentication for all
 agent communications. Custom registration bearer tokens and wake keys, their
 rotation controls, and B's notification-only REST mode are removed. Ordinary
 controller REST asset synchronization and its GLPI credentials remain supported.
@@ -111,7 +170,7 @@ and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
 retain their protocol behavior and permission checks.
 
 Native Both was introduced in **B agent 0.5.3 / A controller 0.6.4**. For the current
-release use the B-first 0.7.0 / A 0.8.0 procedure above. Both sides must support
+release use the B-first 0.8.0 / A 0.9.0 procedure above. Both sides must support
 the native-only Agent API; no older-controller pull downgrade is attempted. Upgrade A before
 enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
 There is no task downgrade or REST fallback. No new database table or column is
