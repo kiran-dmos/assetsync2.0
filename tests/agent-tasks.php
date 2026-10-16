@@ -32,12 +32,12 @@ function taskSetup(): array
     $credentials = AgentTask::declare('b', str_repeat('a', 32), 101, 201, 100);
     $request = ['kind' => 'pull', 'registration' => $credentials['registration'], 'generation' => $credentials['generation'],
         'installation' => str_repeat('a', 32), 'connection_id' => 'b'];
-    $task = AgentTask::exchange($request, $credentials['token'])['task'];
+    $task = AgentTask::exchange($request, new \GlpiPlugin\Assetsync20\AgentApi('b'))['task'];
     $snapshot = ['pair_id' => $task['pair_id'], 'itemtype' => 'Computer', 'items_id' => 201, 'entity_id' => 100, 'serial' => 'AGENT-101', 'observed_at' => time(),
         'fields' => ['name' => ['key' => 'name', 'label' => 'Name', 'type' => 'text', 'group' => 'Native', 'option' => 1,
             'metadata' => str_repeat('b', 64), 'value' => 'Original']]];
     $result = ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot];
-    AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'], 'result' => $result]), $credentials['token']);
+    AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'], 'result' => $result]), new \GlpiPlugin\Assetsync20\AgentApi('b'));
     AgentTask::confirm('b', 'route');
     FieldMapping::save('b', 'Computer', [['glpi_a_field_key' => 'name', 'glpi_b_field_key' => 'name', 'source_of_truth' => 'glpi_a']], AgentTask::catalog('b', 'Computer')['fields']);
     return [$credentials, $request, $snapshot];
@@ -85,23 +85,24 @@ $participants = (new ReflectionMethod(\GlpiPlugin\Assetsync20\AssetUuidService::
 agentCheck($participants['outcome'] === 'unsupported_agent', 'UUID participation explicitly blocked before any remote request.');
 
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 agentCheck(queue()['status'] === 'waiting_agent' && queue()['claim_token'] === '' && AssetSyncQueue::claimDue(1) === [], 'Offline B releases the claim and is never ordinary due work.');
 $before = queue();
 AssetSyncQueue::notify('Computer', 101, 'b');
 $event = ['registration' => $credentials['registration'], 'generation' => $credentials['generation'], 'computer_id' => 201, 'revision' => 1, 'lifecycle' => 'present'];
-AgentInbox::receive($event, $credentials['token']);
+AgentInbox::receive($event, new \GlpiPlugin\Assetsync20\AgentApi('b'));
 agentCheck(queue()['status'] === 'waiting_agent' && queue()['agent_completed'] === 0 && queue()['agent_requested'] === 1
     && queue()['needs_recheck'] === 1 && AssetSyncQueue::claimDue(1) === [], 'Notifications preserve waiting and outstanding revisions.');
 $resultRequest = array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'],
     'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]);
 $DB->failOn = 'COMMIT';
-try { AgentTask::exchange($resultRequest, $credentials['token']); throw new LogicException('Commit failure ACK'); } catch (RuntimeException) {}
+try { AgentTask::exchange($resultRequest, new \GlpiPlugin\Assetsync20\AgentApi('b')); throw new LogicException('Commit failure ACK'); } catch (RuntimeException) {}
 $DB->failOn = null;
 agentCheck(AgentTask::outstanding('b')['result'] === '{}' && queue()['status'] === 'waiting_agent', 'Failed result COMMIT persists neither result nor wake.');
-AgentTask::exchange($resultRequest, $credentials['token']);
+AgentTask::exchange($resultRequest, new \GlpiPlugin\Assetsync20\AgentApi('b'));
 $newClaim = AssetSyncQueue::claimDue(1)[0];
 agentCheck($newClaim['claim_token'] !== $job['claim_token'] && queue()['agent_completed'] === 0, 'Result wakes a fresh claim without consuming captured revisions.');
-AgentTask::exchange($resultRequest, $credentials['token']);
+AgentTask::exchange($resultRequest, new \GlpiPlugin\Assetsync20\AgentApi('b'));
 agentCheck(queue()['claim_token'] === $newClaim['claim_token'] && queue()['status'] === 'running', 'Duplicate old result cannot wake or complete a newer claim.');
 $DB->update(AgentTask::TABLE, ['state' => 'finalizing'], ['id' => $task['id']]);
 $called = false;
@@ -110,23 +111,25 @@ agentCheck(!$called && AgentTask::outstanding('b')['state'] === 'uncertain' && q
 
 [$credentials, $request, $snapshot] = taskSetup();
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 // Reproduce a result racing after the worker saw an empty result but before it parked.
 $DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => $job['id']]);
 $claim = AssetSyncQueue::claimDue(1)[0];
 $staleView = AgentTask::outstanding('b');
 AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'],
-    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), $credentials['token']);
+    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), new \GlpiPlugin\Assetsync20\AgentApi('b'));
 (new ReflectionMethod(AgentTask::class, 'park'))->invoke(null, $claim, $staleView);
 agentCheck(queue()['status'] === 'pending' && queue()['claim_token'] === '', 'Atomic park observes a racing committed result and preserves wakeup.');
 
 [$credentials, $request, $snapshot] = taskSetup();
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 $DB->update(AgentTask::TABLE, ['expires' => time() - 1], ['id' => $task['id']]);
 AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'],
-    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), $credentials['token']);
+    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), new \GlpiPlugin\Assetsync20\AgentApi('b'));
 agentCheck(AgentTask::outstanding('b')['state'] === 'stale' && AgentTask::outstanding('b')['result'] !== '{}', 'Late evidence is durable but cannot become fresh input.');
 $route = EntitySyncRoute::find('route'); $route['active'] = false; EntitySyncRoute::save($route);
-agentCheck(AgentTask::exchange($request, $credentials['token'])['task'] === null,
+agentCheck(AgentTask::exchange($request, new \GlpiPlugin\Assetsync20\AgentApi('b'))['task'] === null,
     'A revoked pair cannot deliver work; the authenticated installation remains available for other pairs.');
 
 [$credentials, $request, $snapshot] = taskSetup();
@@ -139,6 +142,7 @@ agentCheck(AgentTask::outstanding('b') === null && AssetSyncQueue::owns($job), '
 
 [$credentials, $request, $snapshot] = taskSetup();
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 $settings = $request + ['computer_id' => 201, 'entity_id' => 100];
 $terminal = ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot];
 $DB->insert(TaskJournal::TABLE, ['id' => $task['id'], 'hash' => $task['hash'], 'body' => json_encode($task),
@@ -152,6 +156,7 @@ try { TaskJournal::run($task, $settings); throw new LogicException('Rebound repl
 foreach ([0, 1] as $newNotification) {
     [$credentials, $request, $snapshot] = taskSetup();
     [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
     $DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => $job['id']]);
     $claim = AssetSyncQueue::claimDue(1)[0];
     $DB->update(AgentTask::TABLE, ['state' => 'finalizing'], ['id' => $task['id']]);
@@ -172,13 +177,14 @@ agentCheck(AgentTask::needsInspection(AgentTask::pair('b'), true), 'Explicit ref
 $DB->update(AgentTask::PAIRS, ['checked_at' => time() - 3601], ['connection_id' => 'b']);
 agentCheck(AgentTask::needsInspection(AgentTask::pair('b'), false), 'Hourly safety net requests fresh B observation.');
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 agentCheck(!AgentTask::needsInspection(AgentTask::pair('b'), true) && queue()['needs_recheck'] === 0,
     'Backfill cannot dirty an outstanding operation, even with force enabled.');
 
 [$credentials, $request, $snapshot] = taskSetup();
 $event = ['registration' => $credentials['registration'], 'generation' => $credentials['generation'],
     'computer_id' => 201, 'revision' => 1, 'lifecycle' => 'present'];
-AgentInbox::receive($event, $credentials['token']);
+AgentInbox::receive($event, new \GlpiPlugin\Assetsync20\AgentApi('b'));
 $job = AssetSyncQueue::claimDue(1)[0];
 $route = EntitySyncRoute::find('route'); $route['active'] = false; EntitySyncRoute::save($route);
 $called = false;
@@ -192,18 +198,17 @@ $DB->failOn = 'INSERT INTO `' . AgentTask::TABLE;
 $recovery = AgentTask::declare('recovery', str_repeat('c', 32), 101, 201, 100);
 $DB->failOn = null;
 agentCheck(AgentTask::pair('recovery') !== null && AgentTask::outstanding('recovery') === null
-    && isset($recovery['token'], $recovery['inspection_error']), 'Failed initial publication returns durable candidate credentials and recovery message.');
-$rotated = AgentTask::rotate('recovery');
-agentCheck($rotated['registration'] === $recovery['registration'] && $rotated['generation'] === $recovery['generation']
-    && $rotated['token'] !== $recovery['token'], 'Unconfirmed candidate token rotation preserves binding.');
-$request = ['kind' => 'pull', 'registration' => $rotated['registration'], 'generation' => $rotated['generation'],
+    && isset($recovery['registration'], $recovery['generation'], $recovery['inspection_error']), 'Failed initial publication returns durable candidate credentials and recovery message.');
+$binding = AgentTask::binding('recovery');
+agentCheck($binding['registration'] === $recovery['registration'], 'Failed initial publication preserves the registration binding.');
+$request = ['kind' => 'pull', 'registration' => $recovery['registration'], 'generation' => $recovery['generation'],
     'installation' => str_repeat('c', 32), 'connection_id' => 'recovery'];
-try { AgentTask::exchange($request, $recovery['token']); throw new LogicException('Old token survived rotation'); }
-catch (UnexpectedValueException) { agentCheck(true, 'Rotated token invalidates the previous token.'); }
+try { AgentTask::exchange($request, new \GlpiPlugin\Assetsync20\AgentApi('recovery', false)); throw new LogicException('Unauthenticated peer accepted'); }
+catch (UnexpectedValueException) { agentCheck(true, 'Native authorization denial cannot pull a task.'); }
 AgentTask::inspect('recovery');
-$task = AgentTask::exchange($request, $rotated['token'])['task'];
+$task = AgentTask::exchange($request, new \GlpiPlugin\Assetsync20\AgentApi('recovery'))['task'];
 AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'],
-    'result' => ['outcome' => 'blocked', 'changed' => []]]), $rotated['token']);
+    'result' => ['outcome' => 'blocked', 'changed' => []]]), new \GlpiPlugin\Assetsync20\AgentApi('recovery'));
 agentCheck(AgentTask::outstanding('recovery') === null && AgentTask::recent('recovery')[0]['state'] === 'blocked',
     'Standalone failure remains visible after its outstanding slot is released.');
 
@@ -243,9 +248,9 @@ AgentTask::inspect('b');
 AssetSyncQueue::notify('Computer', 101, 'b');
 $parked = AssetSyncQueue::claimDue(1)[0];
 agentCheck(AssetSyncQueue::waitForAgent($parked), 'Reproduce a legacy queue parked beside a standalone read.');
-$inspection = AgentTask::exchange($request, $credentials['token'])['task'];
+$inspection = AgentTask::exchange($request, new \GlpiPlugin\Assetsync20\AgentApi('b'))['task'];
 AgentTask::exchange(array_replace($request, ['kind' => 'result', 'id' => $inspection['id'], 'hash' => $inspection['hash'],
-    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), $credentials['token']);
+    'result' => ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot]]), new \GlpiPlugin\Assetsync20\AgentApi('b'));
 agentCheck(AgentTask::outstanding('b') === null && $DB->firstRow(AssetSyncQueue::TABLE, ['id' => $parked['id']])['status'] === 'pending',
     'A fresh completed standalone observation wakes the exact parked pair without erasing queue evidence.');
 

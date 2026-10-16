@@ -50,7 +50,7 @@ function bothLocal(array $changes): bool
     return false;
 }
 
-function bothInspect(array $settings, array $request, string $token): array
+function bothInspect(array $settings, array $request, \GlpiPlugin\Assetsync20\AgentApi $token): array
 {
     global $DB;
     AssetSyncQueue::notify('Computer', 101, 'b');
@@ -66,7 +66,7 @@ function bothInspect(array $settings, array $request, string $token): array
     return $inspect;
 }
 
-function bothApply(array $settings, array $request, string $token, ?callable $local = null): array
+function bothApply(array $settings, array $request, \GlpiPlugin\Assetsync20\AgentApi $token, ?callable $local = null): array
 {
     $apply = AgentTask::exchange($request + ['kind' => 'pull', 'task_versions' => [1, 2, 3, 4, 5, 6]], $token)['task'];
     scalarCheck(is_array($apply) && $apply['version'] === 6 && $apply['kind'] === 'apply', 'Both always asserts B under lock before local finalization.');

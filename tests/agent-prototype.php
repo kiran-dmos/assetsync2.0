@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/agent-api-fixtures.php';
+
 $smokeBootstrapOnly = true;
 require __DIR__ . '/smoke.php';
 require __DIR__ . '/agent-sqlite.php';
@@ -52,10 +54,13 @@ function agentSetup(): array
     AssetSyncLink::save(['itemtype' => 'Computer', 'items_id' => 101, 'glpi_b_connection_id' => 'b', 'route_id' => 'route',
         'remote_items_id' => 201, 'confirmed_remote_id' => 201, 'confirmed_entity_id' => 100,
         'confirmed_identity' => AgentInbox::identity($connection), 'status' => 'synced']);
-    $credentials = AgentInbox::register('b', ['route']);
+    $credentials = ['registration' => bin2hex(random_bytes(16)), 'generation' => bin2hex(random_bytes(16))];
+    $DB->insert(AgentInbox::REGISTRATIONS, ['id' => $credentials['registration'], 'generation' => $credentials['generation'],
+        'token_hash' => '', 'connection_id' => 'b', 'connection_identity' => AgentInbox::identity($connection),
+        'routes' => json_encode(['route' => ['fingerprint' => AgentInbox::routeIdentity(EntitySyncRoute::loadAll()[0]), 'source_entity' => 1]]), 'active' => 1]);
     $event = ['registration' => $credentials['registration'], 'generation' => $credentials['generation'],
         'computer_id' => 201, 'revision' => 1, 'lifecycle' => 'present'];
-    return [$event, $credentials['token'], $asset];
+    return [$event, new \GlpiPlugin\Assetsync20\AgentApi('b'), $asset];
 }
 
 function receipt(): array { return AgentInbox::one('SELECT * FROM `' . AgentInbox::RECEIPTS . '` ORDER BY id DESC LIMIT 1') ?? []; }
@@ -170,7 +175,7 @@ agentCheck(AssetSyncQueue::finish($job3) && receipt()['outcome'] === 'unchanged'
 // Scope, identity, unknown/ambiguous links and tombstones fail closed and remain visible.
 foreach (['bad_token', 'generation', 'unconfirmed', 'ambiguous', 'route_edit', 'connection_edit', 'deleted', 'purged'] as $case) {
     [$event, $token] = agentSetup();
-    if ($case === 'bad_token') { $token = str_repeat('0', 64); }
+    if ($case === 'bad_token') { $token = new \GlpiPlugin\Assetsync20\AgentApi('b', false); }
     if ($case === 'generation') { $event['generation'] = str_repeat('0', 32); }
     if ($case === 'unconfirmed') { $DB->update(AssetSyncLink::TABLE, ['confirmed_identity' => ''], ['id' => 1]); }
     if ($case === 'ambiguous') {
@@ -186,7 +191,8 @@ foreach (['bad_token', 'generation', 'unconfirmed', 'ambiguous', 'route_edit', '
         $connection = AgentInbox::connection('b'); $connection['base_url'] = 'https://replacement.invalid'; GlpiBConnection::save($connection);
     }
     if (in_array($case, ['deleted', 'purged'], true)) { $event['lifecycle'] = $case; }
-    $result = AgentInbox::receive($event, $token);
+    try { $result = AgentInbox::receive($event, $token); }
+    catch (UnexpectedValueException) { $result = ['status' => 401]; }
     agentCheck(in_array($result['status'], [401, 409], true) && queue() === [], 'Unsafe event never queues: ' . $case);
     if ($result['status'] === 409) { agentCheck(receipt()['outcome'] === 'blocked', 'Unadmitted event stays visible: ' . $case); }
 }
@@ -200,69 +206,18 @@ Outbox::observe(101, ['fingerprint' => str_repeat('0', 64), 'lifecycle' => 'pres
 agentCheck(Outbox::find(101)['revision'] === 1 && Outbox::find(101)['fingerprint'] === $snapshot['fingerprint'], 'Silent baseline cannot erase a concurrent hook.');
 Outbox::observe(101, $snapshot, false);
 agentCheck(Outbox::find(101)['revision'] === 1, 'No-op hooks do not create echo revisions.');
-$sent = Outbox::claim($settings);
-Outbox::observe(101, ['fingerprint' => str_repeat('1', 64), 'lifecycle' => 'present'], false);
-$ack = ['accepted' => true] + array_intersect_key($sent, array_flip(['registration', 'generation', 'computer_id', 'revision']));
-agentCheck(Outbox::acknowledge($sent, $ack, $settings) && Outbox::find(101)['revision'] === 2 && Outbox::find(101)['acked_revision'] === 1,
-    'Old ACK acknowledges only the sent revision.');
-$sent2 = Outbox::claim($settings);
-agentCheck(!Outbox::acknowledge($sent, $ack, $settings) && !Outbox::retry($sent, 'retrying'), 'A replaced claim cannot acknowledge or retry.');
-$settings['generation'] = str_repeat('b', 32);
-agentCheck(!Outbox::acknowledge($sent2, ['accepted' => true] + array_intersect_key($sent2, array_flip(['registration','generation','computer_id','revision'])), $settings),
-    'Old registration generation cannot clear current work.');
-$before = Outbox::find(101);
-Outbox::observe(101, ['fingerprint' => str_repeat('2', 64), 'lifecycle' => 'present'], false);
-Outbox::observe(101, $snapshot, true, $before);
-agentCheck(Outbox::find(101)['fingerprint'] === str_repeat('2', 64), 'Stale reconcile snapshot cannot overwrite a newer hook.');
-
-[$event, $token] = agentSetup();
-$worker = new Worker();
-agentCheck($worker->reconcile() <= 50 && Outbox::find(101)['revision'] === 0, 'Initial scan is bounded and silent.');
-$DB->update('glpi_computers', ['name' => 'Missed hook'], ['id' => 101]);
-$worker->reconcile();
-agentCheck(Outbox::find(101)['revision'] === 1, 'Reconciliation detects missed native hooks.');
-$DB->update('glpi_computers', ['date_mod' => '2026-10-01 00:00:00'], ['id' => 101]);
-$worker->reconcile();
-agentCheck(Outbox::find(101)['revision'] === 1, 'Volatile timestamp-only changes do not enqueue.');
-$DB->doQuery('DELETE FROM glpi_computers WHERE id=101');
-$worker->reconcile();
-agentCheck(Outbox::find(101)['lifecycle'] === 'purged' && Outbox::find(101)['revision'] === 2, 'Tracked missing Computers produce retained tombstones.');
-
-[$event, $token] = agentSetup();
-(new Worker())->reconcile();
-$DB->update('glpi_computers', ['last_boot' => '2026-10-01 01:02:03'], ['id' => 101]);
-$computer = new Computer();
-$computer->getFromDB(101);
-\GlpiPlugin\Assetsync20agent\ChangeHook::changed($computer);
-agentCheck(Outbox::find(101)['revision'] === 1, 'Supported last_boot datetime-only hook advances revision.');
-$DB->update('glpi_computers', ['last_boot' => '2026-10-02 01:02:03'], ['id' => 101]);
-(new Worker())->reconcile();
-agentCheck(Outbox::find(101)['revision'] === 2, 'Supported last_boot datetime-only missed hook is reconciled.');
-
-[$event, $token] = agentSetup();
-$DB->doQuery('CREATE TABLE glpi_plugin_fields_containers (id INTEGER PRIMARY KEY, name TEXT, itemtypes TEXT, is_active INTEGER)');
-$DB->doQuery('CREATE TABLE glpi_plugin_fields_fields (id INTEGER PRIMARY KEY, name TEXT, type TEXT, plugin_fields_containers_id INTEGER, is_active INTEGER)');
-$DB->doQuery('CREATE TABLE glpi_plugin_fields_computerboxes (id INTEGER PRIMARY KEY, items_id INTEGER, itemtype TEXT, plugin_fields_containers_id INTEGER, notesfield TEXT, plugin_fields_colorfielddropdowns_id INTEGER)');
-$DB->insert('glpi_plugin_fields_containers', ['id' => 9, 'name' => 'boxes', 'itemtypes' => '["Computer"]', 'is_active' => 1]);
-foreach (['notesfield' => 'textarea', 'colorfield' => 'dropdown'] as $name => $type) {
-    $DB->insert('glpi_plugin_fields_fields', ['name' => $name, 'type' => $type, 'is_active' => 1, 'plugin_fields_containers_id' => 9]);
+// Notification-only mode is retired: neither legacy credentials nor mode=agent
+// without native credentials may scan, claim, execute or call the controller.
+foreach (['rest', 'agent'] as $mode) {
+    Config::$values['plugin:assetsync20agent'] = ['mode' => $mode, 'token' => str_repeat('a', 64),
+        'endpoint' => 'https://retired.invalid/front/agent-notify.php'];
+    $before = $DB->firstRow(Outbox::TABLE, ['computer_id' => 101]);
+    agentCheck((new Worker())->run() === 0 && (new Worker())->reconcile() === 0,
+        'Retired or incomplete native setup does no worker/scanner work.');
+    agentCheck($DB->firstRow(Outbox::TABLE, ['computer_id' => 101]) === $before,
+        'Blocked setup preserves every retained outbox field.');
 }
-$custom = new PluginFieldsComputerboxe();
-$custom->fields = ['id' => 90, 'items_id' => 101, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => 9, 'notesfield' => 'before', 'plugin_fields_colorfielddropdowns_id' => 3];
-$DB->insert(PluginFieldsComputerboxe::getTable(), $custom->fields);
-agentCheck(Snapshot::hookTypes() === [PluginFieldsComputerboxe::class], 'Fields-generated class/table resolves irregular container inflection.');
-(new Worker())->reconcile();
-$DB->update(PluginFieldsComputerboxe::getTable(), ['notesfield' => 'changed'], ['id' => 90]);
-\GlpiPlugin\Assetsync20agent\ChangeHook::changed($custom);
-agentCheck(Outbox::find(101)['revision'] === 1, 'Generated custom-row hook detects text changes independently of controller metadata.');
-\GlpiPlugin\Assetsync20agent\ChangeHook::changed($custom);
-agentCheck(Outbox::find(101)['revision'] === 1, 'Unchanged custom-row hook does not produce echo work.');
-$DB->update(PluginFieldsComputerboxe::getTable(), ['plugin_fields_colorfielddropdowns_id' => 7], ['id' => 90]);
-(new Worker())->reconcile();
-agentCheck(Outbox::find(101)['revision'] === 2, 'Missed custom dropdown hook is repaired by reconciliation.');
-$custom->fields['itemtype'] = 'Monitor';
-\GlpiPlugin\Assetsync20agent\ChangeHook::changed($custom);
-agentCheck(Outbox::find(101)['revision'] === 2, 'Wrong custom parent type is ignored.');
+agentCheck(Outbox::claim(['mode' => 'rest']) === null, 'Retired notifier cannot claim work.');
 
 // End-to-end controller processing with real SQL and a strictly offline remote transport.
 [$event, $token, $asset] = agentSetup();

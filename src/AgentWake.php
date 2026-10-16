@@ -8,15 +8,6 @@ namespace GlpiPlugin\Assetsync20;
 final class AgentWake
 {
     private const MINIMUM_WINDOW_NS = 11_000_000_000;
-    public static function validUrl(string $url): bool
-    {
-        $parts = parse_url($url);
-        return is_array($parts) && ($parts['scheme'] ?? '') === 'https' && !empty($parts['host'])
-            && !isset($parts['user']) && !isset($parts['pass']) && !isset($parts['query']) && !isset($parts['fragment'])
-            && preg_match('#/(plugins|marketplace)/assetsync20agent/front/agent-wake\\.php$#D', $parts['path'] ?? '') === 1
-            && !preg_match('/[\x00-\x20\x7f]/', $url);
-    }
-
     /** Probe the current connection without ending any caller-owned transaction. */
     public static function transactionIdle(): bool
     {
@@ -54,9 +45,8 @@ final class AgentWake
         // Wake eligibility is read-only; the ordinary loader may migrate legacy REST settings.
         foreach (GlpiBConnection::loadAll(false, false) as $connection) {
             if ($connection['active'] && GlpiBConnection::isAgent($connection) && !empty($connection['wake_enabled'])
-                && (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session'
-                    ? AgentSession::validUrl($connection['agent_api_url'] ?? '')
-                    : (self::validUrl($connection['wake_url'] ?? '') && preg_match('/^[a-f0-9]{64}$/D', $connection['wake_token'] ?? '')))) {
+                && AgentSession::validUrl($connection['agent_api_url'] ?? '')
+                && !empty($connection['agent_app_token']) && !empty($connection['agent_user_token'])) {
                 try {
                     $binding = AgentTask::binding($connection['id']);
                     if (!$binding) { continue; }
@@ -110,8 +100,7 @@ final class AgentWake
 
     private static function fingerprint(array $work): string
     {
-        return hash('sha256', json_encode([$work['request'], $work['connection']['wake_url'],
-            hash('sha256', $work['connection']['wake_token'] ?? ''), AgentSession::fingerprint($work['connection'])], JSON_THROW_ON_ERROR));
+        return hash('sha256', json_encode([$work['request'], AgentSession::fingerprint($work['connection'])], JSON_THROW_ON_ERROR));
     }
 
     private static function backoff(array $state): array
@@ -183,10 +172,8 @@ final class AgentWake
         if (AssetUuidOperation::hasAssetLocks()) { return ['status' => 0, 'state' => 'deferred']; }
         $connection = GlpiBConnection::find($work['connection']['id']);
         if (!$connection || !$connection['active'] || !GlpiBConnection::isAgent($connection) || empty($connection['wake_enabled'])
-            || $connection['wake_url'] !== $work['connection']['wake_url'] || $connection['wake_token'] !== $work['connection']['wake_token']
             || AgentSession::fingerprint($connection) !== AgentSession::fingerprint($work['connection'])
-            || (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session'
-                ? !AgentSession::validUrl($connection['agent_api_url'] ?? '') : !self::validUrl($connection['wake_url']))
+            || !AgentSession::validUrl($connection['agent_api_url'] ?? '')
             || hrtime(true) >= $deadline) { return ['status' => 0, 'state' => 'deferred']; }
         $binding = AgentTask::binding($connection['id']);
         if (!$binding) { return ['status' => 0, 'state' => 'deferred']; }
@@ -202,40 +189,15 @@ final class AgentWake
         if (AssetUuidOperation::hasAssetLocks() || !self::transactionIdle() || hrtime(true) >= $deadline) {
             return ['status' => 0, 'state' => 'deferred'];
         }
-        if (($connection['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
-            $response = AgentSession::send($connection, 'wake', $work['request'], $deadline);
-            $body = $response['body'];
-            if ($response['status'] !== 200 || ($body['version'] ?? null) !== 1
-                || !in_array($body['state'] ?? '', ['completed', 'busy'], true)) {
-                return ['status' => $response['status'], 'state' => 'unavailable'];
-            }
-            foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
-                if (($body[$key] ?? null) !== $work['request'][$key]) { return ['status' => 0, 'state' => 'unavailable']; }
-            }
-            return ['status' => 200, 'state' => $body['state']];
+        $response = AgentSession::send($connection, 'wake', $work['request'], $deadline);
+        $body = $response['body'];
+        if ($response['status'] !== 200 || ($body['version'] ?? null) !== 1
+            || !in_array($body['state'] ?? '', ['completed', 'busy'], true)) {
+            return ['status' => $response['status'], 'state' => 'unavailable'];
         }
-        $timeout = min(10000, max(1, (int) (($deadline - hrtime(true)) / 1_000_000)));
-        $curl = curl_init($connection['wake_url']);
-        $body = '';
-        try {
-            curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => json_encode($work['request'], JSON_THROW_ON_ERROR),
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json', 'Authorization: Bearer ' . $connection['wake_token']],
-                CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2, CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
-                CURLOPT_CONNECTTIMEOUT_MS => min(2000, $timeout), CURLOPT_TIMEOUT_MS => $timeout,
-                CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$body): int {
-                    if (strlen($body) + strlen($chunk) > 2048) { return 0; }
-                    $body .= $chunk; return strlen($chunk);
-                }]);
-            $ok = curl_exec($curl);
-            $response = json_decode($body, true, 8);
-            $status = $ok === false ? 0 : (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
-            if ($status !== 200 || !is_array($response) || ($response['version'] ?? null) !== 1
-                || !in_array($response['state'] ?? '', ['completed', 'busy'], true)) { return ['status' => $status, 'state' => 'unavailable']; }
-            foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
-                if (($response[$key] ?? null) !== $work['request'][$key]) { return ['status' => 0, 'state' => 'unavailable']; }
-            }
-            return ['status' => 200, 'state' => $response['state']];
-        } finally { curl_close($curl); }
+        foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
+            if (($body[$key] ?? null) !== $work['request'][$key]) { return ['status' => 0, 'state' => 'unavailable']; }
+        }
+        return ['status' => 200, 'state' => $body['state']];
     }
 }

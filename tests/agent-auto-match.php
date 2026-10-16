@@ -75,7 +75,7 @@ function autoApplyLocal(array $changes): bool
     return false;
 }
 
-function autoStep(array $settings, array $request, string $token, string $kind): array
+function autoStep(array $settings, array $request, \GlpiPlugin\Assetsync20\AgentApi $token, string $kind): array
 {
     $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
     scalarCheck(is_array($task) && $task['version'] === 4 && $task['kind'] === $kind, 'Expected v4 phase: ' . $kind);

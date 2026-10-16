@@ -27,7 +27,7 @@ function createSetup(string $authority = 'glpi_b', string $column = 'textfield',
     return [$settings, $request, $token];
 }
 
-function createStep(array $settings, array $request, string $token, string $kind): array
+function createStep(array $settings, array $request, \GlpiPlugin\Assetsync20\AgentApi $token, string $kind): array
 {
     $task = AgentTask::exchange($request + ['kind' => 'pull'], $token)['task'];
     scalarCheck(is_array($task) && $task['version'] === 5 && $task['kind'] === $kind, 'Expected creation phase ' . $kind);

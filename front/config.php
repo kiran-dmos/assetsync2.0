@@ -85,9 +85,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'user_token' => $_POST['user_token'] ?? '',
                 'active'     => $_POST['active'] ?? '',
                 'wake_enabled' => $_POST['wake_enabled'] ?? '0',
-                'wake_url' => $_POST['wake_url'] ?? '',
-                'wake_token' => $_POST['wake_token'] ?? '',
-                'agent_auth' => $_POST['agent_auth'] ?? 'legacy_bearer',
                 'agent_api_url' => $_POST['agent_api_url'] ?? '',
                 'agent_app_token' => $_POST['agent_app_token'] ?? '',
                 'agent_user_token' => $_POST['agent_user_token'] ?? '',
@@ -329,12 +326,6 @@ foreach (['rest' => 'REST', 'agent' => 'B agent (Computer and Printer pairs)'] a
 echo '</select> <a href="' . $html(dirname(Menu::configUrl()) . '/agent-pair.php') . '">Agent Pair</a></td></tr>';
 
 echo '<tr><td><label for="wake_enabled">Optional HTTPS wake</label></td><td><input type="hidden" name="wake_enabled" value="0"><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . (!empty($connection['wake_enabled']) ? ' checked' : '') . '> Enabled for B agent mode</td></tr>';
-echo '<tr><td><label for="wake_url">Legacy bearer GLPI B HTTPS wake URL</label></td><td><input type="url" id="wake_url" name="wake_url" value="' . $html($connection['wake_url'] ?? '') . '" size="60" placeholder="https://glpi-b.example.com/plugins/assetsync20agent/front/agent-wake.php"><br><small>Legacy bearer only. Native sessions use the GLPI B Agent API URL.</small></td></tr>';
-echo '<tr><th><label for="agent_auth">Agent authentication</label></th><td><select id="agent_auth" name="agent_auth">';
-foreach (['legacy_bearer' => 'Legacy bearer', 'glpi_session' => 'GLPI native session'] as $value => $label) {
-    echo '<option value="' . $value . '"' . (($connection['agent_auth'] ?? 'legacy_bearer') === $value ? ' selected' : '') . '>' . $label . '</option>';
-}
-echo '</select></td></tr>';
 echo '<tr><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($connection['agent_api_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI B app token', 'agent_user_token' => 'GLPI B user API token'] as $key => $label) {
@@ -353,8 +344,6 @@ Dropdown::show('Profile', ['name' => 'agent_peer_profile', 'value' => (int) ($co
 echo '</td></tr><tr><th>GLPI A exact entity grant used by B</th><td>';
 Dropdown::show('Entity', ['name' => 'agent_peer_entity', 'value' => (int) ($connection['agent_peer_entity'] ?? -1)]);
 echo '</td></tr>';
-echo '<tr><td><label for="wake_token">Legacy wake key</label></td><td><input type="password" id="wake_token" name="wake_token" value="" autocomplete="new-password" size="60"></td></tr>';
-echo '<tr><td>Saved wake key</td><td>' . (!empty($connection['wake_token']) ? 'Yes' : 'No') . '</td></tr>';
 echo '<tr><td>Wake worker</td><td>A\'s background CLI worker must remain running. B\'s CLI worker is optional. A manual web run does ordinary work; it does not send a wake.</td></tr>';
 
 echo '<tr><td><label for="app_token">REST asset-mode app token</label></td>';

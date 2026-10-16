@@ -30,6 +30,7 @@ namespace {
     require __DIR__ . '/agent-sqlite.php';
     require __DIR__ . '/../assetsync20agent/src/Settings.php';
     require __DIR__ . '/../assetsync20agent/src/Wake.php';
+    require_once __DIR__ . '/../assetsync20agent/src/autoload.php';
     require __DIR__ . '/../assetsync20agent/src/Worker.php';
 
     use GlpiPlugin\Assetsync20agent\Settings;
@@ -78,7 +79,8 @@ namespace {
         $DB = new ReconcileDB();
         $DB->sql->doQuery('CREATE TABLE ' . TargetScope::TABLE . ' (id INTEGER PRIMARY KEY, items_id INTEGER, itemtype TEXT,
             installation TEXT, registration TEXT, generation TEXT, connection_id TEXT, active INTEGER, expires INTEGER, dirty INTEGER)');
-        Config::$values = ['mode' => 'agent', 'installation' => 'installation', 'registration' => 'registration',
+        Config::$values = ['agent_auth' => 'glpi_session', 'agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',
+            'agent_app_token' => 'app', 'agent_user_token' => 'user', 'mode' => 'agent', 'installation' => 'installation', 'registration' => 'registration',
             'generation' => 'generation', 'connection_id' => 'connection', 'target_cursor' => (string) $cursor];
         ReconcileFixture::$now = ReconcileFixture::$sweepQueryDuration = 0;
         ReconcileFixture::$attempts = ReconcileFixture::$starts = ReconcileFixture::$durations = [];

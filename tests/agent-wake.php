@@ -41,6 +41,13 @@ namespace GlpiPlugin\Assetsync20 {
     function curl_init(string $url): object { WakeWire::$calls++; return (object) ['url' => $url]; }
     function curl_setopt_array(object $c, array $options): bool { WakeWire::$options = $options; return true; }
     function curl_exec(object $c): bool {
+        $headers = WakeWire::$options[CURLOPT_HTTPHEADER];
+        $lifecycle = in_array('X-Assetsync-Operation: initSession', $headers, true) ? 'init'
+            : (in_array('X-Assetsync-Operation: killSession', $headers, true) ? 'kill' : '');
+        if ($lifecycle !== '') {
+            $body = $lifecycle === 'init' ? '{"session_token":"native-test-session"}' : '{}';
+            return (WakeWire::$options[CURLOPT_WRITEFUNCTION])($c, $body) === strlen($body);
+        }
         if (WakeWire::$onSend !== null) { (WakeWire::$onSend)(); }
         $request = json_decode(WakeWire::$options[CURLOPT_POSTFIELDS], true);
         $response = ['version' => 1, 'state' => 'completed'] + array_intersect_key($request, array_flip(['installation', 'registration', 'generation', 'connection_id']));
@@ -139,28 +146,26 @@ namespace {
     Config::$values[Settings::CONTEXT] = $settings;
     User::$httpFields = ['2fa' => null, '2fa_unenforced' => 0];
     $CFG_GLPI['2fa_enforced'] = 0;
-    $wakeToken = Settings::configureWake(true, true);
+    Settings::configureWake(true);
+    $wakeToken = new \GlpiPlugin\Assetsync20agent\AgentApi('b');
     $wake = ['version' => 1, 'kind' => 'wake'] + $request;
-    Wake::authorize($wake, $wakeToken, Settings::load());
-    scalarCheck(Settings::load()['wake_token_hash'] === hash('sha256', $wakeToken)
-        && Settings::load()['wake_token_hash'] !== hash('sha256', $token), 'Wake is separately hashed, not a reused pull secret.');
+    Wake::authorize($wake, Settings::load(), $wakeToken);
+    scalarCheck(Settings::load()['wake_enabled'] === '1' && !isset(Settings::load()['wake_token_hash']), 'Native wake needs no custom secret.');
     foreach (['version', 'extra', 'binding', 'token', 'disabled', 'password', 'profile'] as $case) {
         $r = $wake; $s = Settings::load(); $t = $wakeToken;
         if ($case === 'version') { $r['version'] = 2; }
         if ($case === 'extra') { $r['items_id'] = 201; }
         if ($case === 'binding') { $r['generation'] = str_repeat('0', 32); }
-        if ($case === 'token') { $t = $token; }
+        if ($case === 'token') { $t = new \GlpiPlugin\Assetsync20agent\AgentApi('b', false); }
         if ($case === 'disabled') { unset($s['wake_enabled']); }
         if ($case === 'password') { $s['service_password'] = 'changed'; }
         if ($case === 'profile') { $s['service_profile'] = '999'; }
-        wakeReject(static fn () => Wake::authorize($r, $t, $s), 'Wake rejects ' . $case . ' before work.');
+        wakeReject(static fn () => Wake::authorize($r, $s, $t), 'Wake rejects ' . $case . ' before work.');
     }
-    $newToken = Settings::configureWake(true, true);
-    wakeReject(static fn () => Wake::authorize($wake, $wakeToken, Settings::load()), 'Rotation revokes old wake credentials.');
-    Wake::authorize($wake, $newToken, Settings::load());
     Settings::configureWake(false);
-    wakeReject(static fn () => Wake::authorize($wake, $newToken, Settings::load()), 'Disable revokes wake credentials.');
-    $newToken = Settings::configureWake(true, true);
+    wakeReject(static fn () => Wake::authorize($wake, Settings::load(), $wakeToken), 'Disable revokes native wake admission.');
+    Settings::configureWake(true);
+    $newToken = new \GlpiPlugin\Assetsync20agent\AgentApi('b');
 
     User::$httpFields = ['2fa' => null, '2fa_unenforced' => 0];
     $CFG_GLPI['2fa_enforced'] = 0;
@@ -173,7 +178,7 @@ namespace {
         $CFG_GLPI['2fa_enforced'] = $case === 'malformed_policy' ? 'unknown' : 0;
         wakeReject(static fn () => ServiceContext::httpAccount((int) $settings['service_user']), 'HTTP MFA fails closed: ' . $case);
         $beforeMfa = Config::$values;
-        wakeReject(static fn () => Settings::configureWake(true, true), 'Setup refuses unsupported HTTP MFA: ' . $case);
+        wakeReject(static fn () => Settings::configureWake(true), 'Setup refuses unsupported HTTP MFA: ' . $case);
         scalarCheck(Config::$values === $beforeMfa, 'MFA rejection does not enable wake or issue a key: ' . $case);
     }
     TOTPManager::$enabled = false; TOTPManager::$enforcement = 0; TOTPManager::$unavailable = false; $CFG_GLPI['2fa_enforced'] = 0;
@@ -184,7 +189,7 @@ namespace {
     wakeReject(static fn () => Wake::receive($wake, $newToken), 'Failed rate write/readback cannot admit work.');
     Config::$failWakeWrites = false;
     $wakeSettings = Settings::load();
-    foreach (['mode', 'endpoint', 'service_profile', 'wake_token_hash', 'wake_enabled'] as $key) {
+    foreach (['mode', 'agent_api_url', 'service_profile', 'agent_user_token', 'wake_enabled'] as $key) {
         Config::$values[Settings::CONTEXT] = array_replace($wakeSettings, ['wake_last_attempt' => '0']);
         $readsAfterAdmission = 0;
         Config::$readHook = static function (string $context) use ($key, &$readsAfterAdmission): void {
@@ -207,12 +212,13 @@ namespace {
     scalarCheck((new Worker())->run(hrtime(true) - 1) === 0 && (new Worker())->reconcile(hrtime(true) - 1) === 0
         && Config::$values === $before, 'Expired shared budgets cannot start tasks/reconciliation or renew a fresh local budget.');
 
-    $url = 'https://b.invalid/plugins/assetsync20agent/front/agent-wake.php';
-    scalarCheck(AgentWake::validUrl($url) && AgentWake::validUrl(str_replace('/plugins/', '/marketplace/', $url)), 'Explicit plugin and marketplace wake aliases are accepted.');
-    foreach (['http://b.invalid/plugins/assetsync20agent/front/agent-wake.php', $url . '?token=x', $url . '/other',
-        str_replace('b.invalid', 'u:p@b.invalid', $url)] as $bad) { scalarCheck(!AgentWake::validUrl($bad), 'Unsafe wake URL rejected.'); }
+    $url = 'https://b.invalid/plugins/assetsync20agent/front/agent-api.php';
+    scalarCheck(\GlpiPlugin\Assetsync20\AgentSession::validUrl($url) && \GlpiPlugin\Assetsync20\AgentSession::validUrl(str_replace('/plugins/', '/marketplace/', $url)), 'Explicit plugin and marketplace wake aliases are accepted.');
+    foreach (['http://b.invalid/plugins/assetsync20agent/front/agent-api.php', $url . '?token=x', $url . '/other',
+        str_replace('b.invalid', 'u:p@b.invalid', $url)] as $bad) { scalarCheck(!\GlpiPlugin\Assetsync20\AgentSession::validUrl($bad), 'Unsafe wake URL rejected.'); }
     foreach (['123', 'b', 'c', 'd'] as $id) {
-        GlpiBConnection::save(['id' => $id, 'mode' => 'agent', 'active' => true, 'base_url' => 'https://' . $id . '.invalid', 'wake_enabled' => true, 'wake_url' => $url, 'wake_token' => $newToken]);
+        GlpiBConnection::save(['id' => $id, 'mode' => 'agent', 'active' => true, 'base_url' => 'https://' . $id . '.invalid', 'wake_enabled' => true, 'agent_api_url' => $url, 'agent_auth' => 'glpi_session', 'agent_app_token' => 'app', 'agent_user_token' => 'user',
+                'agent_peer_user' => '7', 'agent_peer_api_client' => '9', 'agent_peer_profile' => '4', 'agent_peer_entity' => '100']);
         if ($id !== 'b') { AgentTask::register($id, $settings['installation']); }
     }
     unset(Config::$values[GlpiBConnection::CONTEXT]['wake_phase']);
@@ -229,7 +235,7 @@ namespace {
     Config::$failWakeWrites = false;
     $work = AgentWake::plan();
     $result = AgentWake::send($work, hrtime(true) + 900_000_000);
-    scalarCheck($result === ['status' => 200, 'state' => 'completed'] && WakeWire::$calls === 1, 'Pinned current binding sends one wake after lock release.');
+    scalarCheck($result === ['status' => 200, 'state' => 'completed'] && WakeWire::$calls === 3, 'Pinned current binding sends one wake plus two native lifecycle calls after lock release.');
     $options = WakeWire::$options;
     AgentWake::complete($work, $result, hrtime(true) + 1_000_000_000);
     $retry = json_decode(Config::$values[GlpiBConnection::CONTEXT]['wake_backoff'], true)[$work['connection']['id']];
@@ -352,10 +358,10 @@ namespace {
     };
     AgentWake::send($fallback, hrtime(true) + 1_000_000_000);
     WakeWire::$onSend = null;
-    scalarCheck(WakeWire::$calls === $calls + 1, 'Fallback sends exactly one bounded wake.');
+    scalarCheck(WakeWire::$calls === $calls + 3, 'Fallback sends one bounded wake plus two native lifecycle calls.');
     $old = json_decode(Config::$values[GlpiBConnection::CONTEXT]['wake_backoff'], true);
     $changed = GlpiBConnection::find($fallback['connection']['id']);
-    GlpiBConnection::save(array_replace($changed, ['wake_token' => str_repeat('9', 64)]));
+    GlpiBConnection::save(array_replace($changed, ['agent_user_token' => 'changed-native-token']));
     AgentWake::plan();
     $clean = json_decode(Config::$values[GlpiBConnection::CONTEXT]['wake_backoff'], true);
     scalarCheck(!isset($clean[$changed['id']]) && !isset($clean['123']), 'Rotated keys and disabled connections lose stale retry records.');
@@ -376,14 +382,15 @@ namespace {
         \GlpiPlugin\Assetsync20\AssetSyncQueue::install();
         \GlpiPlugin\Assetsync20\AssetSyncLink::install();
         GlpiBConnection::save(['id' => 'cadence', 'mode' => 'agent', 'active' => true, 'base_url' => 'https://b.invalid',
-            'wake_enabled' => true, 'wake_url' => $url, 'wake_token' => $newToken]);
+            'wake_enabled' => true, 'agent_api_url' => $url, 'agent_auth' => 'glpi_session', 'agent_app_token' => 'app', 'agent_user_token' => 'user',
+                'agent_peer_user' => '7', 'agent_peer_api_client' => '9', 'agent_peer_profile' => '4', 'agent_peer_entity' => '100']);
         AgentTask::register('cadence', $settings['installation']);
         $calls = WakeWire::$calls;
         WakeWire::$onSend = static function () use ($DB): void {
             scalarCheck($DB->runOwned === 0 && $DB->transaction === 0, 'Whole-run leftover HTTP starts outside the mutex and transaction.');
         };
         $service = new \GlpiPlugin\Assetsync20\AssetSyncService();
-        scalarCheck($service->run(1, $budget) === 0 && WakeWire::$calls === $calls + 1,
+        scalarCheck($service->run(1, $budget) === 0 && WakeWire::$calls === $calls + 3,
             'An empty ordinary pass wakes in the same cycle instead of waiting for an alternating phase: ' . $budget);
         $metrics = json_decode(substr(array_pop(Toolbox::$entries), strlen('AssetSync2.0 run ')), true);
         scalarCheck($metrics['stop_reason'] === 'no_due_jobs' && $metrics['wake']['state'] === 'completed'
@@ -398,7 +405,7 @@ namespace {
             'Full ordinary budget pressure defers wake without shortening work: ' . $budget);
         $service->run(1, $budget);
         $metrics = json_decode(substr(array_pop(Toolbox::$entries), strlen('AssetSync2.0 run ')), true);
-        scalarCheck(WakeWire::$calls === $calls + 1 && $metrics['stop_reason'] === 'wake_turn'
+        scalarCheck(WakeWire::$calls === $calls + 3 && $metrics['stop_reason'] === 'wake_turn'
             && Config::$values[GlpiBConnection::CONTEXT]['wake_phase'] === 'ordinary', 'Next turn is one wake-only fallback then ordinary resumes: ' . $budget);
         WakeWire::$onSend = null;
         $cadenceValues = Config::$values;
@@ -442,8 +449,8 @@ namespace {
     require __DIR__ . '/../assetsync20agent/setup.php';
     plugin_assetsync20agent_boot();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
-        scalarCheck((preg_match($pattern, '/front/agent-wake.php') === 1 || preg_match($pattern, '/front/agent-api.php') === 1)
-            && preg_match($pattern, '/front/agent-wake.php/other') === 0 && preg_match($pattern, '/front/config.php') === 0
+        scalarCheck((preg_match($pattern, '/front/agent-api.php') === 1 || preg_match($pattern, '/front/agent-api.php') === 1)
+            && preg_match($pattern, '/front/agent-api.php/other') === 0 && preg_match($pattern, '/front/config.php') === 0
             && preg_match($pattern, '/front/agent-api.php/other') === 0 && preg_match($pattern, '/front/agent-api.phpx') === 0,
             'Actual boot registration exempts only the exact machine routes.');
     }

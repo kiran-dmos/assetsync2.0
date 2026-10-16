@@ -176,11 +176,11 @@ final class AgentTask
         if (!$connection || !GlpiBConnection::isAgent($connection) || !preg_match('/^[a-f0-9]{32}$/D', $installation)) {
             throw new \RuntimeException('Choose an active agent connection and B installation identity.');
         }
-        $credentials = ['registration' => bin2hex(random_bytes(16)), 'generation' => bin2hex(random_bytes(16)), 'token' => bin2hex(random_bytes(32))];
+        $credentials = ['registration' => bin2hex(random_bytes(16)), 'generation' => bin2hex(random_bytes(16))];
         AgentInbox::sql('START TRANSACTION');
         try {
             self::write($DB->insert(AgentInbox::REGISTRATIONS, ['id' => $credentials['registration'], 'generation' => $credentials['generation'],
-                'token_hash' => hash('sha256', $credentials['token']), 'connection_id' => $connectionId,
+                'token_hash' => '', 'connection_id' => $connectionId,
                 'connection_identity' => AgentInbox::identity($connection), 'routes' => '{}', 'active' => 1]));
             self::write($DB->insert(self::BINDINGS, ['connection_id' => $connectionId, 'registration' => $credentials['registration'], 'installation' => $installation]));
             AgentInbox::sql('COMMIT');
@@ -252,18 +252,10 @@ final class AgentTask
         try {
             self::inspect($connectionId, $pairId);
         } catch (\Throwable) {
-            // The candidate is durable; never lose its once-visible credentials on publication failure.
+            // The candidate is durable; never lose its binding details on publication failure.
             $credentials['inspection_error'] = 'Candidate saved, but inspection could not be queued. Use Refresh observation.';
         }
         return $credentials;
-    }
-
-    public static function rotate(string $connectionId): array
-    {
-        $binding = self::binding($connectionId);
-        if (!$binding) { throw new \RuntimeException('Agent registration unavailable.'); }
-        $registration = self::registration($binding);
-        return ['registration' => $registration['id'], 'generation' => $registration['generation'], 'token' => AgentInbox::rotate($registration['id'])];
     }
 
     public static function recent(string $connectionId): array
@@ -624,10 +616,10 @@ final class AgentTask
     }
 
     /** Auth is checked for every pull/result, independently of notification ACKs. */
-    public static function exchange(array $request, string $token, ?AgentApi $api = null): array
+    public static function exchange(array $request, AgentApi $api): array
     {
         global $DB;
-        if (($api === null && !preg_match('/^[a-f0-9]{64}$/D', $token)) || !in_array($request['kind'] ?? '', ['pull', 'result', 'recovery'], true)) {
+        if (!in_array($request['kind'] ?? '', ['pull', 'result', 'recovery'], true)) {
             return ['status' => 401];
         }
         AgentInbox::sql('START TRANSACTION');
@@ -638,10 +630,8 @@ final class AgentTask
             catch (\RuntimeException $error) { throw new \UnexpectedValueException('Current registration unavailable.', 0, $error); }
             $connection = AgentInbox::connection($binding['connection_id']);
             if (!$connection) { throw new \UnexpectedValueException('Agent connection unavailable.'); }
-            if ($api !== null) { $api->assertPeer($connection); }
-            if (($api === null && (($connection['agent_auth'] ?? 'legacy_bearer') !== 'legacy_bearer'
-                    || !hash_equals($registration['token_hash'], hash('sha256', $token))))
-                || ($request['generation'] ?? '') !== $registration['generation']
+            $api->assertPeer($connection);
+            if (($request['generation'] ?? '') !== $registration['generation']
                 || ($request['installation'] ?? '') !== $binding['installation'] || ($request['connection_id'] ?? '') !== $binding['connection_id']) {
                 throw new \UnexpectedValueException('Task authentication failed.');
             }
@@ -650,8 +640,7 @@ final class AgentTask
                 $response = ['status' => 200, 'task' => null];
                 if (($request['subscriptions_only'] ?? false) !== true) {
                     $candidates = AgentInbox::sql('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
-                        . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT '
-                        . ($api === null ? 1 : 50) . ' FOR UPDATE');
+                        . ' AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 50 FOR UPDATE');
                     while ($candidate = $DB->fetchAssoc($candidates)) {
                         if (self::readableApiTask($api, $candidate)) { $task = $candidate; break; }
                     }
@@ -680,7 +669,7 @@ final class AgentTask
                             $expected = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                             $policyCurrent = $expected['policy'] === self::policy($pair);
                             if ($body['version'] === 6) {
-                                // Bearer pulls have no interactive Fields profile. Check the captured raw guard,
+                                // Check the captured raw guard,
                                 // then native values/instant/identity; worker metadata and rights are rechecked at finalize.
                                 $native = self::nativeEvidence($pair);
                                 $policyCurrent = $policyCurrent && self::sameEvidence($expected['modification'], $native['modification'])
@@ -852,9 +841,8 @@ final class AgentTask
     }
 
     /** The caller holds the binding lock. Lost pages replay fixed A-issued expiries on a later pass. */
-    private static function readableApiTask(?AgentApi $api, array $task): bool
+    private static function readableApiTask(AgentApi $api, array $task): bool
     {
-        if ($api === null) { return true; }
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
         if ($body['kind'] === 'discover') { return true; }
         $pair = self::isMatch($body) ? null : self::taskPair($task);
@@ -863,7 +851,7 @@ final class AgentTask
         return $api->activateReadAsset($body['itemtype'] ?? 'Computer', $localId);
     }
 
-    private static function subscriptions(array $binding, array $registration, int $budget, ?AgentApi $api = null): array
+    private static function subscriptions(array $binding, array $registration, int $budget, AgentApi $api): array
     {
         global $DB;
         $page = ['installation' => $binding['installation'], 'registration' => $registration['id'],
@@ -874,7 +862,7 @@ final class AgentTask
         $full = false;
         foreach ($DB->request(['FROM' => self::PAIRS, 'WHERE' => ['connection_id' => $binding['connection_id'],
             'id' => ['>', $cursor]], 'ORDER' => 'id ASC', 'LIMIT' => 50]) as $pair) {
-            try { self::scope($pair); $active = $api === null || $api->activateReadAsset($pair['itemtype'], (int) $pair['local_id']); }
+            try { self::scope($pair); $active = $api->activateReadAsset($pair['itemtype'], (int) $pair['local_id']); }
             catch (\Throwable) { $active = false; }
             if (!$active && (int) $pair['subscription_revision'] === 0) {
                 $cursor = $pair['id'];
@@ -900,7 +888,7 @@ final class AgentTask
         }
         if (!$full && $count < 50) { $cursor = ''; }
         self::write($DB->update(self::BINDINGS, ['subscription_cursor' => $cursor, 'subscription_revision' => $revision], ['connection_id' => $binding['connection_id']]));
-        $api?->restoreReadScope();
+        $api->restoreReadScope();
         return $page;
     }
 
@@ -1710,7 +1698,7 @@ final class AgentTask
         return ['context' => $context, 'seed' => $seed, 'guard' => self::creationSourceGuard($job)];
     }
 
-    /** Bearer pulls have no interactive Fields catalog. Compare the worker-validated persisted source. */
+    /** Compare the worker-validated persisted source before finalization. */
     private static function creationSourceGuard(array $job): string
     {
         global $DB;

@@ -40,14 +40,14 @@ GlpiBConnection::save(['id' => 'b', 'mode' => 'agent', 'base_url' => 'https://b.
 $settings = array_replace($settings, AgentTask::register('b', $settings['installation']));
 Config::$values['plugin:assetsync20agent'] = $settings;
 $request = array_intersect_key($settings, array_flip(['registration', 'generation', 'installation', 'connection_id']));
-$response = AgentTask::exchange($request + ['kind' => 'pull', 'subscriptions_only' => true], $settings['token']);
+$response = AgentTask::exchange($request + ['kind' => 'pull', 'subscriptions_only' => true], new \GlpiPlugin\Assetsync20\AgentApi('b'));
 TargetScope::receive($response['subscriptions'], $settings);
 scalarCheck($response['subscriptions']['updates'] === [] && iterator_to_array($DB->request(['FROM' => TargetScope::TABLE])) === [], 'Cold-start registration has no subscriptions.');
 AgentTask::discover('b', 'Computer', -1);
 scalarCheck(AgentTask::discovery('b')['state'] === 'pending', 'Cold-start discovery visibly waits for B.');
-$task = AgentTask::exchange($request + ['kind' => 'pull'], $settings['token'])['task'];
+$task = AgentTask::exchange($request + ['kind' => 'pull'], new \GlpiPlugin\Assetsync20\AgentApi('b'))['task'];
 $result = TaskJournal::run($task, $settings);
-scalarReceipt($request, $settings['token'], $task, $result);
+scalarReceipt($request, new \GlpiPlugin\Assetsync20\AgentApi('b'), $task, $result);
 scalarCheck(AgentTask::discovery('b')['state'] === 'ready' && count($result['discovery']['rows']) === 2
     && iterator_to_array($DB->request(['FROM' => TargetScope::TABLE])) === []
     && iterator_to_array($DB->request(['FROM' => AgentTask::PAIRS])) === [], 'Zero-subscription discovery returns permitted metadata without enrolling or pairing.');
@@ -337,5 +337,78 @@ scalarCheck(!AgentTask::install(), 'Migration rejects inconsistent bindings acro
 scalarCheck(AgentTask::binding('b') === $bindingBeforeConflict, 'Conflicting migration leaves the existing binding unchanged.');
 $DB->doQuery('DELETE FROM `' . AgentTask::PAIRS . '` WHERE `id` = ' . $DB->quote($conflictingPair['id']));
 scalarCheck(AgentTask::install(), 'Consistent migration remains restartable after conflict diagnosis.');
+
+// Native hooks remain local dirtiness hints for both parent and generated Fields rows.
+[$settings, $request, $api] = scalarControllerSetup('textfield', 'glpi_a', 'A', 'B');
+TargetScope::receive(AgentTask::exchange($request + ['kind' => 'pull', 'subscriptions_only' => true], $api)['subscriptions'], $settings);
+Outbox::install();
+(new Worker())->reconcile();
+$baseline = Outbox::find(201);
+$parent = new Computer();
+$parent->getFromDB(201);
+$parent->fields['last_boot'] = '2026-10-16 01:02:03';
+\GlpiPlugin\Assetsync20agent\ChangeHook::changed($parent);
+scalarCheck((int) TargetScope::subscription('Computer', 201, $settings)['dirty'] > 0 && Outbox::find(201) === $baseline,
+    'A last_boot-only parent save marks its native subscription dirty without an eager scan or write.');
+$child = new PluginFieldsComputerscalar();
+$child->fields = $DB->firstRow(PluginFieldsComputerscalar::getTable(), ['items_id' => 201]);
+\GlpiPlugin\Assetsync20agent\ChangeHook::changed($child);
+scalarCheck((int) TargetScope::subscription('Computer', 201, $settings)['dirty'] > 1 && Outbox::find(201) === $baseline,
+    'Generated custom-row hooks preserve deferred native fingerprinting.');
+$DB->update(PluginFieldsComputerscalar::getTable(), ['textfield' => 'Missed custom edit'], ['items_id' => 201]);
+(new Worker())->reconcile();
+scalarCheck((int) Outbox::find(201)['revision'] > (int) $baseline['revision'],
+    'Native subscription reconciliation detects missed custom edits.');
+
+if (!class_exists('Toolbox')) {
+    class Toolbox
+    {
+        public static function logInFile($name, $message): void {}
+    }
+}
+$readHook = Config::$readHook;
+Config::$readHook = static function (): void { throw new RuntimeException('Configuration unavailable'); };
+try {
+    \GlpiPlugin\Assetsync20agent\ChangeHook::changed($parent);
+    scalarCheck(true, 'Native readiness failure never escapes into a human asset save.');
+} finally { Config::$readHook = $readHook; }
+
+[$settings, $request, $api] = scalarControllerSetup('textfield', 'glpi_a', 'A', 'B');
+FieldMapping::save('b', 'Computer', [['glpi_a_field_key' => 'name', 'glpi_b_field_key' => 'name',
+    'source_of_truth' => 'glpi_a']], AgentTask::catalog('b', 'Computer')['fields']);
+TargetScope::receive(AgentTask::exchange($request + ['kind' => 'pull', 'subscriptions_only' => true], $api)['subscriptions'], $settings);
+Outbox::install();
+(new Worker())->reconcile();
+$baseline = Outbox::find(201);
+$DB->update('glpi_computers', ['name' => 'Missed native name edit'], ['id' => 201]);
+(new Worker())->reconcile();
+scalarCheck((int) Outbox::find(201)['revision'] > (int) $baseline['revision'],
+    'Native subscription reconciliation detects a persisted supported Name edit without a hook.');
+
+// Native subscription ACK/claim fencing retains the original reliability semantics.
+[$settings, $request, $api] = scalarControllerSetup('textfield', 'glpi_a', 'A', 'B');
+TargetScope::receive(AgentTask::exchange($request + ['kind' => 'pull', 'subscriptions_only' => true], $api)['subscriptions'], $settings);
+Outbox::install();
+$subscription = TargetScope::subscription('Computer', 201, $settings);
+$snapshot = TargetScope::snapshot($subscription, $settings);
+Outbox::observe(201, $snapshot, false);
+$sent = Outbox::claim($settings);
+scalarCheck($sent !== null, 'A native subscribed asset can be claimed.');
+Outbox::observe(201, ['fingerprint' => str_repeat('1', 64), 'lifecycle' => 'present'], false);
+$ack = ['accepted' => true] + array_intersect_key($sent, array_flip(['registration', 'generation', 'computer_id', 'revision', 'itemtype']));
+scalarCheck(Outbox::acknowledge($sent, $ack, $settings) && (int) Outbox::find(201)['revision'] === 2
+    && (int) Outbox::find(201)['acked_revision'] === 1, 'Old ACK cannot clear a newer native revision.');
+$sent2 = Outbox::claim($settings);
+scalarCheck($sent2 !== null && !Outbox::acknowledge($sent, $ack, $settings) && !Outbox::retry($sent, 'retrying'),
+    'Replaced native claims cannot acknowledge or retry.');
+$changed = array_replace($settings, ['generation' => str_repeat('e', 32)]);
+scalarCheck(!Outbox::acknowledge($sent2, ['accepted' => true] + array_intersect_key($sent2,
+    array_flip(['registration', 'generation', 'computer_id', 'revision', 'itemtype'])), $changed),
+    'Old generation cannot clear current native work.');
+$before = Outbox::find(201);
+Outbox::observe(201, ['fingerprint' => str_repeat('2', 64), 'lifecycle' => 'present'], false);
+Outbox::observe(201, $snapshot, true, $before);
+scalarCheck(Outbox::find(201)['fingerprint'] === str_repeat('2', 64), 'Stale native reconciliation cannot overwrite a newer hook.');
+
 echo "Multi-asset tests passed ($checks checks including scalar prerequisites; host doubles/SQLite only).\n";
 ob_end_flush();

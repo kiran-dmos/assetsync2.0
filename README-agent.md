@@ -1,137 +1,79 @@
 # GLPI B Agent
 
-## Native GLPI Session Authentication Prototype
+## Native-Only Setup And Upgrade
 
-Controller **0.7.0** and agent **0.6.0** add an explicit transport selection under
-the existing agent mode. Existing installations default to **Legacy bearer**.
-Upgrade **B first, then A**, using GLPI's plugin Update action with AssetSync
-workers and automatic actions paused. Do not upgrade GLPI or Fields for this
-change, reset the existing installation identity, or discard journals and pending
-task evidence.
+Controller **0.8.0** and agent **0.7.0** use GLPI-native authentication for all
+agent communications. Custom registration bearer tokens and wake keys, their
+rotation controls, and B's notification-only REST mode are removed. Ordinary
+controller REST asset synchronization and its GLPI credentials remain supported.
 
-Select **GLPI native session** on both installations. The peer HTTPS Agent API
-URL is the other installation's exact
-/plugins/assetsync20/front/agent-api.php (A) or
-/plugins/assetsync20agent/front/agent-api.php (B), including any GLPI URL prefix.
-The marketplace alias is also accepted. These URLs require direct HTTPS with a
-trusted certificate and matching hostname; redirects are disabled.
+1. Back up both installations and pause AssetSync workers/scheduled runs. Install
+   the complete **B plugin first, then A**, using GLPI's plugin **Update** action.
+   Delete stale deployed copies of A's front/agent-notify.php and front/agent-task.php
+   and B's front/agent-wake.php. Refresh serving PHP OPcache and reload the A worker.
+   Do not upgrade GLPI or Fields as part of this change.
+2. Update removes obsolete custom credentials through GLPI configuration APIs.
+   Both sides disable wake once and clear derived admission/retry state; explicitly
+   re-enable native wake after configuration. Repeating Update does not disable a
+   wake already re-enabled after migration. Existing registration, generation,
+   installation, pair/link IDs, tasks, hashes and journal evidence are preserved.
+   Do not re-register or reset an existing agent binding.
+3. On A's agent connection configure the B Agent API URL; on B configure A's URL:
+   A: https://A/plugins/assetsync20/front/agent-api.php
+   B: https://B/plugins/assetsync20agent/front/agent-api.php
+   Include any GLPI URL prefix; marketplace aliases are accepted. Direct HTTPS,
+   a trusted certificate and a matching hostname are required; no redirects.
+4. Configure the destination's native GLPI app token and user API token in each
+   direction. Enable GLPI's legacy REST API and external-token authentication and
+   restrict each API client to the actual caller IP. Select the expected incoming
+   local user/API client/profile/initial exact entity grant on each installation.
+   These are explicit local selections, not IDs inferred from the other server.
+   Transport accounts should have only required asset/Fields READ, not config
+   UPDATE or asset UPDATE/CREATE. Enabled/enforced transport MFA is rejected.
+5. Keep B's separate local service account/profile/password for real GLPI model
+   writes. Its password stays on B; never give A the writer's user API token.
+   Native app/user tokens and the local service password are encrypted with GLPIKey.
+   Session tokens exist only in memory for one bounded turn. The native adapter
+   permits session lifecycle and named agent operations, never generic asset CRUD.
+6. New installations register B's persisted installation identity on **Agent Pair**.
+   Registration returns binding identifiers only. Enter registration, generation
+   and connection ID on B, then configure routes/mappings as described below.
+   A's worker is required. B may use its CLI worker or optional native HTTPS wake;
+   wake uses the same B Agent API URL and credentials, with no separate URL/key.
 
-For each direction configure the destination's native app token and user API
-token. Enable GLPI's legacy REST API and external-token authentication, and
-configure the API client's IP restrictions for the actual caller. On the receiver,
-explicitly select the expected **local user**, **local API client**, **profile** and
-**exact entity grant**. These are local selections, not IDs inferred from the peer.
-The profile must use the central interface and have a direct nonrecursive grant
-to the selected entity. Transport does not require global configuration-write
-permission. Existing pair, route, mapping and asset permissions still govern the
-operations, with profile/entity state loaded afresh on every request. Enabled or
-enforced peer MFA is unsupported and rejected before creating a native session.
+Old notification-only or incomplete native configurations stop before B scans,
+claims or executes work. Missing native credentials never trigger a fallback.
+The registration admin page retains evidence, revocation and saved-pair verification; it
+does not issue or rotate communication tokens. Keep all unresolved evidence.
+Downgrading code to a legacy release is not a supported authentication rollback.
 
-Native mode does not require a custom registration bearer token, a custom wake
-key, or the legacy notification URL. Registration, generation, installation and
-connection bindings are still required. B's dedicated local service account,
-profile and password remain necessary for its existing real GLPI model execution.
-Saved native app/user tokens and the service password are encrypted with GLPIKey;
-session tokens are held only in memory for one bounded turn.
+B reuses one A session across pulls/results/recovery/notifications/health. A opens
+one B session per bounded wake. Core initialization/termination calls count
+separately from protocol requests. Authentication failures retain durable results
+for a later bounded cycle; ambiguous mutations are never automatically replayed.
+The API releases its session lock before local model execution, rejects cookies
+and query/body credentials, and refreshes permissions per operation.
 
-B reuses an A session across task pulls, results, recovery, notifications and health.
-A uses a B session for its bounded wake attempt. Native initialization and
-termination use the GLPI core API methods through narrow plugin adapters. The
-adapter allows only those lifecycle operations and the named plugin operations,
-never stock asset CRUD. It accepts credentials only in headers, rejects cookies
-and query credentials, and releases the API session lock before B executes local
-models. There are no REST asset writes or SQL asset writes added by this mode.
-
-Enable B's optional HTTPS wake after saving the complete native configuration,
-then enable wake on A's connection. Native wake does not generate a separate key.
-A transport or identity change invalidates admitted wake/subscription transport
-state; save the wake setting again before resuming. Task bodies, hashes, journals,
-asset-link identity and the existing glpi_a/glpi_b/native Both authority, matching,
-creation and metadata paths are retained.
-
-To roll back, explicitly select **Legacy bearer** on both sides, restore/confirm
-the saved legacy receiver URL and wake settings, and re-enable wake as needed.
-Retained custom secrets are available for rollback; a new native-only installation
-must configure legacy credentials before selecting legacy mode. Native mode never
-falls back to bearer or stock REST asset calls. Authentication failures retain
-durable results for a later worker turn; ambiguous operations are not automatically
-replayed.
-
-Offline verification:
-- php tests/agent-native-session.php
-- php tests/agent-native-api.php
-- php tests/agent-native-settings.php
-- php tests/agent-native-legacy.php
-
-These tests use mocked HTTP/core sessions and SQLite/GLPI doubles. They do not
-qualify actual HTTPS, core authentication, InnoDB concurrency, local model History,
-or deployed A/B interoperability. Count session initialization/termination
-separately from protocol operations when measuring requests; no live performance
-claim is made by the offline fixtures.
+Offline checks use mocked HTTP/core sessions and SQLite/GLPI doubles, not a claim
+of deployed core compatibility, crash safety, scale or production readiness.
+Focused suites are agent-native-session.php, agent-native-api.php,
+agent-native-settings.php and agent-native-legacy.php under tests/.
 
 This branch provides a separate `assetsync20agent` plugin for GLPI B. Install the
 controller (`assetsync20`) only on A. B stores typed asset fingerprints and a durable
-outbox; it has no mappings and cannot run the controller. In default REST mode A remains responsible
+outbox; it has no mappings and cannot run the controller. In A's ordinary REST asset mode, A remains responsible
 for native/Fields metadata, mappings, permissions, Both/source-of-truth policy,
 native UUID handling and billing. The prototype has passed the isolated checks
 listed below; this is not a production rollout or scale qualification.
 
 ## Bounded Agent-Only Mode
 
-### Optional HTTPS Wake (A 0.6.5 / B 0.5.4)
+### Optional Native HTTPS Wake
 
-HTTPS wake is opt-in and disabled by default on both sides. It lets A's existing
-background CLI worker request one bounded B worker turn. B still pulls and reports
-the existing agent tasks; a wake contains no asset command and adds no REST fallback,
-business policy, table, or task protocol version. Mappings, entity routes, permissions,
-matching, creation and Both authority stay in their existing settings.
-
-Back up both installations and preserve all retained tasks, journals and results.
-During the upgrade stop both AssetSync workers and scheduled AssetSync runs; install
-**B agent 0.5.4 first, then A controller 0.6.5**, using GLPI's plugin Update action.
-No new schema migration is required for wake. Resume A's CLI background worker and
-its existing schedule after both updates succeed. Deploy the complete B plugin
-files and refresh the serving PHP OPcache through the normal deployment procedure
-when necessary; file replacement is not an atomic cache upgrade. The wake endpoint
-rejects a loaded Worker class without the matching wake capability marker, including
-older cached workers that would ignore extra run arguments. Reload A's existing
-CLI worker once after its code upgrade. Enabling or rotating wake later does not
-require restarting B's CLI worker, changing its configuration, or restarting A.
-Do not change worker intervals
-to compensate for an unverified deployment.
-
-1. Finish the existing agent binding and dedicated B service-account setup first.
-   Keep a least-privilege profile with the required exact nonrecursive entity grants.
-   Enabled or enforced service-account MFA is unsupported for HTTP execution.
-   Unreadable MFA policy and interactive authentication steps fail closed; do not
-   weaken global MFA policy to enable wake. Keep using the existing CLI path when
-   the service account cannot use this HTTP path.
-2. Provide direct HTTPS from A to B's
-   `/plugins/assetsync20agent/front/agent-wake.php` (or its `/marketplace/` alias).
-   Provide verified HTTPS from B to A's existing receiver/task endpoints too.
-   Use certificates trusted by the PHP/cURL runtime with matching hostnames. No
-   redirects, insecure certificate overrides, URL credentials, query strings or
-   forwarded-protocol substitutions are supported. B must see server-side HTTPS.
-3. On B's Agent settings page, enable **Allow HTTPS wake from A**. The new independent
-   wake key is shown once in the successful POST response. B stores only its hash;
-   a later page view cannot recover it. Use HTTPS for administration as well.
-4. On A's saved B-agent connection, enter the **B backend HTTPS wake URL**, paste the
-   separate wake key, and enable **Optional HTTPS wake**. This backend URL is separate
-   from the browser Base URL; a localhost browser address does not identify a server
-   reachable from A's runtime. A encrypts the saved key with GLPIKey and never fills
-   the password input with the saved value. Blank keeps the saved key.
-5. Keep `plugins:assetsync20:worker --loop` running on A. Manual web runs do ordinary
-   work and do not reserve or send wakes. B's `plugins:assetsync20agent:worker --loop`
-   remains available and is optional when HTTPS wake is enabled; both paths share
-   the same nonblocking B worker lock.
-
-Rotate the key on B, then replace A's saved wake key. The previous key is revoked
-immediately. **Disable and revoke** on B removes its accepted wake credential;
-disabling A only stops A from sending. Changes to B's binding, registration,
-generation, endpoint, service identity/profile/password or pull credential invalidate
-the bound wake key. Issue a new key and update A after such changes. Setup pages
-require ordinary GLPI configuration permissions and CSRF-protected POST actions;
-read-only users cannot change settings, and key responses use no-store caching.
+Enable wake on B after saving its complete native binding, then on A's connection.
+Changes to native credentials or service scope invalidate B's wake binding; save
+its wake setting again. Disabling B blocks incoming wake; disabling A stops sending.
+B's CLI worker and HTTPS wake share the same nonblocking worker lock.
 
 Ordinary CLI work keeps its full existing 60-second worker or 25-second cron budget.
 After it finishes, A may reserve one wake if about ten seconds plus cleanup time
@@ -169,8 +111,8 @@ and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
 retain their protocol behavior and permission checks.
 
 Native Both was introduced in **B agent 0.5.3 / A controller 0.6.4**. For the current
-release use the B-first 0.5.4 / A 0.6.5 procedure above. B's read-only pull retries with the v1-v5
-capability list when an older A rejects the additive v6 list. Upgrade A before
+release use the B-first 0.7.0 / A 0.8.0 procedure above. Both sides must support
+the native-only Agent API; no older-controller pull downgrade is attempted. Upgrade A before
 enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
 There is no task downgrade or REST fallback. No new database table or column is
 required for Both; older installations still need their existing additive migrations.
@@ -200,11 +142,7 @@ remains excluded. Retained v1-v5 bodies, hashes, results and replay schemas are 
 
 ### Automatic Creation (Protocol V5)
 
-Upgrade **A controller 0.6.2 first, then B agent 0.5.1**, with both workers stopped,
-using GLPI's plugin Update action. B advertises `task_versions: [1,2,3,4,5]`;
-A withholds creation tasks from older agents and shows an upgrade requirement.
-There are no new configuration switches or creation-specific database columns.
-Existing eligible routes authorize automatic creation after complete no-match.
+Follow the native-only B-first upgrade procedure above. Existing eligible routes authorize automatic creation after complete no-match.
 Preserve all retained task/journal bodies, hashes, results and outstanding slots.
 Versions 1-4 keep their wire formats and replay behavior.
 
@@ -334,13 +272,8 @@ fixture columns; they do not prove live MySQL collation, InnoDB concurrency or s
 
 ### Installation And Automatic Pairing
 
-Stop both workers, including scheduled runs, before upgrading AssetSync. Install
-the A controller code first (0.6.2), then the B agent code (0.5.1),
-using GLPI's plugin Update action when upgrading from older installed versions.
-New task/pair/journal tables and columns are additive. Existing connections default
-to REST and retain their existing behavior. This is an AssetSync upgrade only;
-do not upgrade official GLPI or Fields as part of this procedure. Resume workers
-only after both code updates and any required additive migrations succeed.
+Follow the native-only setup/upgrade procedure above. All retained task, pair and
+journal data stays intact; ordinary A REST asset connections retain their mode.
 
 New automatic pairs use **version 4** for matching, reverify, inspect and apply,
 including separate native identity guards. Existing manual/legacy pairs continue
@@ -352,23 +285,7 @@ results; do not rewrite, delete or reset them during an upgrade. B validates the
 original wire hash before checking scalar values. Refresh observation after the
 upgrade to expose Yes/No and Date fields in the mapping catalog.
 
-1. Select **agent** for the A connection. B REST tokens are not saved in this mode.
-2. On B's agent configuration, obtain its persisted installation identity. This
-   identifies the installation, not the Computer UUID.
-3. Open **Agent Pair** on A and register the installation identity. Registration
-   needs no asset pair, route, mapping, REST token or connection test.
-4. Enter the once-displayed registration/generation/token and connection ID on B.
-   Select agent mode and a dedicated active GLPI service account using the native
-   searchable account selector. Select a permitted profile with direct nonrecursive
-   entity assignments, selected asset type READ
-   and UPDATE, and applicable Fields container rights. Its password is encrypted
-   using GLPIKey on B only. Set the direct HTTPS notification URL described below.
-5. A exclusively owns type selection, asset scope, routes, mappings and pair management.
-   B setup contains only transport binding and service identity/permissions, with
-   read-only permitted entity information. B has no asset-scope editor. Migration
-   enrolls nothing; old configured Computer/entity settings remain solely for
-   v1/v2 compatibility. Inventory, links and outbox rows never enroll subscriptions.
-6. Configure an active, exact single-type nonrecursive route on A for each intended
+1. Configure an active, exact single-type nonrecursive route on A for each intended
    source/target entity. B discovery on Agent Pair can populate the B entity selector;
    it is read-only and does not require selecting assets or saving manual candidates.
    Run A and B workers. A's scanner automatically queues eligible unpaired assets;
@@ -377,7 +294,7 @@ upgrade to expose Yes/No and Date fields in the mapping catalog.
    Complete authorized no-match starts v5 creation using the saved supported mappings,
    followed by independent confirmation. Existing assets are not moved or relinked;
    existing candidates and links remain intact.
-7. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
+2. Map Name, Comments or existing custom **text**, **Yes/No** or **Date** fields.
    Custom endpoint types must match. Each mapping must use
    `glpi_a` or `glpi_b` authority; matching native Name/Comments on confirmed
    existing pairs also support v6 Both. Metadata GET uses the bounded
@@ -400,7 +317,7 @@ flow does not infer positional, name or UUID matches. Manual candidates are neve
 overwritten by automatic matching. Inspect and resolve the visible cause of blocked
 work; partial or uncertain apply results still require investigation.
 
-B pulls tasks from the separate `front/agent-task.php` HTTPS endpoint and reports
+B pulls tasks through the native Agent API and reports
 durable results before ACK. A retains immutable task IDs, bindings, expected
 values, policy/metadata fingerprints and captured queue revisions; B journals
 before execution. A releases its claim while `waiting_agent`. New notifications
@@ -498,10 +415,8 @@ Oversized work fails closed and needs smaller values or a narrower eligible scop
 The endpoints require
 direct HTTPS and normal CA validation, without redirects or insecure overrides.
 
-Agent Pair offers token rotation for both unconfirmed candidates and confirmed
-pairs. Rotation preserves task bindings and shows the replacement token once;
-update B's token. If initial inspection publication fails, the candidate and its
-credentials are still returned; use Refresh observation when storage is available.
+If initial inspection publication fails, its candidate and binding identifiers
+remain available; use Refresh observation when storage is available.
 Recent task outcomes remain visible after an inspection releases its slot.
 Releasing a no-write setup task does not itself queue an inspection: use Refresh
 observation. Partial and uncertain tasks remain retained for investigation.
@@ -540,39 +455,7 @@ The plugin endpoint issues a native core-authenticated session marked for its
 configured connection. A session created through stock `apirest.php/initSession`
 does not have that marker and is deliberately rejected by plugin operations.
 
-## REST Notification Mode Setup
-
-1. After upgrading B first as described above, upgrade/install controller version **0.6.0** as `plugins/assetsync20` on A using GLPI's
-   plugin installer. This adds registration/receipt tables, confirmed-link
-   evidence, queue revision counters and claim tokens. Stop workers during the
-   schema upgrade, including cron, and run GLPI's plugin **Update** action (not
-   uninstall/reinstall). Resume cron/workers only after migrations succeed.
-   Pre-upgrade running claims cannot
-   finish with an absent token and become reclaimable after their existing lease.
-2. Copy **only** `assetsync20agent/` to `plugins/assetsync20agent` on B; install
-   and enable it through GLPI. Do not install the controller on B.
-3. On A, configure the existing connection, Computer routes and mappings. The
-   existing controller must have successfully verified each pair after this
-   upgrade. Historical positive remote IDs alone are deliberately unconfirmed.
-   Ordinary A processing establishes confirmation. For a saved legacy pair,
-   including A-authoritative-only mappings, use **Verify saved pair** on the agent
-   registration page after step 4. Enter the single saved A Computer ID. The
-   protected POST action requires `config UPDATE`, asset read permission and the
-   registration's source-entity scope. It makes a bounded read-only B API request
-   for that saved ID and checks serial, actual entity, active route and ambiguity;
-   it changes only confirmation evidence. No dummy data edits are needed.
-   The notification path never searches serials, creates assets, merges, relinks
-   or moves B entities.
-4. Open **B Agent Notifications > Agent registrations and blocked notifications**
-   on A's dashboard/activity page. With central `config UPDATE` and the route's
-   source entity active, select one connection and its approved Computer routes.
-   Copy the once-visible registration, generation and token into B's plugin setup.
-5. Set B's receiver URL to
-   `https://A/plugins/assetsync20/front/agent-notify.php` (include any GLPI prefix).
-   The receiver requires direct web-server TLS (`HTTPS=on/1`); it ignores forwarded
-   protocol headers. TLS-terminating proxies without direct TLS to GLPI are not
-   supported by this first prototype. Configure normal system/PHP CA trust for a
-   private lab CA; there is no insecure HTTP or certificate-verification override.
+## Worker Operation
 
 Run from B's GLPI root as its normal GLPI CLI user:
 
@@ -609,13 +492,9 @@ admission commits. Duplicate notifications after lost ACKs are idempotent. New
 arrivals do not reset running leases or retry timing. Random claim tokens fence
 all queue/outbox ownership writes; old ACKs cannot clear newer revisions.
 
-Each registration binds an enabled connection identity and fingerprints of its
-approved route definitions. Editing route scope requires new approval through a
-new registration. Replacing/deleting a connection or changing its credentials
-invalidates registrations and confirmations. Token rotation through A's agent
-page preserves the registration generation and all revision watermarks. Update
-B with the new token. Revocation prevents new admission and is rechecked by jobs
-before mutations. New registrations have new random generations.
+Each registration binds an enabled connection identity and approved route scope.
+Native GLPI account/API-client permissions are rechecked for admission. Revocation
+prevents new admission; retained tasks and generations are never reset by upgrade.
 
 Agent-triggered jobs require exactly one current reverse link, independently confirmed,
 then check the current A route and actual B entity. They bypass the unchanged-A
@@ -630,27 +509,11 @@ before billing preparation can persist derived fields on A.
 
 ## Baseline, Deletes and Retention
 
-The first reconciliation snapshot is a **silent baseline**, so installation does
-not enqueue the entire inventory. A hook racing that baseline retains its revision.
-Native values and supported Fields scalar/dropdown IDs are fingerprinted using
-B's own generated Fields classes/tables. Volatile modification/inventory dates
-are excluded. Later native/custom changes and missed hooks are detected locally.
-Dropdown catalog-label edits without a changed Computer reference are not a
-Computer-row notification; ordinary controller rechecks remain necessary for
-catalog-only changes.
-
-Deleted/templates and tracked purged Computers produce retained blocked
-notifications. Scope exits block at A. There is no delete propagation, recreation,
-entity move or relinking from agent work. Unknown/ambiguous/unconfirmed links
-return a visible blocked result; B retains and retries them so later confirmation
-can admit a present Computer.
-
-There is no automatic pruning. Current watermarks, blocked records and unacknowledged
-work must not be deleted. Uninstalling B preserves its outbox and removes credentials;
-configure a new A registration/generation on reinstall. A uninstall revokes agent
-registrations and retains receipt/registration tables. Do not restore old credentials
-or revisions into a newer generation. These records describe current invalidation
-state, not an audit history.
+Reconciliation is restricted to A-issued typed subscriptions and uses a silent
+baseline. Concurrent hook revisions survive baseline/ACK races. Native/custom
+changes are fingerprinted under fresh service permissions; there is no unrestricted
+inventory scanner. No automatic pruning or delete/entity-move propagation is added.
+Retain unresolved journals, watermarks and task bindings across upgrades.
 
 ## Activity and Verification
 
@@ -663,7 +526,7 @@ blocked IDs are visible only on the registration administration page within the
 approved source-entity scope. GET page rendering does local reads only and exposes
 no tokens or field payloads. The explicit protected **Verify saved pair** POST is
 the exception: it performs the bounded remote read described above.
-Registration/rotation POST responses display newly issued credentials once.
+Registration returns identifiers only; native GLPI secrets are never displayed.
 Separate health shows no heartbeat, reporting/reconciliation OK, degraded
 reconciliation, stale heartbeat after 180 seconds, or revoked. Stale means contact
 is overdue, not proof that B is offline. Health ACKs use `kind: health` and
@@ -788,9 +651,6 @@ intact; proof is stored separately in context. The journal has no pruning path.
 After restoring or deleting journal data, re-establish installation identity
 before using absence recovery.
 
-Minimum handshake versions are A 0.6.2 and B 0.5.1. B 0.5.1 advertises
-`recovery_version: 1`; older A rejects that pull field with HTTP 400. Drain B before
-deploying, make A 0.6.2 ready first, then deploy/restart B 0.5.1. New A accepts older
-B pulls without that capability, but legacy apply recovery requires the B upgrade.
-A rollback must coordinate B compatibility. Preserve enabled cron and all retained
-task/journal evidence throughout deployment.
+Native-only deployments advertise recovery_version: 1. Follow the B-first upgrade
+procedure at the top; preserve all retained task/journal evidence and coordinate
+worker resumption after both supported plugin updates complete.

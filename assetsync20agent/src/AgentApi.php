@@ -284,7 +284,7 @@ final class AgentApi extends \Glpi\Api\APIRest
     private function dispatch(string $operation, array $payload): array
     {
         if (strlen($this->body) > 1024) { throw new \InvalidArgumentException('Wake body exceeds limit.'); }
-        try { return Wake::receive($payload, '', $this); }
+        try { return Wake::receive($payload, $this); }
         catch (\RuntimeException $error) {
             if ($error->getCode() === 429) { $this->returnResponse(['error' => 'Wake rate limited'], 429); }
             throw $error;

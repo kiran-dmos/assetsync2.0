@@ -3,7 +3,6 @@
 declare(strict_types=1);
 
 use GlpiPlugin\Assetsync20\AgentInbox;
-use GlpiPlugin\Assetsync20\EntitySyncRoute;
 use GlpiPlugin\Assetsync20\SyncActivity;
 
 if (!defined('GLPI_ROOT')) {
@@ -21,14 +20,6 @@ try {
 }
 Session::checkRight('config', UPDATE);
 header('Cache-Control: no-store');
-$routes = [];
-foreach (EntitySyncRoute::loadAll(true) as $route) {
-    if (\GlpiPlugin\Assetsync20\GlpiBConnection::isAgentConnection($route['glpi_b_connection_id'])) { continue; }
-    if ($route['active'] && in_array('Computer', $route['asset_types'], true)
-        && in_array((int) $route['glpi_a_source_entity_id'], array_map('intval', Session::getActiveEntities()), true)) {
-        $routes[$route['id']] = $route;
-    }
-}
 $registrations = [];
 foreach ($DB->request(['FROM' => AgentInbox::REGISTRATIONS]) as $registration) {
     $approved = json_decode($registration['routes'], true);
@@ -37,38 +28,27 @@ foreach ($DB->request(['FROM' => AgentInbox::REGISTRATIONS]) as $registration) {
     }
 }
 $message = '';
-$credentials = null;
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     // GLPI 11's controller listener already checked and consumed the form CSRF token.
     try {
         $action = (string) ($_POST['action'] ?? '');
-        if ($action === 'register') {
-            $selected = is_array($_POST['routes'] ?? null) ? $_POST['routes'] : [];
-            if (array_diff($selected, array_keys($routes)) !== []) {
-                throw new RuntimeException('Routes unavailable.');
+        $id = (string) ($_POST['registration'] ?? '');
+        if (!isset($registrations[$id])) {
+            throw new RuntimeException('Registration unavailable.');
+        }
+        if ($action === 'verify_pair') {
+            $localId = filter_var($_POST['computer_id'] ?? '', FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if ($localId === false) { throw new RuntimeException('Computer unavailable.'); }
+            AgentInbox::verifySavedPair($registrations[$id], $localId);
+            $message = 'Saved Computer pair verified. No asset fields changed.';
+        } elseif ($action === 'revoke') {
+            if (!$DB->update(AgentInbox::REGISTRATIONS, ['active' => 0], ['id' => $id])) {
+                throw new RuntimeException('Revocation failed.');
             }
-            $credentials = AgentInbox::register((string) ($_POST['connection'] ?? ''), $selected);
+            $registrations[$id]['active'] = 0;
+            $message = 'Registration revoked.';
         } else {
-            $id = (string) ($_POST['registration'] ?? '');
-            if (!isset($registrations[$id])) {
-                throw new RuntimeException('Registration unavailable.');
-            }
-            if ($action === 'verify_pair') {
-                $localId = filter_var($_POST['computer_id'] ?? '', FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-                if ($localId === false) { throw new RuntimeException('Computer unavailable.'); }
-                AgentInbox::verifySavedPair($registrations[$id], $localId);
-                $message = 'Saved Computer pair verified. No asset fields changed.';
-            } elseif ($action === 'rotate') {
-                $credentials = ['registration' => $id, 'generation' => $registrations[$id]['generation'], 'token' => AgentInbox::rotate($id)];
-            } elseif ($action === 'revoke') {
-                if (!$DB->update(AgentInbox::REGISTRATIONS, ['active' => 0], ['id' => $id])) {
-                    throw new RuntimeException('Revocation failed.');
-                }
-                $registrations[$id]['active'] = 0;
-                $message = 'Registration revoked.';
-            } else {
-                throw new RuntimeException('Invalid action.');
-            }
+            throw new RuntimeException('Invalid action.');
         }
     } catch (Throwable) {
         $message = 'Registration action failed. Check selected connection, routes and permissions.';
@@ -76,32 +56,13 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
 }
 SyncActivity::header((string) ($_SERVER['PHP_SELF'] ?? ''));
 $html = static fn ($text): string => htmlspecialchars((string) $text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
-echo '<h2>B Agent Registrations</h2><p>' . $html($message) . '</p>';
-if ($credentials !== null) {
-    echo '<p>Credentials shown once. Configure them on B over HTTPS.</p><dl>';
-    foreach ($credentials as $key => $value) {
-        echo '<dt>' . $html($key) . '</dt><dd><code>' . $html($value) . '</code></dd>';
-    }
-    echo '</dl>';
-}
-echo '<form method="post"><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">';
-echo '<input type="hidden" name="action" value="register"><label>Connection <select name="connection">';
-foreach (\GlpiPlugin\Assetsync20\GlpiBConnection::loadAll(true) as $connection) {
-    if ($connection['active'] && !\GlpiPlugin\Assetsync20\GlpiBConnection::isAgent($connection)) {
-        echo '<option value="' . $html($connection['id']) . '">' . $html($connection['name']) . '</option>';
-    }
-}
-echo '</select></label><fieldset><legend>Approved Computer routes</legend>';
-foreach ($routes as $id => $route) {
-    echo '<label><input type="checkbox" name="routes[]" value="' . $html($id) . '"> ' . $html($route['name'] ?: $id) . '</label><br>';
-}
-echo '</fieldset><button type="submit" class="submit">Create registration</button></form>';
+echo '<h2>Retained Agent Registrations</h2><p>' . $html($message) . '</p>';
 foreach ($registrations as $id => $registration) {
     echo '<h3>' . $html($id) . ($registration['active'] ? ' (enabled)' : ' (revoked)') . '</h3><p>Last authenticated contact: '
         . ((int) $registration['last_seen'] > 0 ? $html(gmdate('Y-m-d H:i:s', (int) $registration['last_seen'])) . ' UTC' : 'Never') . '</p>';
     echo '<p>Worker health: ' . $html(\GlpiPlugin\Assetsync20\AgentActivity::health($registration)) . '</p>';
     echo '<form method="post"><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">'
-        . '<input type="hidden" name="registration" value="' . $html($id) . '"><button name="action" value="rotate">Rotate token</button> '
+        . '<input type="hidden" name="registration" value="' . $html($id) . '">'
         . '<button name="action" value="revoke">Revoke</button></form>';
     echo '<form method="post"><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '">'
         . '<input type="hidden" name="registration" value="' . $html($id) . '"><label>Saved A Computer ID '

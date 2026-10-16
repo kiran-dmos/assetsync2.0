@@ -36,9 +36,8 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         switch ($_POST['action'] ?? '') {
             case 'register':
                 $credentials = AgentTask::register($connectionId, (string) ($_POST['installation'] ?? ''));
-                $message = 'Installation registered. Credentials are shown once.';
+                $message = 'Installation registered. Binding identifiers are shown below.';
                 break;
-            case 'rotate': $credentials = AgentTask::rotate($connectionId); $message = 'Token rotated. Update B with the token shown once.'; break;
             case 'discover':
                 AgentTask::discover($connectionId, $type, (int) ($_POST['remote_entity'] ?? -1),
                     (string) ($_POST['remote_search'] ?? ''), (int) ($_POST['remote_cursor'] ?? 0));
@@ -127,8 +126,6 @@ if (!$binding) {
     echo '</div>'; Html::footer(); return;
 }
 echo '<p>Connection binding: <code>' . $html($connectionId) . '</code></p>';
-$post();
-echo '<button class="btn btn-secondary btn-sm" name="action" value="rotate">Rotate token</button></form>';
 $discovery = AgentTask::discovery($connectionId);
 echo '<h3>Asset selection</h3><p>B discovery: ' . $html(str_replace('_', ' ', $discovery['state'])) . '</p>';
 echo '<p><a href="?' . $html(http_build_query($viewContext + ['connection' => $connectionId])) . '">Refresh status</a></p>';

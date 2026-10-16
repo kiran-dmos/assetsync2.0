@@ -63,43 +63,6 @@ final class AgentInbox
         return null;
     }
 
-    /** Called only by the config-right protected form; the plaintext is shown once. */
-    public static function register(string $connectionId, array $routeIds): array
-    {
-        global $DB;
-        $connection = self::connection($connectionId);
-        if ($connection && GlpiBConnection::isAgent($connection)) { throw new \RuntimeException('Use Agent Pair to register this installation.'); }
-        $approved = [];
-        foreach (EntitySyncRoute::loadAll() as $route) {
-            if (in_array($route['id'], $routeIds, true) && $route['glpi_b_connection_id'] === $connectionId
-                && $route['active'] && in_array('Computer', $route['asset_types'], true)) {
-                $approved[$route['id']] = ['fingerprint' => self::routeIdentity($route), 'source_entity' => (int) $route['glpi_a_source_entity_id']];
-            }
-        }
-        if ($connection === null || $approved === [] || count($approved) !== count(array_unique($routeIds))) {
-            throw new \RuntimeException('Select enabled Computer routes on one enabled connection.');
-        }
-        $token = bin2hex(random_bytes(32));
-        $registration = ['id' => bin2hex(random_bytes(16)), 'generation' => bin2hex(random_bytes(16)),
-            'token_hash' => hash('sha256', $token), 'connection_id' => $connectionId,
-            'connection_identity' => self::identity($connection), 'routes' => json_encode($approved, JSON_THROW_ON_ERROR), 'active' => 1];
-        if (!$DB->insert(self::REGISTRATIONS, $registration)) {
-            throw new \RuntimeException('Could not save registration.');
-        }
-        return ['registration' => $registration['id'], 'generation' => $registration['generation'], 'token' => $token];
-    }
-
-    public static function rotate(string $id): string
-    {
-        global $DB;
-        $token = bin2hex(random_bytes(32));
-        if (!$DB->update(self::REGISTRATIONS, ['token_hash' => hash('sha256', $token)], ['id' => $id, 'active' => 1])
-            || $DB->affectedRows() !== 1) {
-            throw new \RuntimeException('Registration unavailable.');
-        }
-        return $token;
-    }
-
     /** Verify one saved pair without running mappings, billing, discovery or remote writes. */
     public static function verifySavedPair(array $registration, int $localId): void
     {
@@ -218,26 +181,21 @@ final class AgentInbox
     }
 
     /** No field values or caller-selected local IDs, routes, URLs or entities enter admission. */
-    public static function receive(array $event, string $token, ?AgentApi $api = null): array
+    public static function receive(array $event, AgentApi $api): array
     {
         global $DB;
-        if ($api === null && !preg_match('/^[a-f0-9]{64}$/D', $token)) {
-            return ['status' => 401];
-        }
         self::sql('START TRANSACTION');
         try {
             $registration = self::one('SELECT * FROM `' . self::REGISTRATIONS . '` WHERE `id` = '
                 . $DB->quote($event['registration']) . ' FOR UPDATE');
             $connection = $registration ? self::connection($registration['connection_id']) : null;
             if (!$registration || !$registration['active'] || !$connection
-                || ($api === null && (($connection['agent_auth'] ?? 'legacy_bearer') !== 'legacy_bearer'
-                    || !hash_equals($registration['token_hash'], hash('sha256', $token))))
                 || !hash_equals($registration['generation'], $event['generation'])
                 || !hash_equals($registration['connection_identity'], self::identity($connection))) {
                 self::sql('ROLLBACK');
                 return ['status' => 401];
             }
-            if ($api !== null) { $api->assertPeer($connection); }
+            $api->assertPeer($connection);
             if (($event['kind'] ?? '') === 'health') {
                 $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
                 $routes = array_column(EntitySyncRoute::loadAll(true), null, 'id');
@@ -302,7 +260,7 @@ final class AgentInbox
             return self::ack($event);
         } catch (\Throwable $error) {
             $DB->doQuery('ROLLBACK');
-            if ($api !== null && ($error instanceof AgentApiResponse || $error instanceof \UnexpectedValueException)) { throw $error; }
+            if ($error instanceof AgentApiResponse || $error instanceof \UnexpectedValueException) { throw $error; }
             throw new \RuntimeException('Notification storage unavailable.', 0, $error);
         }
     }

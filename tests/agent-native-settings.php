@@ -33,17 +33,34 @@ namespace {
         'wake_enabled' => true];
     GlpiBConnection::save($input);
     $saved = GlpiBConnection::find('native');
-    setupCheck($saved['wake_token'] === '' && $saved['agent_auth'] === 'glpi_session', 'Native A configuration needs no legacy wake token.');
+    setupCheck(!isset($saved['wake_token']) && $saved['agent_auth'] === 'glpi_session', 'Native A configuration needs no legacy wake token.');
     setupCheck($saved['agent_app_token'] === $peer['agent_app_token'] && $saved['agent_user_token'] === $peer['agent_user_token'],
         'Native A credentials round trip through encrypted storage.');
     $raw = json_encode(Config::$values[GlpiBConnection::CONTEXT]);
     setupCheck(!str_contains($raw, 'native-app-secret') && !str_contains($raw, 'native-user-secret'), 'A storage contains no plaintext native secrets.');
     $identity = AgentInbox::identity($saved);
-    GlpiBConnection::save(array_replace($input, ['agent_auth' => 'legacy_bearer', 'wake_enabled' => false,
-        'agent_app_token' => '', 'agent_user_token' => '']));
-    $rollback = GlpiBConnection::find('native');
-    setupCheck($rollback['agent_app_token'] === $peer['agent_app_token'] && AgentInbox::identity($rollback) === $identity,
-        'Explicit rollback preserves credentials and stable asset binding identity.');
+    $ordinary = ['id' => 'ordinary', 'mode' => 'rest', 'active' => true, 'base_url' => 'https://rest.invalid',
+        'app_token' => 'ordinary-app', 'user_token' => 'ordinary-user'];
+    $entries = json_decode(Config::$values[GlpiBConnection::CONTEXT]['glpib_connections'], true);
+    $entries[] = $ordinary + ['wake_url' => 'retired', 'wake_token' => 'obsolete-rest-entry-key'];
+    $nativeIndex = array_search('native', array_column($entries, 'id'), true);
+    $entries[$nativeIndex]['wake_url'] = 'https://retired.invalid/front/agent-wake.php';
+    $entries[$nativeIndex]['wake_token'] = 'obsolete-custom-secret';
+    Config::$values[GlpiBConnection::CONTEXT]['glpib_connections'] = json_encode($entries);
+    unset(Config::$values[GlpiBConnection::CONTEXT]['native_only_upgrade']);
+    $evidence = $DB->tables;
+    GlpiBConnection::upgradeNativeOnly();
+    $migrated = json_decode(Config::$values[GlpiBConnection::CONTEXT]['glpib_connections'], true);
+    setupCheck(end($migrated) === $ordinary && !isset($migrated[$nativeIndex]['wake_token'], $migrated[$nativeIndex]['wake_url'])
+        && !$migrated[$nativeIndex]['wake_enabled'], 'A upgrade removes custom credentials, disables wake and leaves ordinary REST exact.');
+    setupCheck(AgentInbox::identity(GlpiBConnection::find('native')) === $identity && $DB->tables === $evidence,
+        'A upgrade preserves asset link identity and all task/journal/evidence rows.');
+    GlpiBConnection::save(array_replace($input, ['wake_enabled' => true]));
+    $once = Config::$values;
+    GlpiBConnection::upgradeNativeOnly();
+    setupCheck(Config::$values === $once, 'A upgrade is idempotent and does not disable explicitly re-enabled native wake.');
+    GlpiBConnection::save($ordinary);
+    setupCheck(GlpiBConnection::find('ordinary')['user_token'] === 'ordinary-user', 'Ordinary REST saves require no native configuration.');
 
     Config::$values[Settings::CONTEXT] = [];
     $b = array_replace($peer, ['agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',
@@ -51,30 +68,38 @@ namespace {
         'service_user' => '7', 'service_profile' => '4', 'service_password' => 'local-password']);
     Settings::save($b);
     $savedB = Settings::load();
-    setupCheck($savedB['token'] === '' && $savedB['endpoint'] === '' && Settings::transportReady($savedB),
+    setupCheck(!isset($savedB['token'], $savedB['endpoint']) && Settings::transportReady($savedB),
         'Fresh B native setup requires no custom token or legacy endpoint.');
     setupCheck(!str_contains(json_encode(Config::$values[Settings::CONTEXT]), 'native-app-secret')
         && !str_contains(json_encode(Config::$values[Settings::CONTEXT]), 'local-password'), 'B stores native and service credentials encrypted.');
+    Config::setConfigurationValues(Settings::CONTEXT, ['installation' => str_repeat('a', 32),
+        'token' => 'obsolete-custom-secret', 'endpoint' => 'https://retired.invalid/front/agent-notify.php',
+        'wake_token_hash' => str_repeat('d', 64), 'wake_enabled' => '1', 'wake_binding' => 'old-derived-binding']);
+    $beforeIds = array_intersect_key(Settings::load(), array_flip(['installation', 'registration', 'generation', 'connection_id']));
+    $fingerprint = \GlpiPlugin\Assetsync20agent\AgentSession::fingerprint(Settings::load());
+    $derived = Settings::wakeBinding(Settings::load());
     Settings::install();
-    setupCheck(Settings::configureWake(true) === null && Settings::load()['wake_enabled'] === '1'
-        && Settings::load()['wake_token_hash'] === '', 'Native wake enables without generating a custom bearer key.');
-
-    $legacyToken = str_repeat('d', 64);
-    Config::setConfigurationValues(Settings::CONTEXT, ['token' => (new GLPIKey())->encrypt($legacyToken),
-        'endpoint' => 'https://a.invalid/plugins/assetsync20/front/agent-notify.php']);
-    Settings::save($b + ['token' => '', 'endpoint' => '']);
-    setupCheck(Settings::load()['token'] === $legacyToken && Settings::load()['endpoint'] !== '', 'Existing legacy credentials and URL survive native setup.');
-    Settings::save(array_replace($b, ['agent_auth' => 'legacy_bearer', 'endpoint' => Settings::load()['endpoint']]));
-    setupCheck(Settings::load()['agent_auth'] === 'legacy_bearer' && Settings::load()['token'] === $legacyToken, 'Explicit B rollback is reversible.');
+    $raw = Config::$values[Settings::CONTEXT];
+    setupCheck(!isset($raw['token'], $raw['endpoint'], $raw['wake_token_hash'])
+        && $raw['wake_enabled'] === '0' && $raw['wake_binding'] === '', 'B upgrade deletes obsolete credentials and revokes derived wake admission.');
+    setupCheck(array_intersect_key(Settings::load(), $beforeIds) === $beforeIds && $DB->tables === $evidence,
+        'B upgrade preserves installation/binding IDs and all evidence rows.');
+    setupCheck(\GlpiPlugin\Assetsync20agent\AgentSession::fingerprint(Settings::load()) === $fingerprint
+        && Settings::wakeBinding(Settings::load()) === $derived, 'Configured native fingerprint remains stable with the constant discriminator.');
+    Settings::configureWake(true);
+    $enabled = Config::$values;
+    Settings::install();
+    setupCheck(Config::$values === $enabled && Settings::load()['wake_enabled'] === '1', 'B upgrade is idempotent after explicit wake re-enable.');
     foreach (['a', 'b'] as $side) {
         Session::$canUpdate = true;
         $html = setupRender($side);
+        setupCheck(!str_contains($html, 'name="agent_auth"') && !str_contains($html, 'legacy_bearer'), 'No selectable custom authentication remains.');
         $local = $side === 'a' ? 'A' : 'B';
         $remote = $side === 'a' ? 'B' : 'A';
-        foreach (['GLPI native session', 'GLPI ' . $remote . ' Agent API URL', 'GLPI ' . $remote . ' app token',
+        foreach (['GLPI ' . $remote . ' Agent API URL', 'GLPI ' . $remote . ' app token',
             'GLPI ' . $remote . ' user API token', 'GLPI ' . $local . ' user used by ' . $remote,
             'GLPI ' . $local . ' API client used by ' . $remote, 'GLPI ' . $local . ' exact entity grant used by ' . $remote,
-            $side === 'a' ? 'REST asset-mode user token' : 'Legacy registration bearer token'] as $label) {
+            $side === 'a' ? 'REST asset-mode user token' : 'Service password'] as $label) {
             setupCheck(str_contains($html, $label), 'Setup identifies credential ownership: ' . $label);
         }
         setupCheck(!str_contains($html, 'native-app-secret') && !str_contains($html, 'native-user-secret'),

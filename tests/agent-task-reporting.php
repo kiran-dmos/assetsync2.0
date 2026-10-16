@@ -7,10 +7,19 @@ require __DIR__ . '/agent-tasks.php';
 use GlpiPlugin\Assetsync20agent\AgentTransport;
 use GlpiPlugin\Assetsync20agent\TaskJournal;
 
+function agentTestCycle(array $settings, int $deadline): void
+{
+    \GlpiPlugin\Assetsync20agent\AgentSession::begin($deadline);
+    try { TaskJournal::cycle($settings, $deadline); }
+    finally { \GlpiPlugin\Assetsync20agent\AgentSession::end(); }
+}
+
 [$credentials, $request, $snapshot] = taskSetup();
 [$job, $task] = queueTask();
+$snapshot['observed_at'] = time();
 $settings = $request + ['computer_id' => 201, 'entity_id' => 100,
-    'endpoint' => 'https://controller.invalid/front/agent-notify.php', 'token' => $credentials['token']];
+    'mode' => 'agent', 'agent_auth' => 'glpi_session', 'agent_api_url' => 'https://controller.invalid/plugins/assetsync20/front/agent-api.php',
+    'agent_app_token' => 'app', 'agent_user_token' => 'user'];
 $result = ['outcome' => 'unchanged', 'changed' => [], 'snapshot' => $snapshot];
 $row = ['id' => $task['id'], 'hash' => $task['hash'], 'body' => json_encode($task),
     'state' => 'unchanged', 'result' => json_encode($result), 'created_at' => time()];
@@ -28,16 +37,16 @@ AgentTransport::$body = '{}';
 AgentTransport::$responses = [
     ['status' => 200, 'body' => []], ['status' => 409, 'body' => []], ['status' => 200, 'body' => ['task' => null]],
 ];
-$calls = AgentTransport::$calls;
-TaskJournal::cycle($settings, hrtime(true) + 1_000_000_000);
+$calls = AgentTransport::$protocolCalls;
+agentTestCycle($settings, hrtime(true) + 1_000_000_000);
 $saved = $DB->fetchAssoc($DB->doQuery('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE id=' . $DB->quote($task['id'])));
 agentCheck($saved['report_status'] === 'rejected' && (int) $saved['acknowledged'] === 0 && $saved['result'] === json_encode($result),
     'Current binding is selected before LIMIT despite 21 old binding rows; rejection retains evidence without claiming ACK.');
-agentCheck(AgentTransport::$calls === $calls + 3 && json_decode(AgentTransport::$options[CURLOPT_POSTFIELDS], true)['kind'] === 'pull',
+agentCheck(AgentTransport::$protocolCalls === $calls + 3 && AgentTransport::$payloads[count(AgentTransport::$payloads) - 2]['kind'] === 'pull',
     'Terminal report rejection still permits the next pull.');
-$calls = AgentTransport::$calls;
+$calls = AgentTransport::$protocolCalls;
 TaskJournal::cycle($settings, hrtime(true) + 1_000_000_000);
-agentCheck(AgentTransport::$calls === $calls + 2, 'Rejected old report cannot permanently pin subscription updates or later task pulls.');
+agentCheck(AgentTransport::$protocolCalls === $calls + 2, 'Rejected old report cannot permanently pin subscription updates or later task pulls.');
 
 $nativeSettings = array_replace($settings, ['agent_auth' => 'glpi_session', 'endpoint' => '', 'token' => '',
     'agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',

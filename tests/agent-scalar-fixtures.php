@@ -2,6 +2,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/agent-api-fixtures.php';
+
 // Host-only GLPI doubles. Production task, journal, normalization and SQL transaction code runs unchanged.
 require_once __DIR__ . '/query-expression.php';
 require_once __DIR__ . '/agent-sqlite.php';
@@ -383,7 +385,8 @@ function scalarSetup(): array
             'name' => 'Scalars - ' . $label, 'uid' => scalarKey($column), 'datatype' => $datatype,
             'pfields_type' => $type, 'pfields_fields_id' => $index + 1, 'plugin_fields_containers_id' => 1, 'is_readonly' => 1];
     }
-    $settings = ['mode' => 'agent', 'installation' => str_repeat('a', 32), 'registration' => str_repeat('b', 32),
+    $settings = ['agent_auth' => 'glpi_session', 'agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',
+        'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user', 'mode' => 'agent', 'installation' => str_repeat('a', 32), 'registration' => str_repeat('b', 32),
         'generation' => str_repeat('c', 32), 'connection_id' => 'b', 'computer_id' => 201, 'entity_id' => 100,
         'service_user' => 7, 'service_profile' => 4, 'service_name' => 'scalar', 'service_password' => 'test-only'];
     Config::$values['plugin:assetsync20agent'] = $settings;

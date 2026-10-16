@@ -10,6 +10,7 @@ final class Worker
     public function run(?int $deadline = null, ?\Closure $admit = null): int
     {
         global $DB;
+        if (!Settings::transportReady(Settings::load())) { return 0; }
         // HTTP wakes and CLI workers share one database-scoped lock.
         $lock = 'assetsync20agent:' . substr(hash('sha256', (string) ($DB->dbdefault ?? 'glpi')), 0, 32);
         $quotedLock = $DB->quote($lock);
@@ -91,6 +92,7 @@ final class Worker
     public function reconcile(?int $deadline = null): int
     {
         global $DB;
+        if (!Settings::transportReady(Settings::load())) { return 0; }
         $deadline = min($deadline ?? PHP_INT_MAX, hrtime(true) + 2_000_000_000);
         if (hrtime(true) >= $deadline) { return 0; }
         $state = Wake::settings();
@@ -141,78 +143,18 @@ final class Worker
             \Config::setConfigurationValues(Settings::CONTEXT, ['target_cursor' => (string) $cursor, 'reconcile_status' => $degraded ? 'degraded' : 'ok']);
             return $seen;
         }
-        $count = 0;
-        foreach (['scan_cursor' => 'glpi_computers', 'purge_cursor' => Outbox::TABLE] as $key => $table) {
-            $column = $key === 'scan_cursor' ? 'id' : 'computer_id';
-            $cursor = max(0, (int) ($state[$key] ?? 0));
-            $rows = $DB->request(['SELECT' => [$column], 'FROM' => $table, 'WHERE' => [$column => ['>', $cursor]], 'ORDER' => $column . ' ASC', 'LIMIT' => 25]);
-            $seen = 0;
-            foreach ($rows as $row) {
-                if (hrtime(true) >= $deadline) {
-                    break;
-                }
-                $id = (int) $row[$column];
-                $before = Outbox::find($id);
-                try {
-                    $snapshot = Snapshot::read($id, $deadline);
-                } catch (\Throwable) {
-                    \Config::setConfigurationValues(Settings::CONTEXT, [$key => (string) $cursor, 'reconcile_status' => 'degraded']);
-                    return $count;
-                }
-                Outbox::observe($id, $snapshot, true, $before);
-                $cursor = $id;
-                $seen++;
-                $count++;
-            }
-            // Reset only on a fully exhausted page, never on a deadline interruption.
-            if ($seen < 25 && hrtime(true) < $deadline) {
-                $cursor = 0;
-            }
-            \Config::setConfigurationValues(Settings::CONTEXT, [$key => (string) $cursor]);
-        }
-        \Config::setConfigurationValues(Settings::CONTEXT, ['reconcile_status' => 'ok']);
-        return $count;
+        return 0;
     }
 
     public static function send(array $settings, array $sent, int $deadline): array
     {
         Wake::assertCurrent();
-        if (!in_array($settings['agent_auth'] ?? 'legacy_bearer', ['legacy_bearer', 'glpi_session'], true)) {
-            return ['status' => 0, 'body' => []];
-        }
-        if (($settings['agent_auth'] ?? 'legacy_bearer') !== 'glpi_session' && !Settings::validEndpoint($settings['endpoint'])) {
-            return ['status' => 0, 'body' => []];
-        }
-        $timeout = min(5000, max(1, (int) (($deadline - hrtime(true)) / 1_000_000)));
+        if (($settings['mode'] ?? '') !== 'agent') { return ['status' => 0, 'body' => []]; }
         $keys = ($sent['kind'] ?? '') === 'health'
             ? ['kind', 'registration', 'generation', 'reconcile_status']
             : ['registration', 'generation', 'computer_id', 'revision', 'lifecycle'];
         if (($settings['mode'] ?? 'rest') === 'agent' && ($sent['kind'] ?? '') !== 'health') { $keys[] = 'itemtype'; }
         $payload = array_intersect_key($sent, array_flip($keys));
-        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
-            return AgentSession::send($settings, 'notify', $payload, $deadline);
-        }
-        $curl = curl_init($settings['endpoint']);
-        $body = '';
-        try {
-            curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => json_encode($payload, JSON_THROW_ON_ERROR),
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json', 'Authorization: Bearer ' . $settings['token']],
-                CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2, CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
-                CURLOPT_CONNECTTIMEOUT_MS => min(2000, $timeout), CURLOPT_TIMEOUT_MS => $timeout,
-                CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$body): int {
-                    if (strlen($body) + strlen($chunk) > 2048) {
-                        return 0;
-                    }
-                    $body .= $chunk;
-                    return strlen($chunk);
-                }]);
-            $ok = curl_exec($curl);
-            $decoded = json_decode($body, true, 8);
-            return ['status' => $ok === false ? 0 : (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE),
-                'body' => is_array($decoded) ? $decoded : []];
-        } finally {
-            curl_close($curl);
-        }
+        return AgentSession::send($settings, 'notify', $payload, $deadline);
     }
 }

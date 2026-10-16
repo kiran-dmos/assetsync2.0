@@ -104,7 +104,7 @@ namespace GlpiPlugin\Assetsync20 {
     final class AgentInbox {
         public static function connection(string $id): ?array { return $id === 'peer' ? \NativeApiFixture::$peer : null; }
         public static function decode(string $body): array { return json_decode($body, true); }
-        public static function receive(array $payload, string $token, AgentApi $api): array {
+        public static function receive(array $payload, AgentApi $api): array {
             $api->assertPeer(\NativeApiFixture::$peer); return \NativeApiFixture::dispatch($payload);
         }
     }
@@ -114,7 +114,7 @@ namespace GlpiPlugin\Assetsync20 {
     }
     final class AgentTask {
         public static function decode(string $body): array { return json_decode($body, true); }
-        public static function exchange(array $payload, string $token, AgentApi $api): array {
+        public static function exchange(array $payload, AgentApi $api): array {
             $api->assertPeer(\NativeApiFixture::$peer);
             if (($payload['kind'] ?? '') !== 'result' && !$api->activateReadAsset('Computer', (int) ($payload['asset'] ?? 101))) {
                 return ['status' => 200, 'task' => null];
@@ -128,7 +128,7 @@ namespace GlpiPlugin\Assetsync20 {
 namespace GlpiPlugin\Assetsync20agent {
     final class Settings { public static function load(): array { return \NativeApiFixture::$peer; } }
     final class Wake {
-        public static function receive(array $payload, string $token, AgentApi $api): array {
+        public static function receive(array $payload, AgentApi $api): array {
             $api->assertPeer(\NativeApiFixture::$peer);
             if (\NativeApiFixture::$rateLimited) { throw new \RuntimeException('Wake rate limited.', 429); }
             return \NativeApiFixture::dispatch($payload);
@@ -240,6 +240,7 @@ namespace {
             'HTTP_APP_TOKEN' => 'app', 'HTTP_X_ASSETSYNC_OPERATION' => $operation, 'HTTP_X_ASSETSYNC_CONNECTION' => 'peer'], $headers);
         if ($token === '') { $_SERVER['HTTP_AUTHORIZATION'] = 'user_token native'; }
         else { $_SERVER['HTTP_SESSION_TOKEN'] = $token; }
+        $_SERVER = array_replace($_SERVER, $headers);
         NativeApiFixture::$body = json_encode((object) $payload);
         $_SESSION = ['caller' => 'preserve'];
         $_REQUEST = ['foreign' => 'preserve', 'user_token' => 'prior-value'];
@@ -262,6 +263,9 @@ namespace {
             'agent_auth' => 'glpi_session', 'agent_peer_user' => '7', 'agent_peer_api_client' => '9',
             'agent_peer_profile' => '4', 'agent_peer_entity' => '2'];
         NativeApiFixture::$id = ''; NativeApiFixture::$active = false;
+        $before = NativeApiFixture::$core['init'];
+        apiCheck(apiRequest($class, 'initSession', '', [], ['HTTP_AUTHORIZATION' => 'Bearer ' . str_repeat('d', 64)])['status'] === 401
+            && NativeApiFixture::$core['init'] === $before, 'Stale custom bearer headers are denied before native initialization.');
         NativeApiFixture::$mfa = true;
         $before = NativeApiFixture::$core['init'];
         apiCheck(apiRequest($class, 'initSession')['status'] === 401 && NativeApiFixture::$core['init'] === $before, 'MFA denied before native mint.');

@@ -236,14 +236,14 @@ function scalarControllerSetup(string $column, string $authority, mixed $a, mixe
     $settings = array_replace($settings, $credentials);
     Config::$values['plugin:assetsync20agent'] = $settings;
     $request = array_intersect_key($settings, array_flip(['registration', 'generation', 'installation', 'connection_id']));
-    $task = AgentTask::exchange($request + ['kind' => 'pull'], $credentials['token'])['task'];
-    scalarReceipt($request, $credentials['token'], $task, TaskExecutor::execute($task, $settings));
+    $task = AgentTask::exchange($request + ['kind' => 'pull'], new \GlpiPlugin\Assetsync20\AgentApi('b'))['task'];
+    scalarReceipt($request, new \GlpiPlugin\Assetsync20\AgentApi('b'), $task, TaskExecutor::execute($task, $settings));
     AgentTask::confirm('b', 'route');
     FieldMapping::save('b', 'Computer', [['glpi_a_field_key' => scalarKey($column), 'glpi_b_field_key' => scalarKey($column),
         'source_of_truth' => $authority]], AgentTask::catalog('b', 'Computer')['fields']);
-    return [$settings, $request, $credentials['token']];
+    return [$settings, $request, new \GlpiPlugin\Assetsync20\AgentApi('b')];
 }
-function scalarReceipt(array $request, string $token, array $task, array $result): void
+function scalarReceipt(array $request, \GlpiPlugin\Assetsync20\AgentApi $token, array $task, array $result): void
 {
     $ack = AgentTask::exchange($request + ['kind' => 'result', 'id' => $task['id'], 'hash' => $task['hash'], 'result' => $result], $token);
     scalarCheck($ack['recorded'] === true, 'Controller accepts independently validated evidence.');
@@ -253,7 +253,7 @@ function scalarApplyLocal(array $changes): bool
     scalarCheck(FieldsText::updateLocal('Computer', 101, $changes, true), 'A reuses its existing FieldsText model writer.');
     return false;
 }
-function scalarControllerRun(array $settings, array $request, string $token): void
+function scalarControllerRun(array $settings, array $request, \GlpiPlugin\Assetsync20\AgentApi $token): void
 {
     global $DB;
     AssetSyncQueue::notify('Computer', 101, 'b');

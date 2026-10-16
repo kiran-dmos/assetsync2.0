@@ -50,7 +50,7 @@ final class TargetScope
         if (AgentSession::fingerprint($settings) !== AgentSession::fingerprint($current)) {
             throw new \RuntimeException('Subscription transport configuration changed.');
         }
-        foreach (['mode', 'installation', 'registration', 'generation', 'connection_id', 'endpoint', 'token'] as $key) {
+        foreach (['mode', 'installation', 'registration', 'generation', 'connection_id'] as $key) {
             if (($settings[$key] ?? null) !== ($current[$key] ?? null) || ($current['mode'] ?? '') !== 'agent') {
                 throw new \RuntimeException('Subscription transport configuration changed.');
             }

@@ -330,9 +330,9 @@ final class AgentApi extends \Glpi\Api\APIRest
     private function dispatch(string $operation, array $payload): array
     {
         if ($operation === 'task') {
-            return AgentTask::exchange(AgentTask::decode($this->body), '', $this);
+            return AgentTask::exchange(AgentTask::decode($this->body), $this);
         }
-        return AgentInbox::receive(AgentInbox::decode($this->body), '', $this);
+        return AgentInbox::receive(AgentInbox::decode($this->body), $this);
     }
 }
 

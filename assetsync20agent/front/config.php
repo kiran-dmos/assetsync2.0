@@ -16,7 +16,6 @@ Session::checkRight('config', READ);
 $canConfigure = Session::haveRight('config', UPDATE);
 header('Cache-Control: no-store');
 $message = '';
-$newWakeToken = null;
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     Session::checkRight('config', UPDATE);
     // GLPI 11's controller listener already checked and consumed the form CSRF token.
@@ -24,10 +23,10 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         if (isset($_POST['save_settings'])) {
             Settings::save($_POST);
             $message = 'Agent settings saved.';
-        } elseif (isset($_POST['save_wake']) || isset($_POST['rotate_wake']) || isset($_POST['revoke_wake'])) {
-            $enabled = !isset($_POST['revoke_wake']) && (isset($_POST['rotate_wake']) || !empty($_POST['wake_enabled']));
-            $newWakeToken = Settings::configureWake($enabled, isset($_POST['rotate_wake']));
-            $message = $enabled ? 'HTTPS wake enabled.' : 'HTTPS wake disabled and key revoked.';
+        } elseif (isset($_POST['save_wake']) || isset($_POST['disable_wake'])) {
+            $enabled = !isset($_POST['disable_wake']) && !empty($_POST['wake_enabled']);
+            Settings::configureWake($enabled);
+            $message = $enabled ? 'HTTPS wake enabled.' : 'HTTPS wake disabled.';
         }
     } catch (Throwable $error) {
         $message = $error->getMessage();
@@ -51,16 +50,8 @@ echo '<style>.assetsync-agent-setup{max-width:980px;margin:1rem auto 2rem;paddin
 .assetsync-agent-setup .btn{margin:.25rem 0;white-space:normal}</style>';
 echo '<div class="assetsync-agent-setup"><h2>AssetSync2.0 Agent</h2><p>' . $html($message) . '</p><fieldset style="border:0;padding:0;min-width:0"' . ($canConfigure ? '' : ' disabled') . '><form method="post"><table class="tab_cadre_fixe">';
 echo '<tr><th>Installation identity</th><td>' . $html($settings['installation'] ?? 'Install the plugin update first') . '</td></tr>';
-echo '<tr><th><label for="mode">Mode</label></th><td><select id="mode" name="mode">';
-foreach (['rest' => 'Notifications for REST', 'agent' => 'Bounded agent tasks'] as $value => $label) {
-    echo '<option value="' . $value . '"' . (($display['mode'] ?? 'rest') === $value ? ' selected' : '') . '>' . $label . '</option>';
-}
-echo '</select></td></tr>';
-echo '<tr><th><label for="agent_auth">Agent authentication</label></th><td><select id="agent_auth" name="agent_auth">';
-foreach (['legacy_bearer' => 'Legacy bearer', 'glpi_session' => 'GLPI native session'] as $value => $label) {
-    echo '<option value="' . $value . '"' . (($display['agent_auth'] ?? 'legacy_bearer') === $value ? ' selected' : '') . '>' . $label . '</option>';
-}
-echo '</select></td></tr>';
+echo '<input type="hidden" name="mode" value="agent">';
+if (($settings['mode'] ?? '') !== 'agent') { echo '<tr><th>Status</th><td>Notification-only mode retired. Native agent configuration required.</td></tr>'; }
 echo '<tr><th><label for="agent_api_url">GLPI A Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($display['agent_api_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI A app token', 'agent_user_token' => 'GLPI A user API token'] as $key => $label) {
@@ -79,10 +70,10 @@ Dropdown::show('Profile', ['name' => 'agent_peer_profile', 'value' => (int) ($di
 echo '</td></tr><tr><th>GLPI B exact entity grant used by A</th><td>';
 Dropdown::show('Entity', ['name' => 'agent_peer_entity', 'value' => (int) ($display['agent_peer_entity'] ?? -1)]);
 echo '</td></tr>';
-foreach (['endpoint' => 'Legacy GLPI A HTTPS receiver URL', 'registration' => 'Registration', 'generation' => 'Generation'] as $key => $label) {
+foreach (['registration' => 'Registration', 'generation' => 'Generation'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
-        . '" type="' . ($key === 'token' ? 'password' : 'text') . '" autocomplete="off" size="72" value="'
-        . ($key === 'token' ? '' : $html($display[$key] ?? '')) . '"></td></tr>';
+        . '" type="text" autocomplete="off" size="72" value="'
+        . $html($display[$key] ?? '') . '"></td></tr>';
 }
 foreach (['connection_id' => 'A connection binding'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
@@ -104,7 +95,7 @@ try { $entities = Settings::entities($serviceUser, $serviceProfile); }
 catch (Throwable $error) { $entities = []; echo $html($error->getMessage()); }
 echo $html(implode(', ', $entities));
 echo '</td></tr>';
-foreach (['token' => 'Legacy registration bearer token (blank keeps current)', 'service_password' => 'Service password (blank keeps current)'] as $key => $label) {
+foreach (['service_password' => 'Service password (blank keeps current)'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input id="' . $key . '" name="' . $key
         . '" type="password" autocomplete="new-password" size="60" value=""></td></tr>';
 }
@@ -118,14 +109,8 @@ echo '<h3>Optional HTTPS wake</h3><p>A background worker is required. B can keep
 echo '<p>Status: ' . ($wakeCurrent ? 'Enabled' : ($wakeEnabled ? 'Binding changed; save wake setting again' : 'Disabled')) . '</p>';
 echo '<form method="post"><table class="tab_cadre_fixe"><tr><th><label for="wake_enabled">Allow HTTPS wake from A</label></th><td><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . ($wakeEnabled ? ' checked' : '') . '></td></tr></table>';
 echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_wake" value="1" class="btn btn-primary btn-sm">Save wake setting</button> ';
-if (($settings['agent_auth'] ?? 'legacy_bearer') === 'legacy_bearer') {
-    echo '<button type="submit" name="rotate_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Rotate legacy wake key</button> ';
-}
-echo '<button type="submit" name="revoke_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Disable and revoke</button></form></fieldset>';
-if ($newWakeToken !== null) {
-    echo '<p><label for="new_wake_key">New wake key (shown once)</label></p><input id="new_wake_key" type="text" readonly autocomplete="off" size="72" value="' . $html($newWakeToken) . '">';
-    echo '<p>Store this separate key in A\'s connection wake setting. Rotation immediately revokes the previous key.</p>';
-}
+
+echo '<button type="submit" name="disable_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Disable wake</button></form></fieldset>';
 
 echo '<p>Last worker cycle: ' . (!empty($settings['worker_seen']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['worker_seen'])) . ' UTC' : 'Never') . '</p>';
 echo '<p>Reconciliation: ' . $html(in_array($settings['reconcile_status'] ?? '', ['ok', 'degraded'], true) ? $settings['reconcile_status'] : 'Not recorded')

@@ -12,6 +12,7 @@ namespace Glpi\DBAL {
     final class QuerySubQuery { public function __construct(array $query) {} }
 }
 namespace {
+    require_once __DIR__ . '/agent-api-fixtures.php';
     $smokeBootstrapOnly = true;
     require __DIR__ . '/smoke.php';
     require __DIR__ . '/../assetsync20agent/src/autoload.php';
@@ -67,31 +68,36 @@ namespace {
     use GlpiPlugin\Assetsync20agent\Settings;
     GlpiBConnection::save(['id' => 'setup', 'mode' => 'agent', 'name' => '<Setup>', 'active' => true,
         'base_url' => 'http://browser.invalid', 'wake_enabled' => true,
-        'wake_url' => 'https://backend.invalid/plugins/assetsync20agent/front/agent-wake.php', 'wake_token' => str_repeat('e', 64)]);
+        'agent_api_url' => 'https://backend.invalid/plugins/assetsync20agent/front/agent-api.php',
+        'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user', 'agent_peer_user' => '7',
+        'agent_peer_api_client' => '9', 'agent_peer_profile' => '4', 'agent_peer_entity' => '2']);
     $settings = ['mode' => 'agent', 'installation' => str_repeat('a', 32), 'registration' => str_repeat('b', 32),
         'generation' => str_repeat('c', 32), 'connection_id' => 'setup',
-        'endpoint' => 'https://a.invalid/plugins/assetsync20/front/agent-notify.php', 'service_user' => '7',
-        'service_profile' => '4', 'service_name' => 'fixture', 'service_password' => 'private-service-password', 'token' => str_repeat('d', 64)];
+        'agent_auth' => 'glpi_session', 'agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',
+        'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user', 'service_user' => '7',
+        'service_profile' => '4', 'service_name' => 'fixture', 'service_password' => 'private-service-password', 'agent_peer_user' => '7', 'agent_peer_api_client' => '9', 'agent_peer_profile' => '4', 'agent_peer_entity' => '2'];
     Config::$values[Settings::CONTEXT] = $settings;
     $before = Config::$values;
     $a = setupRender('a'); $b = setupRender('b');
     setupCheck(Config::$values === $before, 'GET views leave settings unchanged.');
     setupCheck(str_contains($a, '&lt;Setup&gt;') && !str_contains($a, str_repeat('e', 64)), 'A escapes labels and does not echo its saved key.');
     setupCheck(str_contains($a, 'http://browser.invalid') && str_contains($a, 'https://backend.invalid'), 'A distinguishes browser and backend URLs.');
-    setupCheck(str_contains($a, 'name="wake_token" value=""') && str_contains($b, 'name="service_password"')
+    setupCheck(!str_contains($a, 'name="wake_token"') && str_contains($b, 'name="service_password"')
         && !str_contains($b, 'private-service-password') && !str_contains($b, str_repeat('d', 64)), 'Saved secrets stay out of rendered fields.');
     setupCheck(str_contains($a, '_glpi_csrf_token') && str_contains($b, '_glpi_csrf_token'), 'Both setup forms carry the core CSRF field.');
     foreach (['/front/config.php', '/assetsync20agent/front/config.php'] as $file) {
         setupCheck(str_contains(file_get_contents(dirname(__DIR__) . $file), "header('Cache-Control: no-store')"), 'Setup responses prohibit caching: ' . $file);
     }
     $a = setupRender('a', ['save' => '1', 'id' => 'setup', 'mode' => 'agent', 'name' => '<Setup>', 'active' => '1',
-        'base_url' => 'http://browser.invalid', 'wake_enabled' => '1',
-        'wake_url' => 'https://backend.invalid/plugins/assetsync20agent/front/agent-wake.php', 'wake_token' => '', '_glpi_csrf_token' => 'test-csrf']);
-    setupCheck(GlpiBConnection::find('setup')['wake_token'] === str_repeat('e', 64) && str_contains($a, 'connection saved'), 'A blank password keeps its saved key.');
+        'base_url' => 'http://browser.invalid', 'wake_enabled' => '1', 'agent_app_token' => '', 'agent_user_token' => '',
+        'agent_api_url' => 'https://backend.invalid/plugins/assetsync20agent/front/agent-api.php',
+        'agent_peer_user' => '7', 'agent_peer_api_client' => '9', 'agent_peer_profile' => '4', 'agent_peer_entity' => '2']);
+    setupCheck(GlpiBConnection::find('setup')['agent_user_token'] === 'test-user' && str_contains($a, 'connection saved'),
+        'Blank native password keeps the saved GLPI token.');
     $savedA = Config::$values;
     $a = setupRender('a', ['save' => '1', 'id' => 'setup', 'mode' => 'agent', 'base_url' => 'http://browser.invalid',
-        'active' => '1', 'wake_enabled' => '1', 'wake_url' => 'http://insecure.invalid', 'wake_token' => str_repeat('f', 64)]);
-    setupCheck(Config::$values === $savedA && str_contains($a, 'direct HTTPS endpoint'), 'Invalid backend URL reports a safe error without saving.');
+        'active' => '1', 'agent_api_url' => 'http://insecure.invalid']);
+    setupCheck(Config::$values === $savedA && str_contains($a, 'direct HTTPS'), 'Invalid native URL reports an error without saving.');
     $screens = getenv('WAKE_SETUP_SCREENS');
     if (is_string($screens) && $screens !== '') {
         $css = file_get_contents(dirname(__DIR__) . '/public/css/assetsync20.css');
@@ -100,16 +106,11 @@ namespace {
         }
     }
     $b = setupRender('b', ['save_wake' => '1', 'wake_enabled' => '1', '_glpi_csrf_token' => 'test-csrf']);
-    preg_match('/id="new_wake_key"[^>]+value="([a-f0-9]{64})"/', $b, $match);
-    $key = $match[1] ?? '';
-    setupCheck($key !== '' && str_contains($b, 'readonly') && Settings::load()['wake_token_hash'] === hash('sha256', $key),
-        'B shows a newly generated key in a readonly POST field and stores only its hash.');
-    $b = setupRender('b');
-    setupCheck(!str_contains($b, $key) && !str_contains($b, 'id="new_wake_key"'), 'A later GET cannot recover the one-time key.');
-    $b = setupRender('b', ['rotate_wake' => '1', '_glpi_csrf_token' => 'test-csrf']);
-    setupCheck(Settings::load()['wake_token_hash'] !== hash('sha256', $key), 'Rotation revokes the old key.');
-    setupRender('b', ['revoke_wake' => '1', '_glpi_csrf_token' => 'test-csrf']);
-    setupCheck(Settings::load()['wake_enabled'] === '0' && Settings::load()['wake_token_hash'] === '', 'Disable revokes the accepted key.');
+    setupCheck(Settings::load()['wake_enabled'] === '1' && !str_contains($b, 'new_wake_key')
+        && !str_contains($b, 'rotate_wake') && !str_contains($b, 'Legacy registration'),
+        'Native wake enables without custom key generation, display or rotation.');
+    setupRender('b', ['disable_wake' => '1']);
+    setupCheck(Settings::load()['wake_enabled'] === '0' && Settings::load()['wake_binding'] === '', 'Disable clears only derived wake admission.');
     Session::$canUpdate = false;
     $before = Config::$values;
     setupCheck(str_contains(setupRender('a'), ' disabled>') && str_contains(setupRender('b'), ' disabled>'), 'Read-only views disable controls.');

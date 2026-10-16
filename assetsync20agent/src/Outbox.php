@@ -66,6 +66,7 @@ final class Outbox
 
     public static function claim(array $settings): ?array
     {
+        if (!Settings::transportReady($settings)) { return null; }
         global $DB;
         $generation = $DB->quote($settings['generation']);
         $now = time();

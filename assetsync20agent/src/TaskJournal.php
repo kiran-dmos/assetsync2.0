@@ -74,6 +74,7 @@ final class TaskJournal
 
     public static function cycle(array $settings, int $deadline): void
     {
+        if (!Settings::transportReady($settings)) { return; }
         global $DB;
         $deadline = min($deadline, hrtime(true) + 5_000_000_000);
         // A separate bounded pull keeps leases/revocations moving even behind a large task or lost result ACK.
@@ -183,47 +184,15 @@ final class TaskJournal
         return $DB->update(self::TABLE, ['acknowledged' => 1], ['id' => $task['id'], 'hash' => $task['hash']]);
     }
 
-    public static function send(array $settings, array $payload, int $deadline, bool $legacyPull = false): array
+    public static function send(array $settings, array $payload, int $deadline): array
     {
         Wake::assertCurrent();
-        if (!in_array($settings['agent_auth'] ?? 'legacy_bearer', ['legacy_bearer', 'glpi_session'], true)) {
-            return ['status' => 0, 'body' => []];
-        }
-        if ((($settings['agent_auth'] ?? 'legacy_bearer') !== 'glpi_session' && !Settings::validEndpoint($settings['endpoint'] ?? ''))
-            || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
+        if (($settings['mode'] ?? '') !== 'agent' || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
         if (($payload['kind'] ?? '') === 'pull') {
-            $payload['task_versions'] = $legacyPull ? [1, 2, 3, 4, 5] : [1, 2, 3, 4, 5, 6];
+            $payload['task_versions'] = [1, 2, 3, 4, 5, 6];
             $payload['recovery_version'] = 1;
         }
         foreach (['registration', 'generation', 'installation', 'connection_id'] as $key) { $payload[$key] = $settings[$key]; }
-        if (($settings['agent_auth'] ?? 'legacy_bearer') === 'glpi_session') {
-            return AgentSession::send($settings, 'task', $payload, $deadline);
-        }
-        $encoded = json_encode($payload, JSON_THROW_ON_ERROR);
-        if (strlen($encoded) > 65536) { throw new \RuntimeException('Task body exceeds limit.'); }
-        $url = substr($settings['endpoint'], 0, -strlen('agent-notify.php')) . 'agent-task.php';
-        $curl = curl_init($url);
-        $body = '';
-        $timeout = min(5000, max(1, (int) (($deadline - hrtime(true)) / 1_000_000)));
-        try {
-            curl_setopt_array($curl, [CURLOPT_POST => true, CURLOPT_POSTFIELDS => $encoded,
-                CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json', 'Authorization: Bearer ' . $settings['token']],
-                CURLOPT_SSL_VERIFYPEER => true, CURLOPT_SSL_VERIFYHOST => 2, CURLOPT_FOLLOWLOCATION => false,
-                CURLOPT_PROTOCOLS => CURLPROTO_HTTPS, CURLOPT_REDIR_PROTOCOLS => CURLPROTO_HTTPS,
-                CURLOPT_CONNECTTIMEOUT_MS => min(2000, $timeout), CURLOPT_TIMEOUT_MS => $timeout,
-                CURLOPT_WRITEFUNCTION => static function ($handle, string $chunk) use (&$body): int {
-                    if (strlen($body) + strlen($chunk) > 65536) { return 0; }
-                    $body .= $chunk;
-                    return strlen($chunk);
-                }]);
-            $ok = curl_exec($curl);
-            $decoded = json_decode($body, true, 32);
-            $response = ['status' => $ok === false ? 0 : (int) curl_getinfo($curl, CURLINFO_RESPONSE_CODE), 'body' => is_array($decoded) ? $decoded : []];
-        } finally { curl_close($curl); }
-        // Older A rejects the additive capability list before handling a pull. Retry only that read.
-        if (!$legacyPull && ($payload['kind'] ?? '') === 'pull' && $response['status'] === 400) {
-            return self::send($settings, $payload, $deadline, true);
-        }
-        return $response;
+        return AgentSession::send($settings, 'task', $payload, $deadline);
     }
 }

@@ -8,6 +8,7 @@ namespace GlpiPlugin\Assetsync20agent {
         public static array $options = [];
         public static int $calls = 0;
         public static int $closed = 0;
+        public static int $protocolCalls = 0;
         public static int $status = 200;
         public static string $body = '{}';
         public static array $responses = [];
@@ -20,6 +21,15 @@ namespace GlpiPlugin\Assetsync20agent {
         return true;
     }
     function curl_exec(object $handle): bool {
+        $headers = AgentTransport::$options[CURLOPT_HTTPHEADER];
+        $lifecycle = in_array('X-Assetsync-Operation: initSession', $headers, true) ? 'init'
+            : (in_array('X-Assetsync-Operation: killSession', $headers, true) ? 'kill' : '');
+        if ($lifecycle !== '') {
+            $body = $lifecycle === 'init' ? '{"session_token":"native-test-session"}' : '{}';
+            $handle->status = 200;
+            return (AgentTransport::$options[CURLOPT_WRITEFUNCTION])($handle, $body) === strlen($body);
+        }
+        AgentTransport::$protocolCalls++;
         if (AgentTransport::$responses !== []) {
             $response = array_shift(AgentTransport::$responses);
             AgentTransport::$status = $response['status'];
@@ -27,7 +37,7 @@ namespace GlpiPlugin\Assetsync20agent {
         }
         return (AgentTransport::$options[CURLOPT_WRITEFUNCTION])($handle, AgentTransport::$body) === strlen(AgentTransport::$body);
     }
-    function curl_getinfo(object $handle, int $option): int { return AgentTransport::$status; }
+    function curl_getinfo(object $handle, int $option): int { return $handle->status ?? AgentTransport::$status; }
     function curl_close(object $handle): void { AgentTransport::$closed++; }
 }
 
@@ -57,8 +67,10 @@ namespace {
         $checks++;
         if (!$ok) { throw new RuntimeException($message); }
     };
-    $settings = ['endpoint' => 'https://controller.invalid/plugins/assetsync20/front/agent-notify.php', 'token' => str_repeat('a', 64)];
-    $check(plugin_version_assetsync20agent()['version'] === '0.6.0', 'B advertises the native session feature package version.');
+    $settings = ['mode' => 'agent', 'agent_auth' => 'glpi_session', 'agent_api_url' => 'https://controller.invalid/plugins/assetsync20/front/agent-api.php',
+        'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user'];
+    \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
+    $check(plugin_version_assetsync20agent()['version'] === '0.7.0', 'B advertises the native session feature package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
@@ -74,12 +86,12 @@ namespace {
     Worker::send($settings, $health, hrtime(true) + 900_000_000);
     $check(json_decode(AgentTransport::$options[CURLOPT_POSTFIELDS], true) === array_intersect_key($health,
         array_flip(['kind', 'registration', 'generation', 'reconcile_status'])), 'Health payload cannot claim an asset revision.');
-    foreach (['http://controller.invalid/front/agent-notify.php', 'https://u:p@controller.invalid/front/agent-notify.php',
-        'https://controller.invalid/front/agent-notify.php?token=bad', 'https://controller.invalid/front/agent-notify.php#bad'] as $url) {
-        $check(!Settings::validEndpoint($url), 'Reject unsafe endpoint: ' . $url);
+    foreach (['http://controller.invalid/front/agent-api.php', 'https://u:p@controller.invalid/front/agent-api.php',
+        'https://controller.invalid/front/agent-api.php?token=bad', 'https://controller.invalid/front/agent-api.php#bad'] as $url) {
+        $check(!\GlpiPlugin\Assetsync20agent\AgentSession::validUrl($url), 'Reject unsafe endpoint: ' . $url);
     }
     $calls = AgentTransport::$calls;
-    Worker::send(array_replace($settings, ['endpoint' => 'http://controller.invalid/front/agent-notify.php']), $sent, hrtime(true) + 1_000_000_000);
+    Worker::send(array_replace($settings, ['agent_api_url' => 'http://controller.invalid/front/agent-api.php']), $sent, hrtime(true) + 1_000_000_000);
     $check(AgentTransport::$calls === $calls, 'HTTP endpoint rejection happens before transport.');
     AgentTransport::$body = str_repeat('x', 2049);
     $result = Worker::send($settings, $sent, hrtime(true) + 1_000_000_000);
@@ -90,15 +102,15 @@ namespace {
     plugin_assetsync20_boot();
     plugin_init_assetsync20();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
-        $check((preg_match($pattern, '/front/agent-notify.php') === 1 || preg_match($pattern, '/front/agent-task.php') === 1
-            || preg_match($pattern, '/front/agent-api.php') === 1) && preg_match($pattern, '/front/agents.php') === 0
-            && preg_match($pattern, '/front/agent-notify.php/other') === 0 && preg_match($pattern, '/front/agent-notify.phpx') === 0,
-            'Actual GLPI stateless/firewall patterns exempt only the two exact machine endpoints.');
+        $check(preg_match($pattern, '/front/agent-api.php') === 1
+            && preg_match($pattern, '/front/agent-notify.php') === 0 && preg_match($pattern, '/front/agent-task.php') === 0
+            && preg_match($pattern, '/front/agent-wake.php') === 0 && preg_match($pattern, '/front/agents.php') === 0,
+            'Only the exact native API machine endpoint is exempt.');
         $check(preg_match($pattern, '/front/agent-task.php/other') === 0 && preg_match($pattern, '/front/agent-task.phpx') === 0
             && preg_match($pattern, '/front/agent-api.php/other') === 0 && preg_match($pattern, '/front/agent-api.phpx') === 0
             && preg_match($pattern, '/front/agent-pair.php') === 0, 'Task endpoint exemption excludes suffixes and protected pairing.');
     }
-    $endpoint = file_get_contents(__DIR__ . '/../front/agent-notify.php');
+    $endpoint = file_get_contents(__DIR__ . '/../src/AgentApi.php');
     $check(str_contains($endpoint, "\$_SERVER['HTTPS']") && !str_contains($endpoint, 'FORWARDED'), 'Receiver does not trust forwarded protocol headers.');
     foreach (['../front/agents.php', '../assetsync20agent/front/config.php'] as $file) {
         $page = file_get_contents(__DIR__ . '/' . $file);
@@ -112,6 +124,8 @@ namespace {
     $check(str_contains($agentConfig, 'global $DB;'), 'B configuration page imports DB for GLPI legacy controller scoped inclusion.');
     $settings += ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32),
         'installation' => str_repeat('d', 32), 'connection_id' => 'b'];
+    \GlpiPlugin\Assetsync20agent\AgentSession::end();
+    \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
     AgentTransport::$body = '{"task":null}';
     \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000);
     $options = AgentTransport::$options;
@@ -122,8 +136,7 @@ namespace {
     AgentTransport::$responses = [['status' => 400, 'body' => ['error' => 'Invalid task request']], ['status' => 200, 'body' => ['task' => null]]];
     $calls = AgentTransport::$calls;
     $response = \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'pull'], hrtime(true) + 1_000_000_000);
-    $check($response['status'] === 200 && AgentTransport::$calls === $calls + 2
-        && AgentTransport::$payloads[count(AgentTransport::$payloads) - 1]['task_versions'] === [1, 2, 3, 4, 5], 'B-first upgrade retries an older A capability rejection with legacy read-only pull.');
+    $check($response['status'] === 400 && AgentTransport::$calls === $calls + 1, 'Rejected pulls are never retried or downgraded.');
     AgentTransport::$responses = [['status' => 400, 'body' => []]];
     $calls = AgentTransport::$calls;
     \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'result', 'id' => 'retained'], hrtime(true) + 1_000_000_000);
@@ -137,5 +150,6 @@ namespace {
         \GlpiPlugin\Assetsync20agent\TaskJournal::send($settings, ['kind' => 'result', 'result' => str_repeat('x', 65536)], hrtime(true) + 1_000_000_000);
         throw new LogicException('Oversized result accepted');
     } catch (RuntimeException) { $check(AgentTransport::$calls === $calls, 'Oversized task result is rejected before HTTP.'); }
+    \GlpiPlugin\Assetsync20agent\AgentSession::end();
     echo "Agent HTTP/security tests passed ($checks checks; transport entirely mocked).\n";
 }

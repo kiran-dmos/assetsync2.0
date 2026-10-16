@@ -167,17 +167,7 @@ final class GlpiBConnection
             throw new \InvalidArgumentException('Unsupported connection mode.');
         }
         $wakeEnabled = $mode === 'agent' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
-        $wakeUrl = trim((string) ($input['wake_url'] ?? $current['wake_url'] ?? ''));
-        $wakeToken = trim((string) ($input['wake_token'] ?? ''));
-        if ($wakeToken === '') { $wakeToken = $current['wake_token'] ?? ''; }
-        $agent = AgentSession::configuration($input, $current);
-        if ($agent['agent_auth'] === 'glpi_session' && $mode !== 'agent') {
-            throw new \InvalidArgumentException('Native agent authentication requires agent mode.');
-        }
-        if ($wakeEnabled && $agent['agent_auth'] === 'legacy_bearer'
-            && (!AgentWake::validUrl($wakeUrl) || !preg_match('/^[a-f0-9]{64}$/D', $wakeToken))) {
-            throw new \InvalidArgumentException('Wake requires a direct HTTPS endpoint and a separate wake credential.');
-        }
+        $agent = $mode === 'agent' ? AgentSession::configuration($input, $current) : [];
         return $agent + [
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
@@ -187,8 +177,6 @@ final class GlpiBConnection
             'user_token' => $mode === 'agent' ? '' : $userToken,
             'active'     => !empty($input['active']),
             'wake_enabled' => $wakeEnabled,
-            'wake_url' => $mode === 'agent' ? $wakeUrl : '',
-            'wake_token' => $mode === 'agent' ? $wakeToken : '',
         ];
     }
 
@@ -264,6 +252,7 @@ final class GlpiBConnection
             return;
         }
 
+        self::upgradeNativeOnly();
         try {
             if (self::loadAll() === []) {
                 self::saveAll([]);
@@ -271,6 +260,26 @@ final class GlpiBConnection
         } finally {
             self::invalidateRunCache();
         }
+    }
+
+    /** Remove custom communication credentials without normalizing ordinary REST entries. */
+    public static function upgradeNativeOnly(): void
+    {
+        $values = \Config::getConfigurationValues(self::CONTEXT, [self::CONNECTIONS_KEY, 'native_only_upgrade']);
+        if (($values['native_only_upgrade'] ?? '') === '1') { return; }
+        $connections = json_decode((string) ($values[self::CONNECTIONS_KEY] ?? '[]'), true, 32, JSON_THROW_ON_ERROR);
+        if (!is_array($connections)) { throw new \RuntimeException('Saved connections unavailable for upgrade.'); }
+        foreach ($connections as &$connection) {
+            unset($connection['wake_url'], $connection['wake_token']);
+            if (($connection['mode'] ?? 'rest') !== 'agent') { continue; }
+            $connection['agent_auth'] = 'glpi_session';
+            $connection['wake_enabled'] = false;
+        }
+        unset($connection);
+        \Config::deleteConfigurationValues(self::CONTEXT, ['wake_backoff', 'wake_phase', 'wake_cursor']);
+        \Config::setConfigurationValues(self::CONTEXT, [self::CONNECTIONS_KEY => json_encode($connections, JSON_THROW_ON_ERROR),
+            'native_only_upgrade' => '1']);
+        self::invalidateRunCache();
     }
 
     public static function uninstall(): void
@@ -1543,7 +1552,7 @@ final class GlpiBConnection
 
             $connections[] = [
                 'mode'       => (string) ($savedConnection['mode'] ?? 'rest'),
-                'agent_auth' => (string) ($savedConnection['agent_auth'] ?? 'legacy_bearer'),
+                'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($savedConnection['agent_api_url'] ?? ''),
                 'agent_peer_user' => (string) ($savedConnection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($savedConnection['agent_peer_api_client'] ?? ''),
@@ -1558,8 +1567,6 @@ final class GlpiBConnection
                 'user_token' => ($savedConnection['mode'] ?? 'rest') === 'agent' ? '' : self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
                 'active'     => !empty($savedConnection['active']),
                 'wake_enabled' => !empty($savedConnection['wake_enabled']),
-                'wake_url' => (string) ($savedConnection['wake_url'] ?? ''),
-                'wake_token' => empty($savedConnection['wake_token']) ? '' : ((new \GLPIKey())->decrypt($savedConnection['wake_token']) ?? ''),
             ];
         }
 
@@ -1577,7 +1584,7 @@ final class GlpiBConnection
         foreach ($connections as $connection) {
             $savedConnections[] = [
                 'mode'       => (string) ($connection['mode'] ?? 'rest'),
-                'agent_auth' => (string) ($connection['agent_auth'] ?? 'legacy_bearer'),
+                'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($connection['agent_api_url'] ?? ''),
                 'agent_peer_user' => (string) ($connection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($connection['agent_peer_api_client'] ?? ''),
@@ -1592,8 +1599,6 @@ final class GlpiBConnection
                 'user_token' => self::encryptToken($connection['user_token']),
                 'active'     => $connection['active'],
                 'wake_enabled' => !empty($connection['wake_enabled']),
-                'wake_url' => (string) ($connection['wake_url'] ?? ''),
-                'wake_token' => empty($connection['wake_token']) ? '' : (new \GLPIKey())->encrypt($connection['wake_token']),
             ];
         }
 

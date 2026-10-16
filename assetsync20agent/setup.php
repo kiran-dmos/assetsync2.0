@@ -9,9 +9,6 @@ function plugin_assetsync20agent_boot(): void
     \Glpi\Http\SessionManager::registerPluginStatelessPath('assetsync20agent', '#^/front/agent-api\\.php$#D');
     \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts('assetsync20agent', '#^/front/agent-api\\.php$#D',
         \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
-    \Glpi\Http\SessionManager::registerPluginStatelessPath('assetsync20agent', '#^/front/agent-wake\\.php$#D');
-    \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts('assetsync20agent', '#^/front/agent-wake\\.php$#D',
-        \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
 }
 
 function plugin_init_assetsync20agent(): void
@@ -30,7 +27,7 @@ function plugin_init_assetsync20agent(): void
 
 function plugin_version_assetsync20agent(): array
 {
-    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.6.0',
+    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.7.0',
         'author' => 'DMOS Technologies', 'license' => 'GPLv3+', 'requirements' => [
             'glpi' => ['min' => '11.0.0', 'max' => '12.0.0'], 'php' => ['min' => '8.2.0']]];
 }

@@ -19,7 +19,8 @@ namespace GlpiPlugin\Assetsync20agent {
 namespace {
     require __DIR__ . '/../assetsync20agent/src/Wake.php';
     $rejected = false;
-    try { \GlpiPlugin\Assetsync20agent\Wake::receive([], ''); }
+    require_once __DIR__ . '/agent-api-fixtures.php';
+    try { \GlpiPlugin\Assetsync20agent\Wake::receive([], new \GlpiPlugin\Assetsync20agent\AgentApi()); }
     catch (RuntimeException $error) {
         $rejected = $error->getMessage() === 'HTTPS wake requires the upgraded worker.';
     }

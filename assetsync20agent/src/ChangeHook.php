@@ -19,6 +19,7 @@ final class ChangeHook
     private static function record(object $item, bool $purged): void
     {
         try {
+            if (!Settings::transportReady(Settings::load())) { return; }
             $type = method_exists($item, 'getType') ? $item::getType() : $item::class;
             $fields = $item->fields ?? [];
             $parentType = $type;
@@ -43,13 +44,7 @@ final class ChangeHook
             }
             if ($id > 0) {
                 $settings = Settings::load();
-                if (($settings['mode'] ?? 'rest') === 'agent') {
-                    TargetScope::dirty($parentType, $id, $settings);
-                    return;
-                }
-                if (($settings['mode'] ?? 'rest') !== 'agent' && $parentType !== 'Computer') { return; }
-                $snapshot = $purged ? ['fingerprint' => hash('sha256', 'purged'), 'lifecycle' => 'purged'] : Snapshot::read($id, null, $parentType);
-                Outbox::observe($id, $snapshot, false, null, $parentType);
+                if (($settings['mode'] ?? '') === 'agent') { TargetScope::dirty($parentType, $id, $settings); }
             }
         } catch (\Throwable) {
             // Reconciliation repairs missed hooks. Never leak field values/credentials into logs.

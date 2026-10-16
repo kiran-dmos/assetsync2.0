@@ -29,19 +29,16 @@ final class AgentSession
 
     public static function configuration(array $input, array $old): array
     {
-        $settings = [];
-        foreach (['agent_auth', 'agent_api_url', 'agent_app_token', 'agent_user_token',
+        $settings = ['agent_auth' => 'glpi_session'];
+        foreach (['agent_api_url', 'agent_app_token', 'agent_user_token',
             'agent_peer_user', 'agent_peer_api_client', 'agent_peer_profile', 'agent_peer_entity'] as $key) {
-            $value = trim((string) ($input[$key] ?? $old[$key] ?? ($key === 'agent_auth' ? 'legacy_bearer' : '')));
+            $value = trim((string) ($input[$key] ?? $old[$key] ?? ''));
             if (in_array($key, ['agent_app_token', 'agent_user_token'], true) && $value === '') {
                 $value = (string) ($old[$key] ?? '');
             }
             $settings[$key] = $value;
         }
-        if (!in_array($settings['agent_auth'], ['legacy_bearer', 'glpi_session'], true)) {
-            throw new \InvalidArgumentException('Invalid agent authentication mode.');
-        }
-        if ($settings['agent_auth'] === 'glpi_session') {
+        if ($settings['agent_api_url'] !== '') {
             if (!self::validUrl($settings['agent_api_url'])) {
                 throw new \InvalidArgumentException('Enter a direct HTTPS Agent API URL.');
             }
