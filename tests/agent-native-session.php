@@ -12,6 +12,10 @@ namespace GlpiPlugin\Assetsync20 {
 }
 
 namespace GlpiPlugin\Assetsync20agent {
+    class Settings {
+        public static function load(): array { return \NativeTransport::$settings; }
+        public static function transportReady(array $settings): bool { return ($settings['transport'] ?? 'adapter') === 'adapter' && !empty($settings['agent_api_url']); }
+    }
     function hrtime(bool $asNumber = false): int { return \NativeTransport::$now; }
     function curl_init(string $url): object { return (object) ['url' => $url]; }
     function curl_setopt_array(object $handle, array $options): bool { return \NativeTransport::configure($options); }
@@ -31,6 +35,7 @@ namespace {
         public static array $options = [];
         public static array $queue = [];
         public static int $closed = 0;
+        public static array $settings = [];
         public static function configure(array $options): bool
         {
             self::$options = $options;
@@ -61,12 +66,24 @@ namespace {
     }
     $a = file_get_contents(__DIR__ . '/../src/AgentSession.php');
     $b = file_get_contents(__DIR__ . '/../assetsync20agent/src/AgentSession.php');
-    nativeCheck(str_replace('GlpiPlugin\\Assetsync20agent', 'GlpiPlugin\\Assetsync20', $b) === $a, 'Independently packaged client copies have parity.');
+    $fence = <<<'PHP'
+    private static function current(array $settings): bool
+    {
+        $current = Settings::load();
+        return Settings::transportReady($current) && self::fingerprint($settings) === self::fingerprint($current);
+    }
+
+PHP;
+    nativeCheck(str_contains($b, $fence), 'B has its explicit fresh local transport fence.');
+    $shared = str_replace([$fence . "\n", "        if (!self::current(\$settings)) { return ['status' => 0, 'body' => []]; }\n",
+        "        if (!\$cleanup && !self::current(\$this->settings)) { return ['status' => 0, 'body' => []]; }\n"], '', $b);
+    nativeCheck(str_replace('GlpiPlugin\\Assetsync20agent', 'GlpiPlugin\\Assetsync20', $shared) === $a, 'Client transport/lifecycle code has parity apart from B local policy admission.');
     foreach ([GlpiPlugin\Assetsync20\AgentSession::class, GlpiPlugin\Assetsync20agent\AgentSession::class] as $client) {
         NativeTransport::reset();
         $settings = ['agent_auth' => 'glpi_session', 'agent_api_url' => 'https://peer.invalid/plugins/assetsync20/front/agent-api.php',
             'agent_app_token' => 'native-app', 'agent_user_token' => 'native-user', 'connection_id' => 'peer',
             'installation' => 'installation', 'registration' => 'registration', 'generation' => 'generation'];
+        NativeTransport::$settings = $settings;
         $deadline = NativeTransport::$now + 20_000_000_000;
         $client::begin($deadline);
         try {

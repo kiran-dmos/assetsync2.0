@@ -56,6 +56,8 @@ namespace Glpi\Http {
 }
 
 namespace {
+    $smokeBootstrapOnly = true;
+    require_once __DIR__ . '/smoke.php';
     require __DIR__ . '/../assetsync20agent/src/autoload.php';
     require __DIR__ . '/../assetsync20agent/setup.php';
     use GlpiPlugin\Assetsync20agent\AgentTransport;
@@ -69,8 +71,13 @@ namespace {
     };
     $settings = ['mode' => 'agent', 'agent_auth' => 'glpi_session', 'agent_api_url' => 'https://controller.invalid/plugins/assetsync20/front/agent-api.php',
         'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user'];
+    function httpSettings(array $settings): void {
+        foreach (['agent_app_token', 'agent_user_token'] as $key) { $settings[$key] = (new GLPIKey())->encrypt($settings[$key] ?? ''); }
+        Config::setConfigurationValues(Settings::CONTEXT, $settings);
+    }
+    httpSettings($settings);
     \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
-    $check(plugin_version_assetsync20agent()['version'] === '0.8.1', 'B advertises the stock REST records package version.');
+    $check(plugin_version_assetsync20agent()['version'] === '0.8.2', 'B advertises the stock REST records package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
@@ -98,7 +105,7 @@ namespace {
     $check($result['status'] === 0 && $result['body'] === [] && AgentTransport::$closed === AgentTransport::$calls, 'Oversized ACK aborts and closes transport.');
     $hook = file_get_contents(__DIR__ . '/../assetsync20agent/src/ChangeHook.php');
     $check(!str_contains($hook, 'Worker::') && !str_contains($hook, 'curl_') && !str_contains($hook, 'http'), 'Save hooks have no HTTP/worker path.');
-    require __DIR__ . '/../setup.php';
+    require_once __DIR__ . '/../setup.php';
     plugin_assetsync20_boot();
     plugin_init_assetsync20();
     foreach (array_merge(\Glpi\Http\SessionManager::$patterns, \Glpi\Http\Firewall::$patterns) as $pattern) {
@@ -124,6 +131,7 @@ namespace {
     $check(str_contains($agentConfig, 'global $DB;'), 'B configuration page imports DB for GLPI legacy controller scoped inclusion.');
     $settings += ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32),
         'installation' => str_repeat('d', 32), 'connection_id' => 'b'];
+    httpSettings($settings);
     \GlpiPlugin\Assetsync20agent\AgentSession::end();
     \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
     AgentTransport::$body = '{"task":null}';

@@ -102,6 +102,15 @@ final class EntitySyncRoute
      */
     public static function save(array $input): void
     {
+        $connection = (string) ($input['glpi_b_connection_id'] ?? '');
+        $old = self::find((string) ($input['id'] ?? ''));
+        $records = (GlpiBConnection::find($connection)['agent_transport'] ?? '') === 'rest_records'
+            || ($old && (GlpiBConnection::find($old['glpi_b_connection_id'])['agent_transport'] ?? '') === 'rest_records');
+        RestWork::configure(static function () use ($input): void { self::saveConfigured($input); }, (bool) $records);
+    }
+
+    private static function saveConfigured(array $input): void
+    {
         self::invalidateRunCache();
         $route = self::fromInput($input);
         $routes = self::loadAll();
@@ -123,6 +132,12 @@ final class EntitySyncRoute
     }
 
     public static function delete(string $id): void
+    {
+        $old = self::find($id);
+        RestWork::configure(static function () use ($id): void { self::deleteConfigured($id); }, $old && (GlpiBConnection::find($old['glpi_b_connection_id'])['agent_transport'] ?? '') === 'rest_records');
+    }
+
+    private static function deleteConfigured(string $id): void
     {
         self::invalidateRunCache();
         $id = self::cleanId($id);
@@ -400,7 +415,7 @@ final class EntitySyncRoute
 
         try {
             if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-                \Config::setConfigurationValues(self::CONTEXT, [
+                RestWork::saveConfiguration([
                     self::ROUTES_KEY => json_encode($savedRoutes, JSON_THROW_ON_ERROR),
                 ]);
             }

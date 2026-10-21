@@ -188,6 +188,13 @@ final class FieldMapping
      */
     public static function save(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields = []): void
     {
+        RestWork::configure(static function () use ($connectionId, $itemtype, $fieldMappings, $glpiBFields): void {
+            self::saveConfigured($connectionId, $itemtype, $fieldMappings, $glpiBFields);
+        }, (GlpiBConnection::find($connectionId)['agent_transport'] ?? '') === 'rest_records');
+    }
+
+    private static function saveConfigured(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields): void
+    {
         self::invalidateRunCache();
         $connectionId = trim($connectionId);
         if ($connectionId === '') {
@@ -207,6 +214,13 @@ final class FieldMapping
             }
         }
         $rows = self::rowsFromScope($rowInput ? ['version' => 2, 'rows' => $fieldMappings] : $fieldMappings);
+        if ((GlpiBConnection::find($connectionId)['agent_transport'] ?? 'adapter') === 'rest_records') {
+            if (count($rows) > 1) { throw new \RuntimeException('REST records supports one native Name mapping with A authority only.'); }
+            foreach ($rows as $row) {
+                if (!in_array($row['glpi_a_field_key'] ?? '', ['name', 'Computer.name'], true) || !in_array($row['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true)
+                    || ($row['source_of_truth'] ?? '') !== 'glpi_a' || $itemtype !== 'Computer') { throw new \RuntimeException('REST records supports Computer Name with A authority only.'); }
+            }
+        }
         if (GlpiBConnection::isAgentConnection($connectionId)) {
             AgentTask::validateMappings($itemtype, $rows);
         }
@@ -263,7 +277,7 @@ final class FieldMapping
 
         try {
             if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-                \Config::setConfigurationValues(self::CONTEXT, [
+                RestWork::saveConfiguration([
                     self::FIELD_MAPPINGS_KEY => json_encode($allMappings, JSON_THROW_ON_ERROR),
                 ]);
             }

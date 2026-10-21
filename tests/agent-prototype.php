@@ -5,7 +5,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/agent-api-fixtures.php';
 
 $smokeBootstrapOnly = true;
-require __DIR__ . '/smoke.php';
+require_once __DIR__ . '/smoke.php';
 require __DIR__ . '/agent-sqlite.php';
 require __DIR__ . '/../assetsync20agent/src/autoload.php';
 

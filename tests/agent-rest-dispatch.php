@@ -51,7 +51,7 @@ namespace {
     }
 
     /** Only native transaction/lock probes are simulated; all task SQL runs in SQLite. */
-    final class RestDispatchDB
+    class RestDispatchDB
     {
         public function __construct(public AgentSqlite $sql) {}
         public function tableExists(string $table): bool { return $this->sql->tableExists($table); }
@@ -61,6 +61,8 @@ namespace {
         public function request(array $query): ArrayIterator { return $this->sql->request($query); }
         public function firstRow(string $table, array $where): ?array { return $this->sql->firstRow($table, $where); }
         public function update(string $table, array $fields, array $where): bool { return $this->sql->update($table, $fields, $where); }
+        public function insert(string $table, array $fields): bool { return $this->sql->insert($table, $fields); }
+        public function fieldExists(string $table, string $field): bool { return $this->sql->fieldExists($table, $field); }
         public function errno(): int { return 1305; }
         public function doQuery(string $sql): mixed
         {

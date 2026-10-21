@@ -5,13 +5,14 @@ namespace GlpiPlugin\Assetsync20agent {
     final class RestPeer {
         public static function settings(): array {
             return ['connection_id' => 'current', 'registration' => 'registration', 'generation' => 'generation',
-                'installation' => 'installation', 'agent_peer_user' => 1, 'agent_peer_profile' => 2];
+                'installation' => 'installation', 'agent_peer_user' => 1, 'agent_peer_profile' => 2, 'service_user' => 3, 'service_profile' => 4];
         }
         public static function binding(array $settings): string { return 'current-binding'; }
     }
     final class Settings {
         public static function entities(int $user, int $profile): array { return [2 => 'Exact entity']; }
     }
+    final class ServiceContext { public static function account(int $id): void {} }
 }
 namespace Glpi\DBAL {
     final class QueryExpression {
@@ -19,7 +20,14 @@ namespace Glpi\DBAL {
     }
 }
 namespace {
+    define('READ', 1);
     class CommonDBTM {}
+    class Profile {
+        public array $fields = [];
+        public static int $read = READ;
+        public function getFromDB(int $id): bool { $this->fields = ['computer' => self::$read]; return true; }
+    }
+    require __DIR__ . '/../assetsync20agent/src/TaskExecutor.php';
     require __DIR__ . '/../assetsync20agent/src/RestSettings.php';
     require __DIR__ . '/../assetsync20agent/src/RestWork.php';
 
@@ -65,6 +73,19 @@ namespace {
         try { \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records'); throw new LogicException('Invalid batch query accepted'); }
         catch (RuntimeException) {}
     }
+    $_GET = ['get_hateoas' => '0', 'searchText' => ['compiler' => '9', 'work_id' => str_repeat('c', 32)]];
+    $scope = \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records');
+    if (($scope['AND']['records.compiler'] ?? null) !== 9 || ($scope['AND']['records.work_id'] ?? '') !== str_repeat('c', 32)) { throw new RuntimeException('Read-only lookup lacks exact SQL scope'); }
+    $readRow = array_replace($row, ['records.compiler' => 9, 'records.work_id' => str_repeat('c', 32)]);
+    $scope['records.compiler'] = ['LIKE', '%']; $scope['records.work_id'] = ['LIKE', '%'];
+    if (permits($scope, array_replace($readRow, ['records.compiler' => 8])) || permits($scope, array_replace($readRow, ['records.work_id' => str_repeat('d', 32)]))) {
+        throw new RuntimeException('Caller filter replaced exact metadata scope');
+    }
+    Profile::$read = 0;
+    try { \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records'); throw new LogicException('Revoked service READ accepted'); } catch (RuntimeException) {}
+    Profile::$read = READ;
+    $_GET['searchText']['work_id'] = '%';
+    try { \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records'); throw new LogicException('Wildcard read ID accepted'); } catch (RuntimeException) {}
     $_GET = [];
     echo "REST collection ACL passed: searchText cannot replace binding or entity predicates on either resource.\n";
 }

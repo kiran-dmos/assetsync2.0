@@ -66,6 +66,7 @@ final class AgentSession
 
     public static function send(array $settings, string $operation, array $payload, int $deadline): array
     {
+        if (!self::current($settings)) { return ['status' => 0, 'body' => []]; }
         if (self::$cycle === null) {
             $client = new self($settings, $deadline);
             try { return $client->request($operation, $payload); } finally { $client->close(); }
@@ -77,6 +78,12 @@ final class AgentSession
         }
         $client->operationDeadline = min($client->deadline, $deadline);
         return $client->request($operation, $payload);
+    }
+
+    private static function current(array $settings): bool
+    {
+        $current = Settings::load();
+        return Settings::transportReady($current) && self::fingerprint($settings) === self::fingerprint($current);
     }
 
     public static function fingerprint(array $settings): string
@@ -126,6 +133,7 @@ final class AgentSession
 
     private function http(string $operation, array $payload, bool $cleanup): array
     {
+        if (!$cleanup && !self::current($this->settings)) { return ['status' => 0, 'body' => []]; }
         $remaining = (int) ((($cleanup ? $this->deadline : $this->operationDeadline) - hrtime(true)) / 1_000_000) - ($cleanup ? 0 : 500);
         if ($remaining <= 0) { return ['status' => 0, 'body' => []]; }
         $body = json_encode((object) $payload, JSON_THROW_ON_ERROR);

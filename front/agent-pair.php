@@ -38,6 +38,17 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
                 $credentials = AgentTask::register($connectionId, (string) ($_POST['installation'] ?? ''));
                 $message = 'Installation registered. Binding identifiers are shown below.';
                 break;
+            case 'rest_metadata':
+                \GlpiPlugin\Assetsync20\RestWork::requestRead($connectionId, (int) ($_POST['remote_entity'] ?? -1));
+                $message = 'Metadata inspection queued.';
+                break;
+            case 'rest_declare':
+                $binding = AgentTask::binding($connectionId);
+                if (!$binding || (GlpiBConnection::find($connectionId)['agent_transport'] ?? '') !== 'rest_records') { throw new RuntimeException('REST binding unavailable.'); }
+                $credentials = AgentTask::declare($connectionId, $binding['installation'], (int) ($_POST['local_id'] ?? 0),
+                    (int) ($_POST['remote_id'] ?? 0), (int) ($_POST['remote_entity'] ?? -1), 'Computer');
+                $message = 'Computer candidate saved; read-only inspection queued. Confirmation remains separate.';
+                break;
             case 'discover':
                 AgentTask::discover($connectionId, $type, (int) ($_POST['remote_entity'] ?? -1),
                     (string) ($_POST['remote_search'] ?? ''), (int) ($_POST['remote_cursor'] ?? 0));
@@ -126,6 +137,30 @@ if (!$binding) {
     echo '</div>'; Html::footer(); return;
 }
 echo '<p>Connection binding: <code>' . $html($connectionId) . '</code></p>';
+if (($connection['agent_transport'] ?? 'adapter') === 'rest_records' && !$connection['active']) {
+    echo '<p>Connection disabled; REST requests held.</p>';
+} elseif (($connection['agent_transport'] ?? 'adapter') === 'rest_records') {
+    $registration = AgentTask::registration($binding);
+    echo '<dl><dt>Installation</dt><dd>' . $html($binding['installation']) . '</dd><dt>Registration</dt><dd>' . $html($registration['id'])
+        . '</dd><dt>Generation</dt><dd>' . $html($registration['generation']) . '</dd></dl>';
+    $post();
+    echo '<h3>Computer metadata</h3><label>B entity ID <input name="remote_entity" type="number" min="0" required></label> '
+        . '<button class="btn btn-secondary btn-sm" name="action" value="rest_metadata">Request metadata</button></form>';
+    $catalog = \GlpiPlugin\Assetsync20\RestWork::catalog($connectionId);
+    echo '<p>' . $html($catalog['message']) . '</p>';
+    echo '<h3>Route settings</h3><table class="tab_cadre_fixe"><tr><th>Route</th><th>Revision</th><th>Policy</th><th>Publication</th></tr>';
+    foreach (\GlpiPlugin\Assetsync20\RestWork::settingsStatus($connectionId) as $status) {
+        echo '<tr><td>' . $html($status['route']) . '</td><td>' . (int) $status['revision'] . '</td><td>' . ($status['enabled'] ? 'Enabled' : 'Disabled') . '</td><td>'
+            . ($status['pending'] ? 'Pending' : 'Activation accepted by B') . ($status['status'] > 0 ? ' (HTTP ' . (int) $status['status'] . ')' : '')
+            . ($status['error'] !== '' ? ': ' . $html($status['error']) : '') . '</td></tr>';
+    }
+    echo '</table>';
+    $post();
+    echo '<h3>Computer candidate</h3><label>A Computer ID <input name="local_id" type="number" min="1" required></label> '
+        . '<label>B Computer ID <input name="remote_id" type="number" min="1" required></label> '
+        . '<label>B entity ID <input name="remote_entity" type="number" min="0" required></label> '
+        . '<button class="btn btn-primary btn-sm" name="action" value="rest_declare">Inspect candidate</button></form>';
+} else {
 $discovery = AgentTask::discovery($connectionId);
 echo '<h3>Asset selection</h3><p>B discovery: ' . $html(str_replace('_', ' ', $discovery['state'])) . '</p>';
 echo '<p><a href="?' . $html(http_build_query($viewContext + ['connection' => $connectionId])) . '">Refresh status</a></p>';
@@ -212,6 +247,7 @@ try {
         echo '<button class="btn btn-secondary btn-sm" name="action" value="discover">Request next B page</button></form>';
     }
 } catch (Throwable $error) { echo '<p>' . $html($error->getMessage()) . '</p>'; }
+}
 echo '<h3>Candidate and confirmed pairs</h3>';
 echo '<form method="post" id="confirm-pairs">';
 $hidden($viewContext + ['connection' => $connectionId, '_glpi_csrf_token' => Session::getNewCSRFToken()]);

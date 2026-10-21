@@ -275,7 +275,8 @@ final class AgentApi extends \Glpi\Api\APIRest
     private function peer(): array
     {
         $peer = Settings::load();
-        if (($peer['mode'] ?? '') !== 'agent' || ($peer['agent_auth'] ?? '') !== 'glpi_session') {
+        if (($peer['mode'] ?? '') !== 'agent' || ($peer['agent_auth'] ?? '') !== 'glpi_session'
+            || ($peer['transport'] ?? 'adapter') !== 'adapter') {
             throw new \UnexpectedValueException('Native agent connection unavailable.');
         }
         return $peer;

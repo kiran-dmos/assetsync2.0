@@ -156,4 +156,31 @@ final class ServiceContext
         }
         return $item;
     }
+
+    /** Definition discovery needs READ only and no asset/Fields child row. */
+    public static function readComputer(array $settings): object
+    {
+        self::readPermission($settings);
+        if (($settings['itemtype'] ?? '') !== 'Computer' || (int) \Session::getLoginUserID() !== (int) $settings['service_user']
+            || \Session::isCron() || \Session::isInventory() || \Session::isRightChecksDisabled()
+            || (int) ($_SESSION['glpiactiveprofile']['id'] ?? 0) !== (int) $settings['service_profile']
+            || (int) ($_SESSION['glpiactive_entity'] ?? -1) !== (int) $settings['entity_id']
+            || !\Session::haveAccessToEntity((int) $settings['entity_id'])) { throw new \RuntimeException('Service read authorization denied.'); }
+        $item = new \Computer();
+        if ($settings['items_id'] > 0 && (!$item->getFromDB($settings['items_id']) || !$item->can($settings['items_id'], READ)
+            || (int) $item->fields['entities_id'] !== (int) $settings['entity_id'] || $item->fields['is_deleted'] || $item->fields['is_template'])) {
+            throw new \RuntimeException('Service read target denied.');
+        }
+        return $item;
+    }
+
+    public static function readPermission(array $settings): void
+    {
+        self::account((int) $settings['service_user']);
+        self::grant($settings);
+        $profile = new \Profile();
+        if (!$profile->getFromDB((int) $settings['service_profile']) || ((int) ($profile->fields['computer'] ?? 0) & READ) !== READ) {
+            throw new \RuntimeException('Service Computer READ denied.');
+        }
+    }
 }

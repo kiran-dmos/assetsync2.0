@@ -79,6 +79,7 @@ final class AgentActivity
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
             if (in_array($body['version'] ?? 0, [7, 8], true)) { $label = self::restLabel($task, $body, $context ?? []); }
+            if (($body['version'] ?? 0) === 9) { $label = $state === 'observed' ? 'REST inspection received; confirmation remains separate' : 'REST inspection ' . $state; }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
             }

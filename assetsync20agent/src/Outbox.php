@@ -66,7 +66,9 @@ final class Outbox
 
     public static function claim(array $settings): ?array
     {
-        if (!Settings::transportReady($settings)) { return null; }
+        $current = Settings::load();
+        if (!Settings::transportReady($settings) || !Settings::transportReady($current)
+            || AgentSession::fingerprint($settings) !== AgentSession::fingerprint($current)) { return null; }
         global $DB;
         $generation = $DB->quote($settings['generation']);
         $now = time();

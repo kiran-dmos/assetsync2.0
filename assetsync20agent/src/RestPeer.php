@@ -115,11 +115,25 @@ final class RestPeer
             if (($body[$key] ?? null) !== ($settings[$key] ?? null)) { throw new \RuntimeException('REST work binding changed.'); }
         }
         self::entity($settings, $body['entity_id']);
-        $entity = $body['entity_id'];
         $item = new \Computer();
         if (!$item->getFromDB($body['items_id']) || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
-            || (int) $item->fields['entities_id'] !== $entity || !$item->can($body['items_id'], READ)
+            || (int) $item->fields['entities_id'] !== $body['entity_id'] || !$item->can($body['items_id'], READ)
             || array_intersect_key(TaskExecutor::identity($item->fields), $body['identity']) !== $body['identity']) { throw new \RuntimeException('REST work target denied.'); }
+        return $settings;
+    }
+
+    public static function read(array $body): array
+    {
+        $settings = self::settings();
+        foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) {
+            if (($body[$key] ?? null) !== ($settings[$key] ?? null)) { throw new \RuntimeException('REST work binding changed.'); }
+        }
+        self::entity($settings, $body['entity_id']);
+        if ($body['items_id'] > 0) {
+            $item = new \Computer();
+            if (!$item->getFromDB($body['items_id']) || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
+                || (int) $item->fields['entities_id'] !== $body['entity_id'] || !$item->can($body['items_id'], READ)) { throw new \RuntimeException('REST read target denied.'); }
+        }
         return $settings;
     }
 

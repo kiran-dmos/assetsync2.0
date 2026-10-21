@@ -21,7 +21,7 @@ final class Wake
     {
         $current = Settings::load();
         if (self::$admittedSettings !== null) {
-            if (($current['mode'] ?? '') !== 'agent' || ($current['wake_enabled'] ?? '') !== '1'
+            if (($current['mode'] ?? '') !== 'agent' || ($current['transport'] ?? 'adapter') !== 'adapter' || ($current['wake_enabled'] ?? '') !== '1'
                 || ($current['wake_binding'] ?? '') !== self::$admittedSettings['wake_binding']
                 || Settings::wakeBinding($current) !== Settings::wakeBinding(self::$admittedSettings)) {
                 throw new \UnexpectedValueException('Admitted wake binding changed.');
@@ -40,7 +40,7 @@ final class Wake
         }
         if (!is_string($request['connection_id']) || $request['connection_id'] === '' || strlen($request['connection_id']) > 255
             || preg_match('/[\x00-\x20\x7f]/', $request['connection_id'])) { throw new \InvalidArgumentException('Invalid connection binding.'); }
-        if (($settings['wake_enabled'] ?? '0') !== '1' || ($settings['mode'] ?? '') !== 'agent'
+        if (($settings['wake_enabled'] ?? '0') !== '1' || ($settings['mode'] ?? '') !== 'agent' || ($settings['transport'] ?? 'adapter') !== 'adapter'
             || !hash_equals($settings['wake_binding'] ?? '', Settings::wakeBinding($settings))) {
             throw new \UnexpectedValueException('Wake authorization unavailable.');
         }

@@ -9,6 +9,7 @@ use GlpiPlugin\Assetsync20agent\TaskJournal;
 
 function agentTestCycle(array $settings, int $deadline): void
 {
+    httpSettings($settings);
     \GlpiPlugin\Assetsync20agent\AgentSession::begin($deadline);
     try { TaskJournal::cycle($settings, $deadline); }
     finally { \GlpiPlugin\Assetsync20agent\AgentSession::end(); }

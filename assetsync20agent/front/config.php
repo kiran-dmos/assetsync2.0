@@ -51,11 +51,16 @@ echo '<style>.assetsync-agent-setup{max-width:980px;margin:1rem auto 2rem;paddin
 echo '<div class="assetsync-agent-setup"><h2>AssetSync2.0 Agent</h2><p>' . $html($message) . '</p><fieldset style="border:0;padding:0;min-width:0"' . ($canConfigure ? '' : ' disabled') . '><form method="post"><table class="tab_cadre_fixe">';
 echo '<tr><th>Installation identity</th><td>' . $html($settings['installation'] ?? 'Install the plugin update first') . '</td></tr>';
 echo '<input type="hidden" name="mode" value="agent">';
+echo '<tr><th><label for="transport">Transport</label></th><td><select id="transport" name="transport">';
+foreach (['adapter' => 'Agent adapter', 'rest_records' => 'A-driven REST records'] as $value => $label) {
+    echo '<option value="' . $value . '"' . (($settings['transport'] ?? 'adapter') === $value ? ' selected' : '') . '>' . $label . '</option>';
+}
+echo '</select></td></tr>';
 if (($settings['mode'] ?? '') !== 'agent') { echo '<tr><th>Status</th><td>Notification-only mode retired. Native agent configuration required.</td></tr>'; }
-echo '<tr><th><label for="agent_api_url">GLPI A Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
+echo '<tr class="agent-adapter-setting"><th><label for="agent_api_url">GLPI A Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($display['agent_api_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI A app token', 'agent_user_token' => 'GLPI A user API token'] as $key => $label) {
-    echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key
+    echo '<tr class="agent-adapter-setting"><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key
         . '" value="" autocomplete="new-password" size="60"> Saved: ' . (!empty($display[$key]) ? 'Yes' : 'No') . '</td></tr>';
 }
 echo '<tr><th>GLPI B user used by A</th><td>';
@@ -100,8 +105,11 @@ foreach (['service_password' => 'Service password (blank keeps current)'] as $ke
         . '" type="password" autocomplete="new-password" size="60" value=""></td></tr>';
 }
 echo '</table><input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_settings" value="1" class="btn btn-primary btn-sm">Save settings</button></form>';
+echo '<script>function agentTransportRows(){document.querySelectorAll(".agent-adapter-setting").forEach(row=>{row.hidden=document.getElementById("transport").value==="rest_records";});}document.getElementById("transport").addEventListener("change",agentTransportRows);agentTransportRows();</script>';
 
 $wakeEnabled = ($settings['wake_enabled'] ?? '0') === '1';
+$adapter = ($settings['transport'] ?? 'adapter') === 'adapter';
+if ($adapter) {
 $wakeCurrent = false;
 try { $wakeCurrent = $wakeEnabled && hash_equals($settings['wake_binding'] ?? '', Settings::wakeBinding($settings)); }
 catch (Throwable) {}
@@ -111,6 +119,9 @@ echo '<form method="post"><table class="tab_cadre_fixe"><tr><th><label for="wake
 echo '<input type="hidden" name="_glpi_csrf_token" value="' . $html(Session::getNewCSRFToken()) . '"><button type="submit" name="save_wake" value="1" class="btn btn-primary btn-sm">Save wake setting</button> ';
 
 echo '<button type="submit" name="disable_wake" value="1" class="btn btn-secondary btn-sm"' . ($wakeEnabled ? '' : ' disabled') . '>Disable wake</button></form></fieldset>';
+} else {
+    echo '</fieldset><details><summary>Retained adapter evidence</summary>';
+}
 
 echo '<p>Last worker cycle: ' . (!empty($settings['worker_seen']) ? $html(gmdate('Y-m-d H:i:s', (int) $settings['worker_seen'])) . ' UTC' : 'Never') . '</p>';
 echo '<p>Reconciliation: ' . $html(in_array($settings['reconcile_status'] ?? '', ['ok', 'degraded'], true) ? $settings['reconcile_status'] : 'Not recorded')
@@ -120,5 +131,7 @@ $result = Outbox::sql('SELECT `last_outcome`, COUNT(*) AS total FROM `' . Outbox
 while ($row = $DB->fetchAssoc($result)) {
     echo '<tr><td>' . $html($row['last_outcome']) . '</td><td>' . (int) $row['total'] . '</td></tr>';
 }
-echo '</table><p>Accepted notifications remain subject to controller processing and field policies.</p></div>';
+echo '</table><p>Accepted notifications remain subject to controller processing and field policies.</p>';
+if (!$adapter) { echo '</details>'; }
+echo '</div>';
 Html::footer();

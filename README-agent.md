@@ -1,5 +1,64 @@
 # GLPI B Agent
 
+## A-Driven REST Setup And Settings (4a)
+
+Controller **0.9.2** and agent **0.8.2** add an explicit **REST records** transport.
+Update B first, then A through GLPI's plugin Update action. B adds a private
+settings-head table through its existing install hook; repeated installation
+preserves old Work/settings columns and evidence. The default transport remains
+**Adapter**. Existing credentials, bindings, pairs and pending tasks are retained.
+
+For REST records, A needs B's direct HTTPS `/apirest.php` URL, B's native app/user
+tokens, stable local registration identifiers and saved routes. A does not need
+an incoming A peer or the old B Agent API URL for this transport. B needs its
+incoming native peer, binding identifiers and separate local service account;
+it does not need A's URL or tokens. Select REST records on both sides. Adapter
+authentication is unchanged, and retained credentials are available for rollback.
+Switching transport does not send pending REST work through the adapter.
+
+A's worker drives publication and bounded Work POST/GET. No B worker or HTTPS wake
+is required in this mode. B fences adapter run, wake, send, pull and direct claims
+against fresh saved transport, including callers holding old adapter settings.
+Its retained adapter health/outbox remain inspectable as previous evidence.
+
+This slice supports only exact-entity Computer routes, one Name-to-Name mapping
+with A authority and explicitly opted-in confirmed v8 pairs. Child-entity and
+mixed-type routes remain unsupported here. The selected v7 pair setting remains
+separate; a route governed by v2 is not silently downgraded to older settings.
+
+A saves immutable settings v2 bytes and monotonically increasing revisions under
+a short configuration lock/owned transaction. Only effective canonical changes
+advance the revision. Retries reuse the same bytes. Disabled/deleted routes publish
+disable tombstones without asset jobs on active connections; disabled connections
+make no requests. B atomically stores the immutable version and current head under
+its worker lock: higher revisions activate, equal/exact retries are idempotent,
+equal/different conflicts and lower revisions reject. A missing head with retained
+v2 history fails closed. New execution checks the current enabled head before
+compilation or writes; historical terminal results retain their original evidence.
+
+A may retire an old v8 slot only after an explicit `settings_superseded` stale
+receipt with no changes and a valid newer policy. The old body/hash/result remain
+stored, and replacement work receives a new ID. Executing, uncertain, ambiguous,
+ordinary expired and legacy v7 slots are not released by this rule.
+
+Agent Pair can request Computer/Name definitions for a target entity without a
+remote asset row or confirmed pair. Explicit candidate IDs can request typed
+inspection, followed by the existing separate confirmation step. These versioned
+read-only Work requests use POST plus stored-result GET with fresh native/service
+READ context; GET does not execute, and discovery never activates empty mappings
+over a business route. An `observed` inspection is not a verified asset mutation.
+The unchanged 64 KiB response cap applies; v8/v9 public rows are bounded to 16,000
+encoded bytes. Auth, shared settings, polls, retries and continuations count
+separately from the ready Work POST/GET path.
+
+Focused checks are `tests/agent-rest-transport.php`,
+`tests/agent-rest-settings-model.php` and `tests/agent-rest-settings.php`, plus
+retained REST/native regressions. They use model/HTTP doubles and SQLite. Actual
+stock API activation, transaction/lock behavior, fresh service READ and PHP 8.5
+qualification remain independent gates before accepting 4a. Distinct source/target
+and child scopes, multi-connection fairness, new fields, Both, creation, UUID and
+B change/ACK delivery are not implemented by this slice.
+
 ## Opt-In Name REST Batches (V8)
 
 Controller 0.9.1 and agent 0.8.1 add opt-in batching for independently confirmed
@@ -123,10 +182,12 @@ REST, TLS, native model/History and concurrency require isolated integration QA.
 
 ## Native-Only Setup And Upgrade
 
-Controller **0.9.1** and agent **0.8.1** use GLPI-native authentication for all
+Controller **0.9.2** and agent **0.8.2** use GLPI-native authentication for all
 agent communications. Custom registration bearer tokens and wake keys, their
 rotation controls, and B's notification-only REST mode are removed. Ordinary
 controller REST asset synchronization and its GLPI credentials remain supported.
+The following bidirectional setup is for **Adapter** transport; use the A-driven
+REST setup above instead for **REST records**.
 
 1. Back up both installations and pause AssetSync workers/scheduled runs. Install
    the complete **B plugin first, then A**, using GLPI's plugin **Update** action.
@@ -232,7 +293,7 @@ and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
 retain their protocol behavior and permission checks.
 
 Native Both was introduced in **B agent 0.5.3 / A controller 0.6.4**. For the current
-release use the B-first 0.8.1 / A 0.9.1 procedure above. Both sides must support
+release use the B-first 0.8.2 / A 0.9.2 procedure above. Both sides must support
 the native-only Agent API; no older-controller pull downgrade is attempted. Upgrade A before
 enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
 There is no task downgrade or REST fallback. No new database table or column is

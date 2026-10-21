@@ -63,6 +63,24 @@ namespace {
     setupCheck(GlpiBConnection::find('ordinary')['user_token'] === 'ordinary-user', 'Ordinary REST saves require no native configuration.');
 
     Config::$values[Settings::CONTEXT] = [];
+    $DB = new class($DB, $scopeDb) {
+        public string $dbdefault = 'native-settings-test';
+        public function __construct(private object $base, private PDO $pdo) {}
+        public function __get(string $key): mixed { return $this->base->$key; }
+        public function __call(string $name, array $args): mixed { return $this->base->$name(...$args); }
+        public function errno(): int { return 1305; }
+        public function doQuery(string $sql): mixed {
+            if ($sql === 'SELECT @@SESSION.autocommit AS enabled, CONNECTION_ID() AS id') { return $this->pdo->query('SELECT 1 AS enabled, 17 AS id'); }
+            if ($sql === 'SELECT CONNECTION_ID() AS id') { return $this->pdo->query('SELECT 17 AS id'); }
+            if (str_starts_with($sql, 'SAVEPOINT ')) { return true; }
+            if (str_starts_with($sql, 'RELEASE SAVEPOINT ')) { return false; }
+            if (str_starts_with($sql, 'SELECT COALESCE(IS_USED_LOCK(')) { return $this->pdo->query('SELECT 0 AS owned'); }
+            if (str_starts_with($sql, 'SELECT GET_LOCK(')) { return $this->pdo->query('SELECT 1 AS acquired'); }
+            if (str_starts_with($sql, 'SELECT RELEASE_LOCK(')) { return $this->pdo->query('SELECT 1 AS released'); }
+            if (in_array($sql, ['START TRANSACTION', 'COMMIT', 'ROLLBACK'], true)) { return true; }
+            return $this->base->doQuery($sql);
+        }
+    };
     $b = array_replace($peer, ['agent_api_url' => 'https://a.invalid/plugins/assetsync20/front/agent-api.php',
         'mode' => 'agent', 'connection_id' => 'native', 'registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32),
         'service_user' => '7', 'service_profile' => '4', 'service_password' => 'local-password']);

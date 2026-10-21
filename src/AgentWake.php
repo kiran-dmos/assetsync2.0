@@ -44,7 +44,7 @@ final class AgentWake
         $connections = [];
         // Wake eligibility is read-only; the ordinary loader may migrate legacy REST settings.
         foreach (GlpiBConnection::loadAll(false, false) as $connection) {
-            if ($connection['active'] && GlpiBConnection::isAgent($connection) && !empty($connection['wake_enabled'])
+            if ($connection['active'] && GlpiBConnection::isAgent($connection) && ($connection['agent_transport'] ?? 'adapter') === 'adapter' && !empty($connection['wake_enabled'])
                 && AgentSession::validUrl($connection['agent_api_url'] ?? '')
                 && !empty($connection['agent_app_token']) && !empty($connection['agent_user_token'])) {
                 try {
@@ -171,7 +171,7 @@ final class AgentWake
         if (!in_array($owned['owned'] ?? null, [0, '0'], true)) { return ['status' => 0, 'state' => 'deferred']; }
         if (AssetUuidOperation::hasAssetLocks()) { return ['status' => 0, 'state' => 'deferred']; }
         $connection = GlpiBConnection::find($work['connection']['id']);
-        if (!$connection || !$connection['active'] || !GlpiBConnection::isAgent($connection) || empty($connection['wake_enabled'])
+        if (!$connection || !$connection['active'] || !GlpiBConnection::isAgent($connection) || ($connection['agent_transport'] ?? 'adapter') !== 'adapter' || empty($connection['wake_enabled'])
             || AgentSession::fingerprint($connection) !== AgentSession::fingerprint($work['connection'])
             || !AgentSession::validUrl($connection['agent_api_url'] ?? '')
             || hrtime(true) >= $deadline) { return ['status' => 0, 'state' => 'deferred']; }

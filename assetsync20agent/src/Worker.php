@@ -17,9 +17,12 @@ final class Worker
         if ((int) (Outbox::one("SELECT GET_LOCK({$quotedLock}, 0) AS acquired")['acquired'] ?? 0) !== 1) {
             return 0;
         }
+        $sessionOwned = false;
         try {
+            if (!Settings::transportReady(Settings::load())) { return 0; }
             $deadline = min($deadline ?? PHP_INT_MAX, hrtime(true) + 20_000_000_000);
             AgentSession::begin($deadline);
+            $sessionOwned = true;
             if (hrtime(true) >= $deadline) { return 0; }
             if ($admit !== null) { $admit(); }
             $settings = Wake::settings();
@@ -83,7 +86,7 @@ final class Worker
             \Config::setConfigurationValues(Settings::CONTEXT, ['worker_seen' => (string) time()]);
             return $count;
         } finally {
-            AgentSession::end();
+            if ($sessionOwned) { AgentSession::end(); }
             Outbox::sql("SELECT RELEASE_LOCK({$quotedLock})");
         }
     }
@@ -149,7 +152,7 @@ final class Worker
     public static function send(array $settings, array $sent, int $deadline): array
     {
         Wake::assertCurrent();
-        if (($settings['mode'] ?? '') !== 'agent') { return ['status' => 0, 'body' => []]; }
+        if (!Settings::transportReady($settings)) { return ['status' => 0, 'body' => []]; }
         $keys = ($sent['kind'] ?? '') === 'health'
             ? ['kind', 'registration', 'generation', 'reconcile_status']
             : ['registration', 'generation', 'computer_id', 'revision', 'lifecycle'];

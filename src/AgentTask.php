@@ -185,6 +185,7 @@ final class AgentTask
             self::write($DB->insert(self::BINDINGS, ['connection_id' => $connectionId, 'registration' => $credentials['registration'], 'installation' => $installation]));
             AgentInbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+        if (($connection['agent_transport'] ?? 'adapter') === 'rest_records') { RestWork::configure(static function (): void {}); }
         return $credentials;
     }
 
@@ -275,6 +276,7 @@ final class AgentTask
     public static function discover(string $connection, string $type, int $entity, string $search = '', int $cursor = 0): void
     {
         global $DB;
+        if ((GlpiBConnection::find($connection)['agent_transport'] ?? 'adapter') === 'rest_records') { throw new \RuntimeException('REST records currently supports explicit Computer inspection, not inventory discovery.'); }
         self::model($type);
         if ($entity < -1 || $cursor < 0 || strlen($search) > 100) { throw new \RuntimeException('Invalid discovery filter.'); }
         $binding = self::binding($connection);
@@ -306,7 +308,7 @@ final class AgentTask
         }
         $where = ['connection_id' => $connection];
         if (!empty($binding['discovery_id'])) { $where['id'] = $binding['discovery_id']; }
-        $where[] = new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8)");
+        $where[] = new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8, 9)");
         $rows = $DB->request(['FROM' => self::TABLE, 'WHERE' => $where, 'ORDER' => 'created_at DESC, id DESC', 'LIMIT' => 100]);
         foreach ($rows as $row) {
             $body = json_decode($row['body'], true, 32, JSON_THROW_ON_ERROR);
@@ -433,6 +435,9 @@ final class AgentTask
     {
         $pair = $pairId === null ? self::pair($connectionId) : self::byId($connectionId, $pairId);
         if (!$pair) { throw new \RuntimeException('Declare an agent pair first.'); }
+        if ((GlpiBConnection::find($connectionId)['agent_transport'] ?? 'adapter') === 'rest_records') {
+            RestWork::requestRead($connectionId, (int) $pair['entity_id'], $pair); return;
+        }
         self::publish($pair, 'inspect', [], null, []);
     }
 
@@ -490,6 +495,9 @@ final class AgentTask
     public static function catalog(string $connection, string $type): array
     {
         global $DB;
+        if ((GlpiBConnection::find($connection)['agent_transport'] ?? 'adapter') === 'rest_records') {
+            return $type === 'Computer' ? RestWork::catalog($connection) : ['success' => false, 'fields' => [], 'message' => 'REST records supports Computer only.'];
+        }
         self::model($type);
         $fields = [];
         foreach ($DB->request(['FROM' => self::PAIRS, 'WHERE' => ['connection_id' => $connection, 'itemtype' => $type,
@@ -641,7 +649,7 @@ final class AgentTask
                 $response = ['status' => 200, 'task' => null];
                 if (($request['subscriptions_only'] ?? false) !== true) {
                     $candidates = AgentInbox::sql('SELECT * FROM `' . self::TABLE . '` WHERE `connection_id` = ' . $DB->quote($binding['connection_id'])
-                        . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8) AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 50 FOR UPDATE');
+                        . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8, 9) AND `slot` IS NOT NULL AND `state` IN (\'accepted\',\'executing\') ORDER BY `created_at`, `id` LIMIT 50 FOR UPDATE');
                     while ($candidate = $DB->fetchAssoc($candidates)) {
                         if (self::readableApiTask($api, $candidate)) { $task = $candidate; break; }
                     }
@@ -733,7 +741,7 @@ final class AgentTask
                 if (!$task && ($request['recovery_version'] ?? 0) === 1) {
                     foreach ($DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $binding['connection_id'],
                         'state' => 'stale', new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL'),
-                        new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8)")],
+                        new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8, 9)")],
                         'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.recovery_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]) as $candidate) {
                         $body = json_decode($candidate['body'], true, 32, JSON_THROW_ON_ERROR);
                         if (!self::readableApiTask($api, $candidate)) { continue; }
@@ -751,7 +759,7 @@ final class AgentTask
                     }
                 }
             } elseif ($request['kind'] === 'recovery') {
-                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) ($request['id'] ?? '')) . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8) FOR UPDATE');
+                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) ($request['id'] ?? '')) . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8, 9) FOR UPDATE');
                 $proof = $request['proof'] ?? null;
                 $proofKeys = ['version', 'observed_at', 'journal', 'result_hash'];
                 if (is_array($proof) && ($proof['journal'] ?? '') === 'verified') { $proofKeys[] = 'result'; }
@@ -811,7 +819,7 @@ final class AgentTask
                 $response = ['status' => 200, 'recorded' => true, 'id' => $saved['id'], 'hash' => $saved['hash']];
             } else {
                 $id = $request['id'] ?? '';
-                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8) FOR UPDATE');
+                $saved = AgentInbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote((string) $id) . ' AND JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8, 9) FOR UPDATE');
                 $result = $request['result'] ?? null;
                 if (!$saved || $saved['connection_id'] !== $binding['connection_id'] || ($request['hash'] ?? '') !== $saved['hash']
                     || !is_array($result) || !in_array($result['outcome'] ?? '', ['verified', 'unchanged', 'blocked', 'stale', 'partial', 'uncertain'], true)
@@ -846,7 +854,7 @@ final class AgentTask
     private static function readableApiTask(AgentApi $api, array $task): bool
     {
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-        if (in_array($body['version'] ?? 0, [7, 8], true)) { return false; }
+        if (in_array($body['version'] ?? 0, [7, 8, 9], true)) { return false; }
         if ($body['kind'] === 'discover') { return true; }
         $pair = self::isMatch($body) ? null : self::taskPair($task);
         $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
@@ -1226,7 +1234,7 @@ final class AgentTask
     {
         global $DB;
         $anchors = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $pair['connection_id'],
-            new \Glpi\DBAL\QueryExpression('JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
+            new \Glpi\DBAL\QueryExpression('JSON_EXTRACT(`body`, \'$.version\') NOT IN (7, 8, 9) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.pair_id\')) = ' . $DB->quote($pair['id'])
                 . ' AND (JSON_EXTRACT(`context`, \'$.local_mutation\') IS NOT NULL OR JSON_EXTRACT(`context`, \'$.field_conflict\') IS NOT NULL)')], 'ORDER' => 'created_at DESC,id DESC', 'LIMIT' => 32]);
         $seen = false;
         $latestHistory = 0;
@@ -2157,7 +2165,7 @@ final class AgentTask
         if ($connections === []) { return; }
         $tasks = $DB->request(['FROM' => self::TABLE, 'WHERE' => ['connection_id' => $connections,
             'state' => ['stale', 'blocked'], new \Glpi\DBAL\QueryExpression('`slot` IS NOT NULL'),
-            new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8)")],
+            new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') NOT IN (7, 8, 9)")],
             'ORDER' => new \Glpi\DBAL\QueryExpression("COALESCE(JSON_EXTRACT(`context`, '$.inspection_checked_at'), 0) ASC, created_at ASC, id ASC"), 'LIMIT' => 10]);
         foreach ($tasks as $task) {
             if (hrtime(true) >= $deadline) { break; }

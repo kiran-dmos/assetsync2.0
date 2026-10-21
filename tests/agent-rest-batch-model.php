@@ -12,6 +12,7 @@ namespace GlpiPlugin\Assetsync20agent {
     function hrtime(bool $asNumber = false): int { return \BatchModelClock::$now; }
     function time(): int { return \BatchModelClock::$wall ?: \time(); }
     final class RestPeer {
+        public static bool $idle = true;
         public static function deadline(): int { return \BatchModelClock::$deadline; }
         public static function work(array $body): array { return Settings::load(); }
         public static function settings(): array { return Settings::load(); }
@@ -19,7 +20,13 @@ namespace GlpiPlugin\Assetsync20agent {
         public static function policy(array $settings): void {}
         public static function grant(array $settings, int $entity): void {}
         public static function entity(array $settings, int $entity): void {}
-        public static function idle(): bool { return true; }
+        public static function idle(): bool { return self::$idle; }
+        public static function read(array $body): array {
+            $settings = Settings::load();
+            if (!\Profile_User::$granted) { throw new \RuntimeException('Fixture peer grant denied.'); }
+            if ($body['items_id'] > 0 && !(new \Computer())->can($body['items_id'], READ)) { throw new \RuntimeException('Fixture peer READ denied.'); }
+            return $settings;
+        }
         public static function canView(): bool { return true; }
     }
 }

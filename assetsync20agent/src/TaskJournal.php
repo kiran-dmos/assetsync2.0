@@ -190,7 +190,7 @@ final class TaskJournal
     public static function send(array $settings, array $payload, int $deadline): array
     {
         Wake::assertCurrent();
-        if (($settings['mode'] ?? '') !== 'agent' || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
+        if (!Settings::transportReady($settings) || hrtime(true) >= $deadline) { return ['status' => 0, 'body' => []]; }
         if (($payload['kind'] ?? '') === 'pull') {
             $payload['task_versions'] = [1, 2, 3, 4, 5, 6];
             $payload['recovery_version'] = 1;

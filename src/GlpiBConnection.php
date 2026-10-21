@@ -163,11 +163,26 @@ final class GlpiBConnection
         }
 
         $mode = (string) ($input['mode'] ?? $current['mode'] ?? 'rest');
+        $transport = (string) ($input['agent_transport'] ?? $current['agent_transport'] ?? 'adapter');
+        if (!in_array($transport, ['adapter', 'rest_records'], true)) { throw new \InvalidArgumentException('Invalid agent transport.'); }
         if (!in_array($mode, ['rest', 'agent'], true)) {
             throw new \InvalidArgumentException('Unsupported connection mode.');
         }
-        $wakeEnabled = $mode === 'agent' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
-        $agent = $mode === 'agent' ? AgentSession::configuration($input, $current) : [];
+        $wakeEnabled = $mode === 'agent' && $transport === 'adapter' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
+        $agent = [];
+        if ($mode === 'agent' && $transport === 'adapter') { $agent = AgentSession::configuration($input, $current); }
+        if ($mode === 'agent' && $transport === 'rest_records') {
+            $agent = array_intersect_key($current, array_flip(['agent_api_url', 'agent_peer_user', 'agent_peer_api_client', 'agent_peer_profile', 'agent_peer_entity']));
+            $agent['agent_auth'] = 'glpi_session';
+            foreach (['agent_app_token', 'agent_user_token'] as $key) {
+                $value = trim((string) ($input[$key] ?? ''));
+                if ($value === '') { $value = (string) ($current[$key] ?? ''); }
+                if ($value === '' || strlen($value) > 1024 || preg_match('/[\x00-\x20\x7f]/', $value)) {
+                    throw new \InvalidArgumentException('Native B app and user tokens are required.');
+                }
+                $agent[$key] = $value;
+            }
+        }
         $restPair = trim((string) ($input['agent_rest_pair'] ?? $current['agent_rest_pair'] ?? ''));
         $restPairs = $input['agent_rest_pairs'] ?? $current['agent_rest_pairs'] ?? [];
         if (is_string($restPairs)) { $restPairs = preg_split('/[\s,]+/', trim($restPairs), -1, PREG_SPLIT_NO_EMPTY); }
@@ -182,11 +197,13 @@ final class GlpiBConnection
         }
         $restPairs = array_values(array_unique($restPairs));
         $restUrl = trim((string) ($input['agent_rest_url'] ?? $current['agent_rest_url'] ?? ''));
+        if ($mode === 'agent' && $transport === 'rest_records' && !RestSession::validUrl($restUrl)) { throw new \InvalidArgumentException('REST records require a direct HTTPS apirest.php URL.'); }
         if (($restPair !== '' || $restPairs !== []) && ($mode !== 'agent' || ($restPair !== '' && !preg_match('/^[a-f0-9]{32}$/D', $restPair)) || !RestSession::validUrl($restUrl))) {
             throw new \InvalidArgumentException('REST records require an agent connection, confirmed pair ID and direct HTTPS apirest.php URL.');
         }
         return $agent + [
             'agent_rest_pair' => $restPair, 'agent_rest_pairs' => $restPairs, 'agent_rest_url' => $restUrl,
+            'agent_transport' => $transport,
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
@@ -202,6 +219,12 @@ final class GlpiBConnection
      * @param array{id?:string,name?:string,base_url?:string,app_token?:string,user_token?:string,active?:mixed} $input
      */
     public static function save(array $input): void
+    {
+        $records = ($input['agent_transport'] ?? '') === 'rest_records' || (self::find((string) ($input['id'] ?? ''))['agent_transport'] ?? '') === 'rest_records';
+        RestWork::configure(static function () use ($input): void { self::saveConfigured($input); }, $records);
+    }
+
+    private static function saveConfigured(array $input): void
     {
         self::invalidateRunCache();
         $connection = self::fromInput($input);
@@ -228,6 +251,11 @@ final class GlpiBConnection
     }
 
     public static function delete(string $id): void
+    {
+        RestWork::configure(static function () use ($id): void { self::deleteConfigured($id); }, (self::find($id)['agent_transport'] ?? '') === 'rest_records');
+    }
+
+    private static function deleteConfigured(string $id): void
     {
         self::invalidateRunCache();
         $id = self::connectionId($id);
@@ -1575,6 +1603,7 @@ final class GlpiBConnection
                 'agent_rest_pair' => (string) ($savedConnection['agent_rest_pair'] ?? ''),
                 'agent_rest_pairs' => (array) ($savedConnection['agent_rest_pairs'] ?? []),
                 'agent_rest_url' => (string) ($savedConnection['agent_rest_url'] ?? ''),
+                'agent_transport' => (string) ($savedConnection['agent_transport'] ?? 'adapter'),
                 'agent_peer_user' => (string) ($savedConnection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($savedConnection['agent_peer_api_client'] ?? ''),
                 'agent_peer_profile' => (string) ($savedConnection['agent_peer_profile'] ?? ''),
@@ -1610,6 +1639,7 @@ final class GlpiBConnection
                 'agent_rest_pair' => (string) ($connection['agent_rest_pair'] ?? ''),
                 'agent_rest_pairs' => (array) ($connection['agent_rest_pairs'] ?? []),
                 'agent_rest_url' => (string) ($connection['agent_rest_url'] ?? ''),
+                'agent_transport' => (string) ($connection['agent_transport'] ?? 'adapter'),
                 'agent_peer_user' => (string) ($connection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($connection['agent_peer_api_client'] ?? ''),
                 'agent_peer_profile' => (string) ($connection['agent_peer_profile'] ?? ''),
@@ -1628,7 +1658,7 @@ final class GlpiBConnection
 
         try {
             if (class_exists('\Config') && method_exists('\Config', 'setConfigurationValues')) {
-                \Config::setConfigurationValues(self::CONTEXT, [
+                RestWork::saveConfiguration([
                     self::CONNECTIONS_KEY => json_encode($savedConnections, JSON_THROW_ON_ERROR),
                 ]);
             }

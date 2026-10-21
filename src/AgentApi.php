@@ -321,7 +321,8 @@ final class AgentApi extends \Glpi\Api\APIRest
     {
         GlpiBConnection::endRunCache();
         $peer = AgentInbox::connection($this->connection);
-        if (!$peer || !GlpiBConnection::isAgent($peer) || ($peer['agent_auth'] ?? '') !== 'glpi_session') {
+        if (!$peer || !GlpiBConnection::isAgent($peer) || ($peer['agent_auth'] ?? '') !== 'glpi_session'
+            || ($peer['agent_transport'] ?? 'adapter') !== 'adapter') {
             throw new \UnexpectedValueException('Native agent connection unavailable.');
         }
         return $peer;

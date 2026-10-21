@@ -89,6 +89,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'agent_rest_pair' => $_POST['agent_rest_pair'] ?? '',
                 'agent_rest_pairs' => $_POST['agent_rest_pairs'] ?? '',
                 'agent_rest_url' => $_POST['agent_rest_url'] ?? '',
+                'agent_transport' => $_POST['agent_transport'] ?? 'adapter',
                 'agent_app_token' => $_POST['agent_app_token'] ?? '',
                 'agent_user_token' => $_POST['agent_user_token'] ?? '',
                 'agent_peer_user' => $_POST['agent_peer_user'] ?? '',
@@ -328,9 +329,14 @@ foreach (['rest' => 'REST', 'agent' => 'B agent (Computer and Printer pairs)'] a
 }
 echo '</select> <a href="' . $html(dirname(Menu::configUrl()) . '/agent-pair.php') . '">Agent Pair</a></td></tr>';
 
-echo '<tr><td><label for="wake_enabled">Optional HTTPS wake</label></td><td><input type="hidden" name="wake_enabled" value="0"><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . (!empty($connection['wake_enabled']) ? ' checked' : '') . '> Enabled for B agent mode</td></tr>';
-echo '<tr><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
+echo '<tr class="agent-adapter-setting"><td><label for="wake_enabled">Optional HTTPS wake</label></td><td><input type="hidden" name="wake_enabled" value="0"><input type="checkbox" id="wake_enabled" name="wake_enabled" value="1"' . (!empty($connection['wake_enabled']) ? ' checked' : '') . '> Enabled for B agent mode</td></tr>';
+echo '<tr class="agent-adapter-setting"><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($connection['agent_api_url'] ?? '') . '"></td></tr>';
+echo '<tr><th><label for="agent_transport">Agent transport</label></th><td><select id="agent_transport" name="agent_transport">';
+foreach (['adapter' => 'Agent adapter / legacy REST opt-in', 'rest_records' => 'A-driven REST records / settings v2'] as $value => $label) {
+    echo '<option value="' . $value . '"' . (($connection['agent_transport'] ?? 'adapter') === $value ? ' selected' : '') . '>' . $label . '</option>';
+}
+echo '</select></td></tr>';
 echo '<tr><th><label for="agent_rest_pair">Name REST confirmed pair ID</label></th><td><input id="agent_rest_pair" name="agent_rest_pair" size="36" value="'
     . $html($connection['agent_rest_pair'] ?? '') . '"></td></tr>';
 echo '<tr><th><label for="agent_rest_pairs">Name REST v8 batch pair IDs</label></th><td><textarea id="agent_rest_pairs" name="agent_rest_pairs" rows="4" cols="36">'
@@ -341,19 +347,20 @@ foreach (['agent_app_token' => 'GLPI B app token', 'agent_user_token' => 'GLPI B
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key
         . '" value="" autocomplete="new-password" size="60"> Saved: ' . (!empty($connection[$key]) ? 'Yes' : 'No') . '</td></tr>';
 }
-echo '<tr><th>GLPI A user used by B</th><td>';
+echo '<tr class="agent-adapter-setting"><th>GLPI A user used by B</th><td>';
 User::dropdown(['name' => 'agent_peer_user', 'value' => (int) ($connection['agent_peer_user'] ?? 0),
     'right' => 'all', 'entity' => -1, 'condition' => ['is_active' => 1, 'is_deleted' => 0]]);
-echo '</td></tr><tr><th>GLPI A API client used by B</th><td>';
+echo '</td></tr><tr class="agent-adapter-setting"><th>GLPI A API client used by B</th><td>';
 Dropdown::show('APIClient', ['name' => 'agent_peer_api_client', 'value' => (int) ($connection['agent_peer_api_client'] ?? 0),
     'condition' => ['is_active' => 1]]);
-echo '</td></tr><tr><th>GLPI A profile used by B</th><td>';
+echo '</td></tr><tr class="agent-adapter-setting"><th>GLPI A profile used by B</th><td>';
 Dropdown::show('Profile', ['name' => 'agent_peer_profile', 'value' => (int) ($connection['agent_peer_profile'] ?? 0),
     'condition' => ['interface' => 'central']]);
-echo '</td></tr><tr><th>GLPI A exact entity grant used by B</th><td>';
+echo '</td></tr><tr class="agent-adapter-setting"><th>GLPI A exact entity grant used by B</th><td>';
 Dropdown::show('Entity', ['name' => 'agent_peer_entity', 'value' => (int) ($connection['agent_peer_entity'] ?? -1)]);
 echo '</td></tr>';
-echo '<tr><td>Wake worker</td><td>A\'s background CLI worker must remain running. B\'s CLI worker is optional. A manual web run does ordinary work; it does not send a wake.</td></tr>';
+echo '<tr class="agent-adapter-setting"><td>Wake worker</td><td>A\'s background CLI worker must remain running. B\'s CLI worker is optional. A manual web run does ordinary work; it does not send a wake.</td></tr>';
+echo '<script>function agentTransportRows(){document.querySelectorAll(".agent-adapter-setting").forEach(row=>{row.hidden=document.getElementById("agent_transport").value==="rest_records";});}document.getElementById("agent_transport").addEventListener("change",agentTransportRows);agentTransportRows();</script>';
 
 echo '<tr><td><label for="app_token">REST asset-mode app token</label></td>';
 echo '<td><input type="password" id="app_token" name="app_token" value="" size="60" autocomplete="new-password"></td></tr>';

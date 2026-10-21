@@ -637,6 +637,10 @@ final class AssetSyncService
             return;
         }
         if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {
+            if (($agentConnection['agent_transport'] ?? 'adapter') === 'rest_records') {
+                AssetSyncQueue::block($job, 'REST records requires an explicitly opted-in confirmed Computer/Name pair.');
+                return;
+            }
             AgentTask::process($job, function (array $changes, array $mappings) use ($itemtype, $itemsId): bool {
                 return AssetChangeHook::withoutQueue(function () use ($itemtype, $itemsId, $changes, $mappings): bool {
                     if ($changes !== [] && !$this->updateLocalAsset($itemtype, $itemsId, $changes)) {

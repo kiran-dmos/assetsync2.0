@@ -13,6 +13,7 @@ final class Settings
         $settings = \Config::getConfigurationValues(self::CONTEXT);
         unset($settings['token'], $settings['endpoint'], $settings['wake_token_hash']);
         $settings['agent_auth'] = 'glpi_session';
+        $settings['transport'] = $settings['transport'] ?? 'adapter';
         $settings['service_password'] = (new \GLPIKey())->decrypt($settings['service_password'] ?? '') ?? '';
         foreach (['agent_app_token', 'agent_user_token'] as $key) {
             $settings[$key] = (new \GLPIKey())->decrypt($settings[$key] ?? '') ?? '';
@@ -23,21 +24,63 @@ final class Settings
     public static function transportReady(array $settings): bool
     {
         return ($settings['mode'] ?? '') === 'agent'
+            && ($settings['transport'] ?? 'adapter') === 'adapter'
             && AgentSession::validUrl($settings['agent_api_url'] ?? '')
             && !empty($settings['agent_app_token']) && !empty($settings['agent_user_token']);
     }
 
     public static function save(array $input): void
     {
+        self::withWorkerLock(static function () use ($input): void {
+            global $DB;
+            Outbox::sql('START TRANSACTION');
+            try { self::saveLocked($input); Outbox::sql('COMMIT'); }
+            catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+        });
+    }
+
+    /** Shared by policy activation and binding saves; never borrow an outer transaction or lock. */
+    public static function withWorkerLock(callable $operation): mixed
+    {
+        global $DB;
+        if (!RestPeer::idle()) { throw new \RuntimeException('Agent settings require an idle database connection.'); }
+        $lock = $DB->quote('assetsync20agent:' . substr(hash('sha256', (string) $DB->dbdefault), 0, 32));
+        if ((int) (Outbox::one('SELECT COALESCE(IS_USED_LOCK(' . $lock . ') = CONNECTION_ID(), 0) AS owned')['owned'] ?? 1) !== 0) {
+            throw new \RuntimeException('Agent worker lock is already owned by this connection.');
+        }
+        if ((int) (Outbox::one('SELECT GET_LOCK(' . $lock . ', 0) AS acquired')['acquired'] ?? 0) !== 1) {
+            throw new \RuntimeException('Agent is busy; settings were not changed.');
+        }
+        try { return $operation(); }
+        finally {
+            if ((int) (Outbox::one('SELECT RELEASE_LOCK(' . $lock . ') AS released')['released'] ?? 0) !== 1) {
+                throw new \RuntimeException('Agent settings lock release unavailable.');
+            }
+        }
+    }
+
+    private static function saveLocked(array $input): void
+    {
         $old = self::load();
-        $settings = AgentSession::configuration($input, $old);
+        $transport = (string) ($input['transport'] ?? $old['transport']);
+        if (!in_array($transport, ['adapter', 'rest_records'], true)) { throw new \InvalidArgumentException('Invalid agent transport.'); }
+        if ($transport === 'adapter') { $settings = AgentSession::configuration($input, $old); }
+        else {
+            // Incoming REST admission is independent of the retained outgoing adapter credentials.
+            $settings = array_intersect_key($old, array_flip(['agent_auth', 'agent_api_url', 'agent_app_token', 'agent_user_token']));
+            foreach (['agent_peer_user', 'agent_peer_api_client', 'agent_peer_profile', 'agent_peer_entity'] as $key) {
+                $settings[$key] = trim((string) ($input[$key] ?? $old[$key] ?? ''));
+            }
+            AgentApi::validatePeer($settings);
+        }
+        $settings['transport'] = $transport;
         $settings['mode'] = (string) ($input['mode'] ?? $old['mode'] ?? 'rest');
         if ($settings['mode'] !== 'agent') { throw new \InvalidArgumentException('Notification-only mode is retired. Configure native agent mode.'); }
         foreach (['registration', 'generation'] as $key) {
             $settings[$key] = trim((string) ($input[$key] ?? $old[$key] ?? ''));
             if (!preg_match('/^[a-f0-9]{32}$/D', $settings[$key])) { throw new \InvalidArgumentException('Valid registration and generation are required.'); }
         }
-        if (!self::transportReady($settings)) { throw new \InvalidArgumentException('Native Agent API URL, app token and user token are required.'); }
+        if ($transport === 'adapter' && !self::transportReady($settings)) { throw new \InvalidArgumentException('Native Agent API URL, app token and user token are required.'); }
         // The generation is part of each outbox claim; old requests cannot acknowledge a reset.
         if ($settings['mode'] === 'agent') {
             foreach (['connection_id', 'service_user', 'service_profile'] as $key) {
@@ -62,9 +105,13 @@ final class Settings
             $settings['service_password'] = (new \GLPIKey())->encrypt($password);
         }
         foreach (['agent_app_token', 'agent_user_token'] as $key) {
-            $settings[$key] = (new \GLPIKey())->encrypt($settings[$key]);
+            $settings[$key] = (new \GLPIKey())->encrypt($settings[$key] ?? '');
         }
         \Config::setConfigurationValues(self::CONTEXT, $settings);
+        $saved = \Config::getConfigurationValues(self::CONTEXT, array_keys($settings));
+        foreach ($settings as $key => $value) {
+            if (($saved[$key] ?? null) !== $value) { throw new \RuntimeException('Agent setting storage failed.'); }
+        }
     }
 
     public static function install(): void

@@ -9,7 +9,8 @@ namespace GlpiPlugin\Assetsync20agent {
     }
     final class RestSettings {
         public static function getTable(): string { return 'rest_settings'; }
-        public static function decode(string $body, string $hash): array { return ['target_entity' => 2]; }
+        public static function decode(string $body, string $hash): array { return ['version' => 1, 'target_entity' => 2]; }
+        public static function binding(array $settings, int $version): string { return RestPeer::binding($settings); }
         public static function authorize(array $body): array { return []; }
     }
     final class TaskJournal { public const TABLE = 'tasks'; }
