@@ -15,6 +15,193 @@ final class FieldsText
     private const TYPE_DROPDOWN = 'dropdown';
     private static ?array $runCache = null;
 
+    /** Work12 selected metadata only. No asset row, legacy default, or run-cache fallback. */
+    public static function selectedTextPin(string $key, ?int $entity = null, bool $update = false): array
+    {
+        global $DB;
+        $field = null; $container = null;
+        $native = in_array($key, ['name', 'comment', 'Computer.name', 'Computer.comment', 'native:name', 'native:comment'], true);
+        if ($native) {
+            $column = str_replace(['Computer.', 'native:'], '', $key); $options = [];
+            foreach ((new \Computer())->rawSearchOptions() as $option) {
+                if (is_array($option) && ($option['table'] ?? '') === 'glpi_computers' && ($option['field'] ?? '') === $column) { $options[] = $option; }
+            }
+            if (count($options) !== 1 || !is_numeric($options[0]['id'] ?? null)) { throw new \RuntimeException('Native selected field metadata unavailable.'); }
+            NativeField::fromOption('Computer', $options[0]);
+            $pin = ['kind' => 'native', 'key' => $column, 'capture_key' => 'native:' . $column,
+                'type' => $column === 'name' ? 'text' : 'textarea', 'search_id' => (int) $options[0]['id'],
+                'definition_id' => null, 'container_id' => null, 'class' => 'Computer', 'table' => 'glpi_computers', 'column' => $column];
+        } else {
+            if (!class_exists('PluginFieldsContainer') || !defined('PluginFieldsField::SEARCH_OPTION_STARTING_INDEX')) { throw new \RuntimeException('Selected Fields metadata unavailable.'); }
+            $expectedClass = null;
+            if (preg_match('/^fields:([1-9][0-9]*)$/D', $key, $match)) { $where = '`id`=' . $DB->quote($match[1]); }
+            elseif (preg_match('/^Computer\.(PluginFieldsComputer[a-zA-Z0-9_]+)\.([a-z][a-z0-9_]*)$/D', $key, $match)) {
+                $expectedClass = $match[1]; $where = '`name`=' . $DB->quote($match[2]);
+            } else { throw new \RuntimeException('Selected Fields identity unavailable.'); }
+            if (!AgentWake::transactionIdle()) {
+                AgentInbox::sql('SELECT id FROM glpi_plugin_fields_fields WHERE ' . $where . ' LIMIT 33 LOCK IN SHARE MODE');
+            }
+            $matches = []; $inspected = 0;
+            foreach ($DB->request(['FROM' => 'glpi_plugin_fields_fields', 'WHERE' => [new \Glpi\DBAL\QueryExpression($where)], 'LIMIT' => 33]) as $candidate) {
+                if (++$inspected > 32) { throw new \RuntimeException('Selected Fields definition budget exceeded.'); }
+                if (!AgentWake::transactionIdle()) { AgentInbox::sql('SELECT id FROM glpi_plugin_fields_containers WHERE id=' . (int) $candidate['plugin_fields_containers_id'] . ' LOCK IN SHARE MODE'); }
+                $owner = AgentInbox::one('SELECT * FROM `glpi_plugin_fields_containers` WHERE `id`=' . (int) $candidate['plugin_fields_containers_id']);
+                if (!$owner) { continue; }
+                $class = \PluginFieldsContainer::getClassname('Computer', (string) $owner['name']);
+                if ($expectedClass === null || $expectedClass === $class) { $matches[] = [$candidate, $owner, $class]; }
+            }
+            if (count($matches) !== 1) { throw new \RuntimeException('Selected Fields identity unavailable or ambiguous.'); }
+            [$field, $container, $class] = $matches[0];
+            $types = json_decode((string) $container['itemtypes'], true, 32, JSON_THROW_ON_ERROR);
+            if (!is_array($types) || !in_array('Computer', $types, true) || empty($container['is_active']) || empty($field['is_active'])
+                || !in_array($field['type'], ['text', 'textarea'], true) || !empty($field['multiple'])
+                || !preg_match('/^PluginFieldsComputer[a-zA-Z0-9_]+$/D', $class) || !is_callable([$class, 'getTable'])
+                || !preg_match('/^[a-z][a-z0-9_]*$/D', $field['name'])) { throw new \RuntimeException('Selected Fields definition unsupported.'); }
+            $table = $class::getTable();
+            if (!is_string($table) || !preg_match('/^glpi_plugin_fields_[a-z0-9_]+$/D', $table)) { throw new \RuntimeException('Selected Fields table unsupported.'); }
+            if ($entity !== null && !in_array((string) $container['entities_id'], empty($container['is_recursive']) ? [(string) $entity] : EntitySyncRoute::strictEntityPath($entity), true)) {
+                throw new \RuntimeException('Selected container does not apply to this asset.');
+            }
+            if (!\Session::isCron()) {
+                $profile = (int) ($_SESSION['glpiactiveprofile']['id'] ?? 0);
+                $right = $profile > 0 && is_callable(['PluginFieldsProfile', 'getRightOnContainer'])
+                    ? \PluginFieldsProfile::getRightOnContainer($profile, (int) $container['id']) : 0;
+                // Fields uses a Read / Read-Write enum, not core CRUD permission bits.
+                if (!is_int($right) && !ctype_digit((string) $right)) { $right = 0; }
+                if (!\Session::haveAccessToEntity((int) $container['entities_id'], true) || (int) $right < READ || ($update && (int) $right <= READ)) {
+                    throw new \RuntimeException('Selected Fields permission denied.');
+                }
+            }
+            $pin = ['kind' => 'fields', 'key' => 'Computer.' . $class . '.' . $field['name'], 'capture_key' => 'fields:' . (int) $field['id'],
+                'type' => $field['type'], 'search_id' => \PluginFieldsField::SEARCH_OPTION_STARTING_INDEX + (int) $field['id'],
+                'definition_id' => (int) $field['id'], 'container_id' => (int) $container['id'], 'class' => $class, 'table' => $table, 'column' => $field['name']];
+        }
+        $limits = AgentInbox::one('SELECT CHARACTER_MAXIMUM_LENGTH AS characters, CHARACTER_OCTET_LENGTH AS bytes FROM information_schema.COLUMNS'
+            . ' WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=' . $DB->quote($pin['table']) . ' AND COLUMN_NAME=' . $DB->quote($pin['column']));
+        if (!$limits || !is_numeric($limits['characters']) || !is_numeric($limits['bytes']) || $limits['characters'] < 1 || $limits['bytes'] < 1) {
+            throw new \RuntimeException('Selected text storage bounds unavailable.');
+        }
+        $pin['limits'] = ['characters' => $pin['type'] === 'text' ? min(255, (int) $limits['characters']) : (int) $limits['characters'], 'bytes' => (int) $limits['bytes']];
+        $fieldFacts = $field ? ['active' => (bool) $field['is_active'], 'readonly' => (bool) $field['is_readonly'],
+            'mandatory' => (bool) $field['mandatory'], 'multiple' => (bool) $field['multiple']] : null;
+        $containerFacts = null;
+        if ($container) {
+            $types = array_values(array_unique($types)); sort($types, SORT_STRING);
+            $containerFacts = ['active' => (bool) $container['is_active'], 'type' => (string) $container['type'],
+                'entity_id' => (int) $container['entities_id'], 'recursive' => (bool) $container['is_recursive'], 'itemtypes' => $types];
+        }
+        $preimage = ['itemtype' => 'Computer'] + $pin + ['field' => $fieldFacts, 'container' => $containerFacts];
+        $hash = AgentTask::hash($preimage); $limits = $pin['limits']; unset($pin['limits']);
+        $pin += ['definition_hash' => $hash, 'limits' => $limits];
+        TextBoth::validatePin($pin);
+        return $pin;
+    }
+
+    /** Selected strict read for Work12. Missing/duplicate child is never the legacy blank default. */
+    public static function readSelectedText(array $pin, int $id, int $entity, bool $update = false): array
+    {
+        global $DB;
+        TextBoth::validatePin($pin);
+        if (self::selectedTextPin($pin['key'], $entity, $update) !== $pin) { throw new \RuntimeException('Selected text definition changed; explicit reselection required.'); }
+        $item = new \Computer();
+        if (!$item->getFromDB($id) || (int) $item->fields['entities_id'] !== $entity || !empty($item->fields['is_deleted']) || !empty($item->fields['is_template'])
+            || (!\Session::isCron() && (!$item->can($id, READ) || ($update && !$item->can($id, UPDATE)) || !\Session::haveAccessToEntity($entity)))) {
+            throw new \RuntimeException('Selected A asset permission or scope changed.');
+        }
+        $row = $item->fields;
+        if ($pin['kind'] === 'fields') {
+            $rows = iterator_to_array($DB->request(['FROM' => $pin['table'], 'WHERE' => ['items_id' => $id,
+                'itemtype' => 'Computer', 'plugin_fields_containers_id' => $pin['container_id']], 'LIMIT' => 2]));
+            if (count($rows) !== 1) { throw new \RuntimeException('Selected Fields child missing or ambiguous.'); }
+            $row = array_values($rows)[0];
+        }
+        if (!array_key_exists($pin['column'], $row)) { throw new \RuntimeException('Selected text column unavailable.'); }
+        TextBoth::normalize($row[$pin['column']], $pin);
+        return ['value' => $row[$pin['column']], 'row' => $row, 'parent' => $item->fields];
+    }
+
+    /** One supported model call for an actual incoming storage group, never one call per field. */
+    public static function updateSelectedTextGroup(array $changes, int $id, int $entity): void
+    {
+        global $DB;
+        if (AgentWake::transactionIdle() || !array_is_list($changes) || count($changes) < 1 || count($changes) > 8) {
+            throw new \RuntimeException('Selected group requires an owned model transaction.');
+        }
+        AgentInbox::sql('SELECT * FROM glpi_computers WHERE id=' . $id . ' FOR UPDATE');
+        $first = $changes[0]['pin']; $proposed = []; $pins = []; $before = null;
+        foreach ($changes as $change) {
+            if (!is_array($change) || array_keys($change) !== ['pin','value']) { throw new \RuntimeException('Invalid selected group.'); }
+            $pin = $change['pin']; TextBoth::validatePin($pin);
+            if ($pin['kind'] !== $first['kind'] || $pin['table'] !== $first['table'] || $pin['container_id'] !== $first['container_id']
+                || isset($pins[$pin['column']])) { throw new \RuntimeException('Mixed or duplicate selected storage group.'); }
+            $selected = self::readSelectedText($pin, $id, $entity, true);
+            if ($before !== null && ($before['row'] !== $selected['row'] || $before['parent'] !== $selected['parent'])) { throw new \RuntimeException('Selected group changed during validation.'); }
+            $before = $selected; $pins[$pin['column']] = $pin; $proposed[$pin['column']] = TextBoth::normalize($change['value'], $pin);
+        }
+        if ($first['kind'] === 'native') {
+            $options = (new \Computer())->rawSearchOptions();
+            foreach ($pins as $pin) {
+                $matches = array_filter($options, static fn ($o): bool => is_array($o) && ($o['table'] ?? '') === $pin['table'] && ($o['field'] ?? '') === $pin['column']);
+                if (count($matches) !== 1 || array_filter($matches, static fn ($o): bool => !empty($o['readonly']) || !empty($o['is_readonly']))) { throw new \RuntimeException('Selected native field is not writable.'); }
+            }
+            $item = new \Computer(); $item->getFromDB($id);
+            if (!$item->update(['id' => $id] + $proposed)) { throw new \RuntimeException('destination_validation'); }
+        } else {
+            $where = ' WHERE items_id=' . $id . ' AND itemtype=\'Computer\' AND plugin_fields_containers_id=' . $first['container_id'];
+            $rows = AgentInbox::sql('SELECT * FROM ' . $first['table'] . $where . ' LIMIT 2 FOR UPDATE');
+            $locked = [];
+            while ($row = $DB->fetchAssoc($rows)) { $locked[] = $row; }
+            if (count($locked) !== 1 || $locked[0] !== $before['row']) { throw new \RuntimeException('Selected child missing or changed.'); }
+            $input = ['items_id' => $id, 'itemtype' => 'Computer', 'plugin_fields_containers_id' => $first['container_id']] + $proposed;
+            $fields = []; $overrides = [];
+            $rows = AgentInbox::sql('SELECT * FROM glpi_plugin_fields_fields WHERE plugin_fields_containers_id=' . $first['container_id'] . ' LIMIT 129 LOCK IN SHARE MODE');
+            while ($field = $DB->fetchAssoc($rows)) {
+                if (count($fields) >= 128) { throw new \RuntimeException('Selected container validation budget exceeded.'); }
+                $fields[(int) $field['id']] = $field;
+            }
+            $rows = AgentInbox::sql('SELECT o.* FROM glpi_plugin_fields_statusoverrides o INNER JOIN glpi_plugin_fields_fields f'
+                . ' ON f.id=o.plugin_fields_fields_id WHERE f.plugin_fields_containers_id=' . $first['container_id'] . ' LIMIT 129 LOCK IN SHARE MODE');
+            $count = 0;
+            while ($override = $DB->fetchAssoc($rows)) {
+                if (++$count > 128) { throw new \RuntimeException('Selected status validation budget exceeded.'); }
+                $states = json_decode((string) ($override['states'] ?? '[]'), true, 32, JSON_THROW_ON_ERROR);
+                if (!is_array($states)) { throw new \RuntimeException('destination_validation'); }
+                if ($override['itemtype'] !== 'Computer' || !in_array((int) ($before['parent']['states_id'] ?? 0), $states, false)) { continue; }
+                $fieldId = (int) $override['plugin_fields_fields_id'];
+                if (isset($overrides[$fieldId])) { throw new \RuntimeException('destination_validation'); }
+                $overrides[$fieldId] = $override;
+            }
+            // Validate the complete proposal first: a selected sibling may fill an old blank.
+            foreach ($fields as $fieldId => $field) {
+                if (empty($field['is_active']) || in_array($field['type'], ['header','yesno'], true)) { continue; }
+                $mandatory = (int) ($overrides[$fieldId]['mandatory'] ?? $field['mandatory']) === 1;
+                if (!$mandatory && empty($field['mandatory'])) { continue; }
+                $column = $field['type'] === 'dropdown' ? 'plugin_fields_' . $field['name'] . 'dropdowns_id' : $field['name'];
+                if (!preg_match('/^[a-z][a-z0-9_]*$/D', $column) || !array_key_exists($column, $before['row'])
+                    || !empty($field['multiple']) || $field['type'] === 'glpi_item') { throw new \RuntimeException('destination_validation'); }
+                $value = $proposed[$column] ?? $before['row'][$column];
+                if ($mandatory && (empty($value) || (in_array($field['type'], ['date','datetime'], true) && $value === 'NULL'))) { throw new \RuntimeException('destination_validation'); }
+                $input[$column] = $value;
+            }
+            $container = new \PluginFieldsContainer();
+            if (!$container->getFromDB($first['container_id']) || !$container->updateFieldsValues($input, 'Computer', false)) { throw new \RuntimeException('destination_validation'); }
+        }
+        foreach ($pins as $column => $pin) {
+            $after = self::readSelectedText($pin, $id, $entity, true);
+            if ($after['value'] !== $proposed[$column]) { throw new \RuntimeException('Selected group readback was lossy.'); }
+            foreach (['row','parent'] as $part) {
+                $allowed = ['date_mod' => true];
+                if ($part === 'row' || $first['kind'] === 'native') { $allowed += array_fill_keys(array_keys($proposed), true); }
+                if (array_diff_key($before[$part], $allowed) !== array_diff_key($after[$part], $allowed)) { throw new \RuntimeException('Selected group changed an unselected value or identity.'); }
+            }
+        }
+    }
+
+    public static function updateSelectedText(array $pin, int $id, int $entity, string $value): void
+    {
+        self::updateSelectedTextGroup([['pin' => $pin, 'value' => $value]], $id, $entity);
+    }
+
     public static function beginRunCache(): void
     {
         self::$runCache = [];

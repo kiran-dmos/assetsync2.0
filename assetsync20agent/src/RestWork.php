@@ -9,6 +9,7 @@ final class RestWork extends \CommonDBTM
 {
     private const ROW_BYTES = 16000;
     private int $deadline = 0;
+    private array $allowRows = [];
     private static ?string $executing = null;
     private static int $executionDeadline = 0;
 
@@ -38,6 +39,14 @@ final class RestWork extends \CommonDBTM
     public static function unsetUndisclosedFields(&$fields)
     {
         parent::unsetUndisclosedFields($fields);
+        if (in_array((int) ($fields['compiler'] ?? 0), [12, 13], true) && isset($fields['id'], $fields['body'], $fields['hash'], $fields['binding'])) {
+            if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET') {
+                RestPeer::textReadOptions((int) $fields['compiler']);
+                if ((int) $fields['compiler'] === 12) { $fields['read_observation'] = TextBoth::disclose($fields); }
+                else { self::discloseCatalog($fields); }
+            }
+            unset($fields['execution_settings'], $fields['task_body'], $fields['task_hash']);
+        }
         if ((int) ($fields['compiler'] ?? 0) === 11 && ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
             && ($fields['result'] ?? '{}') !== '{}') { NameBoth::assertReadable($fields); }
         if (in_array((int) ($fields['compiler'] ?? 0), [8, 9, 10, 11], true)) {
@@ -66,10 +75,42 @@ final class RestWork extends \CommonDBTM
     private static function assertResponseSize(array $row): void
     {
         self::unsetUndisclosedFields($row);
-        $limit = (int) ($row['compiler'] ?? 0) === 11 ? 31000 : self::ROW_BYTES;
+        $limit = (int) ($row['compiler'] ?? 0) === 12 ? 60000 : (in_array((int) ($row['compiler'] ?? 0), [11, 13], true) ? 31000 : self::ROW_BYTES);
         if (strlen(json_encode($row, JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)) > $limit) {
             throw new \RuntimeException('REST public record exceeds response budget.');
         }
+    }
+
+    public static function assertTextResponse(array $row, array $result): void
+    {
+        $row['result'] = $result === [] ? '{}' : json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        unset($row['execution_settings'], $row['task_body'], $row['task_hash']);
+        $fields = [];
+        foreach ($result['fields'] ?? [] as $field) {
+            $fields[] = ['mapping_id' => $field['mapping_id'], 'receipt_hash' => str_repeat('f', 64), 'current_matches' => false];
+        }
+        $row['read_observation'] = ['revision' => 25, 'receipt_hash' => str_repeat('f', 64), 'fields' => $fields];
+        $bytes = strlen(json_encode($row, JSON_THROW_ON_ERROR));
+        if ($bytes > 60000 || $bytes + 4096 > 65536) { throw new \RuntimeException('response_limit'); }
+    }
+
+    public static function projectText(array $row, string $state, array $result): void
+    {
+        global $DB;
+        $fresh = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `work_id`=' . $DB->quote($row['work_id']) . ' FOR UPDATE');
+        $journal = Outbox::one('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE `id`=' . $DB->quote($row['work_id']) . ' FOR UPDATE');
+        if (!$fresh || !$journal || (int) $fresh['compiler'] !== 12 || $fresh['body'] !== $row['body'] || $fresh['hash'] !== $row['hash']
+            || $journal['body'] !== $row['body'] || $journal['hash'] !== $row['hash']) { throw new \RuntimeException('Text projection identity changed.'); }
+        $raw = $result === [] ? '{}' : json_encode($result, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        $document = TextBoth::decodeJson($journal['result'], 131072);
+        if ($journal['state'] !== $state || ($document['result'] ?? null) !== $result || TextBoth::state($result) !== $state) { throw new \RuntimeException('Text journal projection mismatch.'); }
+        $body = self::decode($row['body'], $row['hash']);
+        $stored = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id`=' . $DB->quote($body['settings_id']));
+        $policy = RestSettings::decode($stored['body'], $stored['hash']);
+        TextBoth::validateProgress($body, $policy, TextBoth::decodeJson($fresh['result'], 65536), $result);
+        self::assertTextResponse(array_replace($fresh, ['state' => $state]), $result);
+        if (!$DB->update(self::getTable(), ['state' => $state, 'result' => $raw], ['id' => $fresh['id'], 'hash' => $row['hash'], 'body' => $row['body'], 'result' => $fresh['result']])
+            || $DB->affectedRows() !== 1) { throw new \RuntimeException('Text projection changed.'); }
     }
 
     /** Work11 stores its external identity directly in the existing private journal. */
@@ -118,7 +159,21 @@ final class RestWork extends \CommonDBTM
     public static function getSystemSQLCriteria(?string $tablename = null): array
     {
         $table = $tablename ?? self::getTable();
+        $compiler = $_GET['searchText']['compiler'] ?? null;
+        if (in_array($compiler, ['12', '13'], true)) {
+            RestPeer::textReadOptions((int) $compiler);
+            $where = RestSettings::getSystemSQLCriteria($table);
+            $where['AND'][$table . '.compiler'] = (int) $compiler;
+            $where['AND'][$table . '.entities_id'] = (int) $_GET['rest_entity'];
+            $key = $compiler === '13' ? 'work_id' : 'batch_id';
+            $where['AND'][$table . '.' . $key] = $_GET['searchText'][$key];
+            if ($compiler === '12') {
+                $where[] = new \Glpi\DBAL\QueryExpression('EXISTS (SELECT 1 FROM `glpi_computers` AS `text_target` WHERE `text_target`.`id`=JSON_EXTRACT(`' . $table . '`.`body`, \'$.items_id\') AND `text_target`.`entities_id`=`' . $table . '`.`entities_id` AND `text_target`.`is_deleted`=0 AND `text_target`.`is_template`=0)');
+            }
+            return $where;
+        }
         $where = RestSettings::getSystemSQLCriteria($table);
+        $where[] = new \Glpi\DBAL\QueryExpression('`' . $table . '`.`compiler` NOT IN (12, 13)');
         $read = ($_GET['searchText']['compiler'] ?? null) === '9';
         if ($read) {
             $id = $_GET['searchText']['work_id'] ?? null;
@@ -161,6 +216,52 @@ final class RestWork extends \CommonDBTM
     public static function decode(string $json, string $hash): array
     {
         $body = json_decode($json, true, 16, JSON_THROW_ON_ERROR);
+        if (is_array($body) && in_array($body['version'] ?? null, [12, 13], true)) {
+            $body = TextBoth::decodeJson($json, $body['version'] === 12 ? 24576 : 4096);
+            $keys = $body['version'] === 12 ? ['version', 'id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id',
+                'settings_hash', 'pair_id', 'itemtype', 'source_items_id', 'source_asset_entity', 'items_id', 'entity_id', 'identity', 'sources', 'source_hash', 'source_fingerprint', 'expires', 'batch_id']
+                : ['version', 'id', 'kind', 'installation', 'registration', 'generation', 'connection_id', 'itemtype', 'entity_id', 'selector', 'expires'];
+            if (array_keys($body) !== $keys || !hash_equals(TaskExecutor::hash($body), $hash) || $body['itemtype'] !== 'Computer'
+                || !is_int($body['entity_id']) || $body['entity_id'] < 0 || !is_int($body['expires']) || $body['expires'] < 0
+                || !is_string($body['connection_id']) || $body['connection_id'] === '' || strlen($body['connection_id']) > 255
+                || preg_match('/[\x00-\x20\x7f]/', $body['connection_id'])) { throw new \RuntimeException('Invalid text REST work.'); }
+            foreach ($body['version'] === 12 ? ['id', 'installation', 'registration', 'generation', 'settings_id', 'pair_id', 'batch_id'] : ['id', 'installation', 'registration', 'generation'] as $key) {
+                if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $body[$key])) { throw new \RuntimeException('Invalid text REST ID.'); }
+            }
+            if ($body['version'] === 12) {
+                foreach (['settings_hash', 'source_hash', 'source_fingerprint'] as $key) {
+                    if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{64}$/D', $body[$key])) { throw new \RuntimeException('Invalid text REST hash.'); }
+                }
+                if (!is_int($body['source_items_id']) || $body['source_items_id'] < 1 || !is_int($body['source_asset_entity']) || $body['source_asset_entity'] < 0
+                    || !is_int($body['items_id']) || $body['items_id'] < 1 || !is_array($body['identity']) || !in_array(array_keys($body['identity']), [['serial'], ['serial', 'otherserial']], true)
+                    || array_intersect_key(TaskExecutor::identity($body['identity'] + ['otherserial' => '']), $body['identity']) !== $body['identity']
+                    || !is_array($body['sources']) || !array_is_list($body['sources']) || count($body['sources']) < 1 || count($body['sources']) > 8
+                    || $body['source_hash'] !== TaskExecutor::hash($body['sources'])) { throw new \RuntimeException('Invalid text REST source.'); }
+                $previous = '';
+                foreach ($body['sources'] as $source) {
+                    if (!is_array($source) || array_keys($source) !== ['mapping_id', 'envelope'] || !is_string($source['mapping_id'])
+                        || !preg_match('/^[a-f0-9]{32}$/D', $source['mapping_id']) || strcmp($source['mapping_id'], $previous) <= 0
+                        || !is_array($source['envelope'])) { throw new \RuntimeException('Invalid text source order.'); }
+                    $previous = $source['mapping_id'];
+                }
+            } else {
+                $selector = $body['selector'];
+                if ($body['kind'] !== 'catalog' || !is_array($selector)) { throw new \RuntimeException('Invalid text catalog.'); }
+                $valid = $selector === ['kind' => 'native']
+                    || (array_keys($selector) === ['kind', 'after_id'] && $selector['kind'] === 'fields' && is_int($selector['after_id']) && $selector['after_id'] >= 0)
+                    || (array_keys($selector) === ['kind', 'capture_keys'] && $selector['kind'] === 'selected' && is_array($selector['capture_keys'])
+                        && array_is_list($selector['capture_keys']) && count($selector['capture_keys']) >= 1 && count($selector['capture_keys']) <= 8);
+                if (!$valid) { throw new \RuntimeException('Invalid text catalog selector.'); }
+                if ($selector['kind'] === 'selected') {
+                    $sorted = array_values(array_unique($selector['capture_keys'])); sort($sorted, SORT_STRING);
+                    if ($sorted !== $selector['capture_keys']) { throw new \RuntimeException('Invalid selected catalog order.'); }
+                    foreach ($sorted as $key) {
+                        if (!is_string($key) || !preg_match('/^(?:native:(?:name|comment)|fields:[1-9][0-9]*)$/D', $key)) { throw new \RuntimeException('Invalid selected catalog key.'); }
+                    }
+                }
+            }
+            return $body;
+        }
         if (is_array($body) && ($body['version'] ?? null) === 11) {
             $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash',
                 'pair_id', 'itemtype', 'items_id', 'entity_id', 'identity', 'source', 'source_hash', 'source_fingerprint', 'expires', 'batch_id'];
@@ -227,12 +328,19 @@ final class RestWork extends \CommonDBTM
 
     private static function authorize(array $body): array
     {
+        if ($body['version'] === 13) {
+            $settings = RestPeer::read($body + ['items_id' => 0]);
+            ServiceContext::readPermission(array_replace($settings, ['entity_id' => $body['entity_id']]));
+            return $settings;
+        }
+        if ($body['version'] === 12 && ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET') { $settings = RestPeer::read($body); }
+        else { $settings = null; }
         if ($body['version'] === 9) {
             $settings = RestPeer::read($body);
             ServiceContext::readPermission(array_replace($settings, ['entity_id' => $body['entity_id']]));
             return $settings;
         }
-        $settings = RestPeer::work($body);
+        $settings ??= RestPeer::work($body);
         global $DB;
         $policy = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['settings_id']));
         if (!$policy || $policy['hash'] !== $body['settings_hash']) {
@@ -243,6 +351,12 @@ final class RestWork extends \CommonDBTM
         if ($policy['binding'] !== RestSettings::binding($settings, $document['version'])) { throw new \RuntimeException('Pinned REST binding changed.'); }
         RestSettings::authorize($document);
         if ($document['target_entity'] !== $body['entity_id']) { throw new \RuntimeException('Pinned REST route changed.'); }
+        if ($body['version'] === 12) {
+            if ($document['version'] !== 5 || $document['mappings'] === [] || (!$document['include_child_entities'] && $body['source_asset_entity'] !== $document['source_entity'])) { throw new \RuntimeException('Text REST source scope changed.'); }
+            TextBoth::validateSources($body, $document);
+            return $settings;
+        }
+        if ($document['version'] === 5) { throw new \RuntimeException('Text settings require Work12.'); }
         if ($body['version'] === 10) {
             if ($document['version'] !== 3 || !in_array($body['itemtype'], $document['asset_types'], true)
                 || (!$document['include_child_entities'] && $body['source_asset_entity'] !== $document['source_entity'])) { throw new \RuntimeException('Pinned REST source scope changed.'); }
@@ -254,7 +368,7 @@ final class RestWork extends \CommonDBTM
 
     private static function workBinding(array $body, array $settings): string
     {
-        if ($body['version'] === 9) { return RestSettings::binding($settings, 2); }
+        if (in_array($body['version'], [9, 13], true)) { return RestSettings::binding($settings, 2); }
         global $DB;
         $row = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['settings_id']));
         $document = RestSettings::decode($row['body'], $row['hash']);
@@ -264,15 +378,21 @@ final class RestWork extends \CommonDBTM
     public function add(array $input, $options = [], $history = true)
     {
         $this->deadline = hrtime(true) + 5_000_000_000;
-        if (array_diff(array_keys($input), ['work_id', 'hash', 'body', 'entities_id', '_add'])) { throw new \RuntimeException('Unknown REST work input.'); }
+        if (array_diff(array_keys($input), ['work_id', 'hash', 'body', 'entities_id', '_add', 'allow_rows'])) { throw new \RuntimeException('Unknown REST work input.'); }
         $body = self::decode((string) ($input['body'] ?? ''), (string) ($input['hash'] ?? ''));
-        if (in_array($body['version'], [8, 9, 10, 11], true)) { $this->deadline = RestPeer::deadline(); }
+        if ($body['version'] === 12) {
+            if (array_diff(array_keys($input), ['work_id', 'hash', 'body', 'allow_rows', 'entities_id', '_add'])) { throw new \RuntimeException('Unknown Text Both work input.'); }
+            if (!is_array($input['allow_rows'] ?? null) || strlen(json_encode(['input' => $input], JSON_THROW_ON_ERROR)) > 49152) { throw new \RuntimeException('Restrictive row mask or request budget invalid.'); }
+            TextBoth::validateAllowRows($input['allow_rows'], array_column($body['sources'], 'mapping_id'));
+            $this->allowRows = $input['allow_rows'];
+        } elseif (array_key_exists('allow_rows', $input)) { throw new \RuntimeException('Unexpected restrictive row mask.'); }
+        if (in_array($body['version'], [8, 9, 10, 11, 12, 13], true)) { $this->deadline = RestPeer::deadline(); }
         $settings = self::authorize($body);
         if (($input['work_id'] ?? '') !== $body['id'] || !RestPeer::idle()) { throw new \RuntimeException('REST acceptance unavailable.'); }
         global $DB;
         $old = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `work_id` = ' . $DB->quote($body['id']));
         if (!$old) {
-            if ($body['version'] === 9 && ($settings['transport'] ?? 'adapter') !== 'rest_records') { throw new \RuntimeException('REST read transport unavailable.'); }
+            if (in_array($body['version'], [9, 13], true) && ($settings['transport'] ?? 'adapter') !== 'rest_records') { throw new \RuntimeException('REST read transport unavailable.'); }
             if (Outbox::one('SELECT `id` FROM `' . TaskJournal::TABLE . '` WHERE `id` = ' . $DB->quote($body['id']))) {
                 throw new \RuntimeException('REST work ID is already used by retained journal evidence.');
             }
@@ -281,10 +401,11 @@ final class RestWork extends \CommonDBTM
                 'binding' => self::workBinding($body, $settings), 'entities_id' => $body['entity_id'], 'accepted_at' => time(),
                 'task_body' => '{}', 'execution_settings' => '{}'];
             foreach (['connection_id', 'registration', 'generation', 'installation'] as $key) { $fields[$key] = $body[$key]; }
-            if (in_array($body['version'], [8, 9, 10, 11], true)) {
+            if (in_array($body['version'], [8, 9, 10, 11, 12, 13], true)) {
                 if (hrtime(true) >= $this->deadline) { throw new \RuntimeException('REST batch acceptance deadline reached.'); }
                 $fields += ['compiler' => $body['version'], 'batch_id' => $body['batch_id'] ?? null, 'state' => 'accepted', 'result' => '{}', 'expires' => $body['expires']];
                 self::assertResponseSize($fields + ['id' => PHP_INT_MAX]);
+                if ($body['version'] === 12) { self::assertTextResponse($fields + ['id' => PHP_INT_MAX], []); }
             }
             try { return parent::add($fields, $options, false); }
             catch (\RuntimeException $error) {
@@ -323,7 +444,16 @@ final class RestWork extends \CommonDBTM
             $this->fields = $fresh;
             $settings = self::authorize($body);
             if ($this->fields['binding'] !== self::workBinding($body, $settings) || !RestPeer::idle()) { throw new \RuntimeException('REST execution binding changed.'); }
-            if (($this->fields['result'] ?? '{}') !== '{}') { return; }
+            if ($body['version'] !== 12 && ($this->fields['result'] ?? '{}') !== '{}') { return; }
+            if ($body['version'] === 13) { $this->observeCatalog($body, $settings); return; }
+            if ($body['version'] === 12) {
+                $lockWait = (int) Outbox::one('SELECT @@SESSION.innodb_lock_wait_timeout AS seconds')['seconds'];
+                Outbox::sql('SET SESSION innodb_lock_wait_timeout = 1');
+                $stored = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id`=' . $DB->quote($body['settings_id']));
+                $policy = RestSettings::decode($stored['body'], $stored['hash']);
+                TextBoth::run($this->fields, $body, $policy, $this->deadline, $this->allowRows);
+                return;
+            }
             if ($body['version'] === 9) { $this->observe($body, $settings); return; }
             $journal = Outbox::one('SELECT * FROM `' . TaskJournal::TABLE . '` WHERE `id` = ' . $DB->quote($body['id']));
             if (!$journal) {
@@ -403,6 +533,40 @@ final class RestWork extends \CommonDBTM
         $this->storeObservation($result);
     }
 
+    private function observeCatalog(array $body, array $settings): void
+    {
+        $target = array_replace($settings, ['itemtype' => 'Computer', 'items_id' => 0, 'entity_id' => $body['entity_id']]);
+        try {
+            if (time() > $body['expires'] || hrtime(true) >= $this->deadline) { throw new \RuntimeException('expired'); }
+            $result = ServiceContext::run($target, function () use ($target, $body): array {
+                ServiceContext::readComputer($target);
+                return Snapshot::textCatalog($body, $this->deadline);
+            });
+            if (time() > $body['expires'] || hrtime(true) >= $this->deadline) { throw new \RuntimeException('expired'); }
+            self::assertResponseSize(array_replace($this->fields, ['state' => 'observed', 'result' => json_encode($result, JSON_THROW_ON_ERROR)]));
+        } catch (\Throwable $error) {
+            $reason = in_array($error->getMessage(), ['field_unavailable', 'unsupported_field', 'metadata_invalid', 'response_limit', 'expired'], true) ? $error->getMessage() : 'field_unavailable';
+            $result = ['outcome' => 'blocked', 'reason' => $reason];
+        }
+        $this->storeObservation($result);
+    }
+
+    private static function discloseCatalog(array $row): void
+    {
+        $body = self::decode($row['body'], $row['hash']);
+        $settings = self::authorize($body);
+        if ($row['binding'] !== self::workBinding($body, $settings)) { throw new \RuntimeException('Catalog binding changed.'); }
+        $result = TextBoth::decodeJson($row['result'], 65536);
+        $target = array_replace($settings, ['itemtype' => 'Computer', 'items_id' => 0, 'entity_id' => $body['entity_id']]);
+        ServiceContext::run($target, static function () use ($target, $body, $result): void {
+            ServiceContext::readComputer($target);
+            foreach ($result['fields'] ?? [] as $entry) {
+                $pin = $body['selector']['kind'] === 'selected' ? $entry['descriptor'] : $entry;
+                if ($pin !== null) { Snapshot::textReadPermission($pin, $body['entity_id']); }
+            }
+        });
+    }
+
     /** Projection-only transaction: no asset mutation and no execution on GET. */
     private function storeObservation(array $result): void
     {
@@ -450,7 +614,8 @@ final class RestWork extends \CommonDBTM
         if (!parent::getFromDB($ID)) { return false; }
         $body = self::decode($this->fields['body'], $this->fields['hash']);
         if ($this->fields['binding'] !== self::workBinding($body, self::authorize($body))) { return false; }
-        if (in_array($body['version'], [8, 9, 10, 11], true)) {
+        if (in_array($body['version'], [8, 9, 10, 11, 12, 13], true)) {
+            if (in_array($body['version'], [12, 13], true) && ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET') { RestPeer::textReadOptions($body['version']); }
             if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
                 && (isset($_GET['debug']) || !in_array($_GET['get_hateoas'] ?? null, ['0', 0], true))) { throw new \RuntimeException('Bounded REST response options required.'); }
             return true;

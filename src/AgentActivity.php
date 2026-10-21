@@ -78,7 +78,7 @@ final class AgentActivity
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
-            if (in_array($body['version'] ?? 0, [7, 8, 10, 11], true)) { $label = self::restLabel($task, $body, $context ?? []); }
+            if (in_array($body['version'] ?? 0, [7, 8, 10, 11, 12], true)) { $label = self::restLabel($task, $body, $context ?? []); }
             if (($body['version'] ?? 0) === 9) { $label = $state === 'observed' ? 'REST inspection received; confirmation remains separate' : 'REST inspection ' . $state; }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
@@ -126,9 +126,39 @@ final class AgentActivity
     private static function restLabel(array $task, array $body, array $context): string
     {
         if ($task['state'] === 'superseded' && ($body['version'] ?? 0) === 11) { return 'REST never-reserved preparation superseded locally; no dispatch or completion'; }
-        if ($task['state'] === 'origin_pending' || ($context['rest_state'] ?? '') === 'origin_pending') { return 'REST model committed; original field evidence pending qualification'; }
-        if ($task['state'] === 'conflict') { return 'REST Name conflict; no mutation, original intervals need review'; }
+        if (in_array($task['state'], ['superseded', 'retired'], true) && ($body['version'] ?? 0) === 12) { return 'REST Text evidence retained; a fresh field comparison is required'; }
         $result = json_decode($task['result'], true);
+        if (($body['version'] ?? 0) === 12 && is_array($result['fields'] ?? null) && $result['fields'] !== []) {
+            if (in_array($task['state'], ['verified', 'unchanged'], true)) { return 'REST Text ' . $task['state']; }
+            $counts = [];
+            foreach ($result['fields'] as $field) {
+                $outcome = $field['outcome'] ?? '';
+                if ($outcome === 'offered') {
+                    $phase = $context['text_groups'][$field['group_id'] ?? '']['phase'] ?? '';
+                    $outcome = match ($phase) {
+                        'done' => 'a_verified', 'origin_pending' => 'a_origin_pending',
+                        'blocked' => 'a_blocked', 'uncertain' => 'a_uncertain', 'intent' => 'a_intent',
+                        default => $outcome,
+                    };
+                }
+                if (is_string($outcome)) { $counts[$outcome] = ($counts[$outcome] ?? 0) + 1; }
+            }
+            $labels = ['verified' => 'verified on B', 'offered' => 'returned for A to handle', 'unchanged' => 'already equal',
+                'conflict' => 'conflicted', 'blocked' => 'blocked', 'uncertain' => 'with unknown write outcome',
+                'origin_pending' => 'awaiting original-evidence verification', 'intent' => 'executing', 'pending' => 'waiting',
+                'a_verified' => 'verified on A', 'a_origin_pending' => 'committed on A; original evidence pending',
+                'a_blocked' => 'blocked on A', 'a_uncertain' => 'with unknown A write outcome', 'a_intent' => 'executing on A'];
+            $parts = [];
+            foreach ($labels as $outcome => $label) { if (!empty($counts[$outcome])) { $parts[] = $counts[$outcome] . ' ' . $label; } }
+            if ($task['state'] === 'origin_pending' || ($context['rest_state'] ?? '') === 'origin_pending') {
+                $parts[] = 'A model committed; original field evidence pending qualification';
+            }
+            return 'REST Text incomplete: ' . implode('; ', $parts) . '. A finalization pending; partial field results are not full completion.';
+        }
+        if ($task['state'] === 'origin_pending' || ($context['rest_state'] ?? '') === 'origin_pending') { return 'REST model committed; original field evidence pending qualification'; }
+        if ($task['state'] === 'conflict') { return ($body['version'] ?? 0) === 12
+            ? 'REST field conflict; no mutation, original edit intervals need review'
+            : 'REST Name conflict; no mutation, original intervals need review'; }
         if (in_array($task['state'], ['verified', 'unchanged'], true)) { return 'REST ' . $task['state']; }
         if (in_array($task['state'], ['accepted', 'finalizing'], true)
             && in_array($result['outcome'] ?? '', ['verified', 'unchanged'], true)) { return 'REST result received; A finalization pending'; }
@@ -140,6 +170,9 @@ final class AgentActivity
         $label = match ($context['rest_state'] ?? '') {
             'accepted' => 'REST accepted on B; completion pending',
             'executing' => 'REST B intent executing; completion unverified',
+            'active' => 'REST B field groups in progress; completion pending',
+            'held' => 'REST B write or original evidence unresolved; completion unverified',
+            'terminal' => 'REST B processing ended; A finalization pending',
             'expired' => 'REST expired; retained for inspection',
             'not_found' => 'REST work not found on last check; completion unverified',
             default => ($body['version'] ?? 0) === 10 && !empty($context['rest_observe_only']) && empty($context['rest_sent'])

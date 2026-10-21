@@ -333,10 +333,33 @@ final class FieldEvidence
         try { return $operation(); } finally { array_pop(self::$origins); }
     }
 
+    /** One supported model call can inherit a different genuine origin for each changed field. */
+    public static function withOrigins(int $computerId, array $changes, callable $operation): mixed
+    {
+        if ($computerId < 1 || !array_is_list($changes) || $changes === [] || count($changes) > 8) {
+            throw new \InvalidArgumentException('Invalid field origin group.');
+        }
+        $fields = [];
+        foreach ($changes as $change) {
+            if (!is_array($change) || array_keys($change) !== ['key', 'before_hash', 'after_hash', 'origin']
+                || !is_string($change['key']) || !preg_match('/^(?:native:(?:name|comment)|fields:[1-9][0-9]*)$/D', $change['key'])
+                || isset($fields[$change['key']]) || !is_string($change['before_hash']) || !is_string($change['after_hash'])
+                || !preg_match('/^[a-f0-9]{64}$/D', $change['before_hash']) || !preg_match('/^[a-f0-9]{64}$/D', $change['after_hash'])
+                || !is_array($change['origin']) || !self::validOrigin($change['origin'])) {
+                throw new \InvalidArgumentException('Invalid or duplicate field origin group member.');
+            }
+            $fields[$change['key']] = ['id' => $computerId, 'key' => $change['key'],
+                'before' => $change['before_hash'], 'after' => $change['after_hash'], 'origin' => $change['origin']];
+        }
+        self::$origins[] = ['fields' => $fields];
+        try { return $operation(); } finally { array_pop(self::$origins); }
+    }
+
     private static function origin(array $entry, string $after, int $revision, int $end): ?array
     {
         if ($entry['scope'] !== null) {
             $scope = $entry['scope'];
+            if (isset($scope['fields'])) { $scope = $scope['fields'][$entry['descriptor']['key']] ?? []; }
             return ($scope['id'] ?? null) === $entry['id'] && ($scope['key'] ?? null) === $entry['descriptor']['key']
                 && ($scope['before'] ?? null) === $entry['old_hash'] && ($scope['after'] ?? null) === $after ? $scope['origin'] : null;
         }

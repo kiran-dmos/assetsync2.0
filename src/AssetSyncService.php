@@ -634,7 +634,14 @@ final class AssetSyncService
 
         $agentConnection = $this->activeConnection($connectionId);
         if ($agentConnection !== null && RestWork::handles($agentConnection, $itemtype, $itemsId)) {
-            RestWork::process($job);
+            RestWork::process($job, function (array $mappings) use ($itemtype, $itemsId): bool {
+                return AssetChangeHook::withoutQueue(function () use ($itemtype, $itemsId, $mappings): bool {
+                    $asset = $this->loadLocalAsset($itemtype, $itemsId);
+                    if ($asset === null) { throw new \RuntimeException('Local asset disappeared before billing.'); }
+                    $prepared = $this->prepareAssetForSync($itemtype, $itemsId, $asset, $mappings, []);
+                    return $prepared['billing_changed'];
+                });
+            });
             return;
         }
         if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {

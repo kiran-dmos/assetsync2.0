@@ -49,7 +49,7 @@ function plugin_assetsync20agent_deactivate(): void
 
 function plugin_version_assetsync20agent(): array
 {
-    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.8.5',
+    return ['id' => 'assetsync20agent', 'name' => 'AssetSync2.0 Agent', 'version' => '0.8.6',
         'author' => 'DMOS Technologies', 'license' => 'GPLv3+', 'requirements' => [
             'glpi' => ['min' => '11.0.0', 'max' => '12.0.0'], 'php' => ['min' => '8.2.0']]];
 }

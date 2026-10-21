@@ -193,6 +193,100 @@ final class FieldMapping
         }, (GlpiBConnection::find($connectionId)['agent_transport'] ?? '') === 'rest_records');
     }
 
+    /** New explicit selection only; legacy save/read never manufactures or silently discards pins. */
+    public static function savePinnedText(string $connectionId, string $itemtype, array $fieldMappings, int $entityId, string $catalogWorkId, string $saveAttempt): void
+    {
+        RestWork::configure(static function () use ($connectionId, $itemtype, $fieldMappings, $entityId, $catalogWorkId, $saveAttempt): void {
+            self::invalidateRunCache();
+            $connection = GlpiBConnection::find($connectionId);
+            if ($itemtype !== 'Computer' || !$connection || !GlpiBConnection::isAgent($connection) || ($connection['agent_transport'] ?? '') !== 'rest_records') {
+                throw new \RuntimeException('Pinned text requires a Computer REST-records connection.');
+            }
+            $rows = self::rowsFromScope(['version' => 2, 'rows' => $fieldMappings]);
+            $ordinary = self::ordinaryTextRows($rows);
+            if (count($ordinary) < 1 || count($ordinary) > 8
+                || array_filter($ordinary, static fn ($r): bool => $r['source_of_truth'] !== 'both')) { throw new \RuntimeException('Select one to eight ordinary Both mappings.'); }
+            if ($saveAttempt !== $catalogWorkId) { throw new \RuntimeException('Selected request must belong to this complete save attempt.'); }
+            $reserved = array_values(array_filter(self::load($connectionId, $itemtype), static fn ($r): bool => self::isReservedUuidRow($itemtype, $r)));
+            foreach ($rows as $row) {
+                if (!self::isReservedUuidRow($itemtype, $row)) { continue; }
+                $found = false;
+                foreach ($reserved as $i => $old) {
+                    if ($old['_raw'] === $row['_raw']) { unset($reserved[$i]); $found = true; break; }
+                }
+                if (!$found) { throw new \RuntimeException('Reserved UUID configuration must remain unchanged.'); }
+            }
+            if ($reserved !== []) { throw new \RuntimeException('Retain every saved reserved UUID row unchanged.'); }
+            $status = RestWork::catalogStatus($connectionId, $catalogWorkId);
+            if ($status['state'] !== 'observed') { throw new \RuntimeException('Fresh selected B catalog is not ready.'); }
+            $remote = [];
+            foreach ($status['fields'] as $selected) {
+                if (!is_array($selected['descriptor'] ?? null) || $selected['reason'] !== null) { throw new \RuntimeException('Every selected B definition must be available.'); }
+                $pin = $selected['descriptor']; TextBoth::validatePin($pin); $remote[$pin['key']] = $pin;
+            }
+            $pins = []; $keys = []; $runtime = [];
+            foreach ($ordinary as $row) {
+                $a = FieldsText::selectedTextPin($row['glpi_a_field_key']);
+                $bKey = str_starts_with($row['glpi_b_field_key'], 'Computer.') && !str_contains($row['glpi_b_field_key'], 'PluginFields')
+                    ? substr($row['glpi_b_field_key'], 9) : $row['glpi_b_field_key'];
+                $b = $remote[$bKey] ?? null;
+                if (!$b) { throw new \RuntimeException('Selected B field changed during save.'); }
+                $pins[] = [$a, $b]; $keys[] = $b['capture_key'];
+                $runtime[] = ['glpi_a_field' => $a['key'], 'glpi_b_field' => $b['key'], 'source_of_truth' => 'both'];
+            }
+            self::validateOwnership($connectionId, 'Computer', $runtime);
+            sort($keys, SORT_STRING); self::selectedForSave($connectionId, $entityId, $keys, $catalogWorkId);
+            $saved = []; $i = 0;
+            foreach ($rows as $entry) {
+                if (self::isReservedUuidRow('Computer', $entry)) { $saved[] = $entry['_raw']; continue; }
+                [$a, $b] = $pins[$i++];
+                $saved[] = ['glpi_a_field_key' => $a['key'], 'glpi_b_field_key' => $b['key'], 'source_of_truth' => 'both',
+                    'glpi_b_field_label' => $entry['glpi_b_field_label'], 'glpi_a_pin' => $a, 'glpi_b_pin' => $b];
+            }
+            self::textMappings(self::rowsFromScope(['version' => 2, 'rows' => $saved]));
+            $all = self::loadAll(); $all[$connectionId]['Computer'] = ['version' => 2, 'rows' => $saved];
+            try { RestWork::saveConfiguration([self::FIELD_MAPPINGS_KEY => json_encode($all, JSON_THROW_ON_ERROR)]); }
+            finally { self::invalidateRunCache(); }
+        }, true);
+    }
+
+    /** Called only by the owned complete Config save; no caller-supplied pin JSON is authority. */
+    public static function selectedForSave(string $connectionId, int $entityId, array $captureKeys, string $catalogWorkId): array
+    {
+        return RestWork::selectedCatalogForSave($connectionId, $entityId, $captureKeys, $catalogWorkId, $catalogWorkId);
+    }
+
+    /** Reserved UUID rows stay stored, but are never executable text mappings. */
+    public static function ordinaryTextRows(array $rows): array
+    {
+        return array_values(array_filter($rows, static fn ($row): bool => !self::isReservedUuidRow('Computer', $row)));
+    }
+
+    public static function textMappings(array $rows): ?array
+    {
+        $rows = self::ordinaryTextRows($rows);
+        $pinned = array_filter($rows, static fn ($r): bool => array_key_exists('glpi_a_pin', $r) || array_key_exists('glpi_b_pin', $r));
+        if ($pinned === []) { return null; }
+        if (count($rows) < 1 || count($rows) > 8) { throw new \RuntimeException('Pinned text processing requires one to eight complete ordinary rows.'); }
+        $mappings = []; $seen = ['a' => [], 'b' => []];
+        foreach ($rows as $r) {
+            if ($r['source_of_truth'] !== 'both' || !is_array($r['glpi_a_pin'] ?? null) || !is_array($r['glpi_b_pin'] ?? null)) {
+                throw new \RuntimeException('Every ordinary pinned text mapping must be complete Both.');
+            }
+            $a = $r['glpi_a_pin']; $b = $r['glpi_b_pin']; TextBoth::validatePin($a); TextBoth::validatePin($b);
+            if ($r['glpi_a_field_key'] !== $a['key'] || $r['glpi_b_field_key'] !== $b['key']) { throw new \RuntimeException('Pinned mapping keys changed.'); }
+            foreach (['a' => $a, 'b' => $b] as $side => $pin) {
+                $physical = AgentTask::hash([$pin['table'], $pin['container_id'], $pin['column']]);
+                if (isset($seen[$side][$physical]) || isset($seen[$side][$pin['capture_key']])) { throw new \RuntimeException('Duplicate selected physical endpoint.'); }
+                $seen[$side][$physical] = $seen[$side][$pin['capture_key']] = true;
+            }
+            $id = substr(AgentTask::hash(['text-row', $a, $b]), 0, 32);
+            if (isset($mappings[$id])) { throw new \RuntimeException('Selected mapping ID collision.'); }
+            $mappings[$id] = ['mapping_id' => $id, 'source_of_truth' => 'both', 'a' => $a, 'b' => $b];
+        }
+        ksort($mappings, SORT_STRING); return array_values($mappings);
+    }
+
     private static function saveConfigured(string $connectionId, string $itemtype, array $fieldMappings, array $glpiBFields): void
     {
         self::invalidateRunCache();
@@ -214,6 +308,9 @@ final class FieldMapping
             }
         }
         $rows = self::rowsFromScope($rowInput ? ['version' => 2, 'rows' => $fieldMappings] : $fieldMappings);
+        if (array_filter([...$rows, ...self::load($connectionId, $itemtype)], static fn ($r): bool => array_key_exists('glpi_a_pin', $r) || array_key_exists('glpi_b_pin', $r))) {
+            throw new \RuntimeException('Pinned mappings require a fresh explicit selected-catalog save.');
+        }
         if ((GlpiBConnection::find($connectionId)['agent_transport'] ?? 'adapter') === 'rest_records') {
             if (count($rows) > 1) { throw new \RuntimeException('REST records currently supports one native Name mapping.'); }
             foreach ($rows as $row) {
@@ -366,7 +463,7 @@ final class FieldMapping
         foreach ($legacy ? $scope : $scope['rows'] as $key => $value) {
             $record = is_array($value) ? $value : ['source_of_truth' => $value];
             $row = [];
-            $rawRecord = [];
+            $rawRecord = $record;
             foreach (['glpi_a_field_key', 'glpi_b_field_key', 'glpi_b_field_id', 'glpi_b_field_uid', 'glpi_b_field_label', 'source_of_truth'] as $field) {
                 $raw = $record[$field] ?? ($field === 'glpi_a_field_key' && $legacy ? $key : '');
                 $row[$field] = is_scalar($raw) ? trim((string) $raw) : '[invalid value]';
@@ -375,6 +472,9 @@ final class FieldMapping
                 } elseif ($field === 'glpi_a_field_key' && $legacy) {
                     $rawRecord[$field] = (string) $key;
                 }
+            }
+            foreach (['glpi_a_pin', 'glpi_b_pin'] as $pin) {
+                if (array_key_exists($pin, $record)) { $row[$pin] = $record[$pin]; }
             }
             $row['_legacy'] = $legacy;
             $row['_raw'] = $rawRecord;

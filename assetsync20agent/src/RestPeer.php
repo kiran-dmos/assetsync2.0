@@ -30,6 +30,11 @@ final class RestPeer
         $json = (string) file_get_contents('php://input', false, null, 0, 49153);
         if (strlen($json) > 49152) { throw new \RuntimeException('REST body exceeds limit.'); }
         $raw = $json === '' ? null : json_decode($json, true, 16, JSON_THROW_ON_ERROR);
+        foreach (is_array($raw['input'] ?? null) && array_is_list($raw['input']) ? $raw['input'] : [$raw['input'] ?? null] as $input) {
+            if (!is_array($input) || !is_string($input['body'] ?? null)) { continue; }
+            $probe = json_decode($input['body'], true);
+            if (in_array($probe['version'] ?? null, [5, 12, 13], true)) { TextBoth::decodeJson($json, 49152); break; }
+        }
         if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
             && (!is_array($raw) || !is_array($raw['input'] ?? null)
                 || array_diff(array_keys($raw), ['input', 'session_write']))) { throw new \RuntimeException('One REST input object is required.'); }
@@ -85,17 +90,41 @@ final class RestPeer
         if (preg_match('#/([1-9][0-9]*)$#D', $path, $match)) {
             if (!empty($_GET['searchText'])) { throw new \RuntimeException('Single REST lookup has unexpected filters.'); }
             $where[] = '`id` = ' . (int) $match[1];
-            $where[] = '`compiler` IN (9, 10)';
+            $where[] = '`compiler` IN (9, 10, 12, 13)';
             if (!Outbox::one('SELECT `id` FROM `' . RestWork::getTable() . '` WHERE ' . implode(' AND ', $where))) { throw new \RuntimeException('REST lookup target unavailable.'); }
         } else {
             $search = $_GET['searchText'] ?? [];
             $compiler = $search['compiler'] ?? null;
-            $key = $compiler === '9' ? 'work_id' : 'batch_id';
-            if (!in_array($compiler, ['9', '10'], true) || !is_string($search[$key] ?? null)
+            $key = in_array($compiler, ['9', '13'], true) ? 'work_id' : 'batch_id';
+            if (!in_array($compiler, ['9', '10', '12', '13'], true) || !is_string($search[$key] ?? null)
                 || !preg_match('/^[a-f0-9]{32}$/D', $search[$key]) || isset($search[$key === 'work_id' ? 'batch_id' : 'work_id'])
                 || !isset($_GET['range']) || isset($_GET['debug']) || ($_GET['get_hateoas'] ?? null) !== '0') { throw new \RuntimeException('Exact REST lookup scope required.'); }
         }
         return $entity;
+    }
+
+    /** Only full, bounded stored rows can carry Work12 observations or Catalog13 results. */
+    public static function textReadOptions(int $compiler): void
+    {
+        if (!in_array($compiler, [12, 13], true) || ($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET'
+            || array_diff(array_keys($_GET), ['rest_entity', 'range', 'get_hateoas', 'searchText', 'session_write'])
+            || !is_string($_GET['rest_entity'] ?? null) || !preg_match('/^(0|[1-9][0-9]*)$/D', $_GET['rest_entity'])
+            || filter_var($_GET['rest_entity'], FILTER_VALIDATE_INT) === false || ($_GET['get_hateoas'] ?? null) !== '0') {
+            throw new \RuntimeException('Exact full text REST lookup required.');
+        }
+        $single = preg_match('#/[1-9][0-9]*$#D', (string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH)) === 1;
+        if ($single) {
+            if (!empty($_GET['searchText']) || isset($_GET['range'])) { throw new \RuntimeException('Unexpected single text lookup filters.'); }
+            return;
+        }
+        $search = $_GET['searchText'] ?? []; $key = $compiler === 13 ? 'work_id' : 'batch_id';
+        if (!is_array($search) || count($search) !== 2 || array_diff(array_keys($search), ['compiler', $key])
+            || ($search['compiler'] ?? null) !== (string) $compiler || !is_string($search[$key] ?? null)
+            || !preg_match('/^[a-f0-9]{32}$/D', $search[$key]) || !is_string($_GET['range'] ?? null)
+            || !preg_match('/^([0-9]+)-([0-9]+)$/D', $_GET['range'], $range) || (int) $range[2] < (int) $range[1]
+            || $_GET['range'] !== '0-0') {
+            throw new \RuntimeException('Exact bounded text collection lookup required.');
+        }
     }
 
     public static function policy(array $settings): void
@@ -120,9 +149,13 @@ final class RestPeer
         $group = null; $ids = [];
         foreach ($inputs as $row) {
             if (!is_array($row) || !is_string($row['body'] ?? null) || !is_string($row['hash'] ?? null)
-                || array_diff(array_keys($row), ['work_id', 'hash', 'body', 'entities_id'])) { throw new \RuntimeException('Invalid REST batch input.'); }
+                || array_diff(array_keys($row), ['work_id', 'hash', 'body', 'entities_id', 'allow_rows'])) { throw new \RuntimeException('Invalid REST batch input.'); }
             $body = RestWork::decode($row['body'], $row['hash']);
-            if (!in_array($body['version'], [8, 10, 11], true) || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
+            if ($body['version'] === 12) {
+                if (!is_array($row['allow_rows'] ?? null)) { throw new \RuntimeException('Restrictive row mask required.'); }
+                TextBoth::validateAllowRows($row['allow_rows'], array_column($body['sources'], 'mapping_id'));
+            } elseif (array_key_exists('allow_rows', $row)) { throw new \RuntimeException('Unexpected restrictive row mask.'); }
+            if (!in_array($body['version'], [8, 10, 11, 12], true) || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
                 throw new \RuntimeException('Only distinct supported work is admitted in a REST batch.');
             }
             $scope = [];
@@ -131,6 +164,7 @@ final class RestPeer
             $group = $scope; $ids[$body['id']] = true;
         }
         if ($group['version'] === 11 && count($inputs) > 2) { throw new \RuntimeException('Name Both evidence is bounded to two rows per batch.'); }
+        if ($group['version'] === 12 && count($inputs) !== 1) { throw new \RuntimeException('Text Both requires one asset record per batch.'); }
     }
 
     public static function binding(array $settings): string

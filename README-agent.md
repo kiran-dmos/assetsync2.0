@@ -1,5 +1,90 @@
 # GLPI B Agent
 
+## Multi-Field Text Both (Settings5 / Work12 / Catalog13)
+
+Controller **0.9.6** and agent **0.8.6** extend original-edit Both to up to eight
+configured text mappings per connection/Computer scope on existing confirmed
+pairs. Native Name/Comments and official Fields text/textarea can be mapped
+independently, including different generated keys and containers. This is not
+fanout, creation, scalar/dropdown or other-asset-type qualification.
+
+Install B before A using supported plugin Update/Enable, with owned workers and
+saves quiesced. Preserve old work, journals and configuration. The lifecycle
+changes capture coverage: obtain fresh genuine browser edits on the selected
+fields afterward. Older values without qualified origins do not acquire an
+invented baseline or timestamp. No new table or custom UUID field is introduced.
+
+On A's Field Mapping page, choose the connection and Computer. Choose an enabled
+route's B entity, request native or custom B fields, and refresh field status
+after the background worker runs. Custom fields use bounded pages; request the
+next page when available. Set the selected ordinary mappings to Both, click
+**Verify Text Both fields**, refresh, then save that verified selection. A checks its current
+definition; B supplies a new authenticated selected-definition receipt. The
+browser never supplies authoritative pin JSON. One unavailable selected field
+prevents the complete configuration save; no selected rows are silently dropped.
+Opening/refreshing this page only reads local status; explicit requests enqueue
+bounded background discovery.
+
+Existing mapping JSON stays version2. Explicitly verified rows add independent
+`glpi_a_pin` and `glpi_b_pin` identities. Unpinned legacy Name mappings retain
+Settings4/Work11. Missing, recreated, inactive, retyped or changed definitions
+hold visibly until explicit reselection; they are not replaced by similar labels
+or silently downgraded. Changes to field/container semantics, including readonly
+definitions, require fresh verification. Catalog13 definitions do not require an
+asset or custom row. Execution requires the existing unique custom row and column;
+it never creates a missing row or falls back to B asset REST.
+
+Both compares only genuine selected-field original intervals. Newer blank is
+real data. Equal normalized values do nothing; normalization only equates NULL
+and empty text, while exact raw execution guards keep them distinct. Unknown,
+equal, touching or overlapping original intervals conflict without mutation.
+Sync copies inherit the winning original identity and bounds, not a new sync
+timestamp. Each field has its own winner: one sync may copy different fields in
+opposite directions. A conflict does not choose a whole-asset winner or stop
+independent valid groups. Whitespace, case, string zero, Unicode and line endings
+are not rewritten. Comparable installation clocks remain a requirement, not a UTC proof.
+
+Native writes use the supported Computer model; custom writes use the official
+Fields wrapper and normal parent History. Fresh asset/entity/container rights,
+inventory safeguards and trusted readonly destination behavior still apply.
+Writes are grouped per native Computer row or exact custom container. Selected
+changes and mandatory siblings are validated together before that group's one
+model call. Every changed field inherits its own original evidence. Unchanged
+required siblings accompany a custom write and must stay unchanged.
+Official Fields1.24.5 rejects mandatory text string `0`; that case is a visible
+validation failure, not silently coerced. Destination/storage/body/result limits
+are checked without truncation. Unsupported or lossy values block/roll back.
+
+Acceptance is not completion. B commits its mutation/normal History/recovery
+receipt together, then qualifies inherited evidence. GET only discloses stored
+results under fresh READ authorization. Work12 adds a separate current observation
+of a historical receipt; it never rewrites that receipt or treats it as proof
+that a later B edit did not happen. A requires fresh guards before applying it.
+Known terminal work can be retired for a fresh comparison without replaying its
+mutation. Unknown outcomes and unresolved local inherited receipts stay held.
+Partial progress is not full completion. Failed/conflicted fields remain visible;
+known terminal partial attempts can retry after 60 seconds or a genuine source/
+policy change. Uncertain writes and unresolved receipts retain their slot rather
+than being replayed blindly. An edit after a committed local `origin_pending`
+receipt can still require manual investigation; this milestone does not invent
+safe replay or pruning.
+
+Before first reservation, stale or expired Work12 can use strict atomic
+never-reserved replacement. Any sticky lease/attempt/receipt prevents treating
+expiry as proof of no dispatch. Old work bodies, hashes, results and protocols
+1-11 remain retained. No new B daemon or change/ack protocol is introduced; B-only
+edits still use the existing bounded due probes, with their additional requests
+and interim per-pair delay. No two-request, latency or production-scale promise.
+
+Settings <=16KiB, Catalog request <=4KiB, Work12 body <=24KiB, actual bulk request
+<=49,152 bytes, one Work12 asset per POST/GET, public row <=60,000 bytes and response
+<=64KiB. The eight-mapping processing limit is separate from byte limits: large
+values may not fit. Complete worst-case progress/receipt storage must fit before
+the first model call; values and extra rows are never truncated. The five-second
+execution budget is shared by all groups and cooperative, not a hard wall-clock
+deadline. Versions, runtime coverage and remaining limitations must be recorded
+in independent verification; pure contract vectors are not native sync evidence.
+
 ## Scoped REST Routing Checkpoint (Settings3 / Work10)
 
 Controller **0.9.5** and agent **0.8.5** add a bounded routing extension for

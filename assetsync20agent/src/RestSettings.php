@@ -49,6 +49,22 @@ final class RestSettings extends \CommonDBTM
     public static function decode(string $json, string $hash): array
     {
         $body = json_decode($json, true, 16, JSON_THROW_ON_ERROR);
+        if (is_array($body) && ($body['version'] ?? null) === 5) {
+            $body = TextBoth::decodeJson($json, 16384);
+            $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id',
+                'route_id', 'source_entity', 'target_entity', 'itemtype', 'mappings', 'revision', 'enabled', 'include_child_entities', 'asset_types'];
+            if (array_diff(array_keys($body), $keys) || array_diff($keys, array_keys($body))
+                || !is_array($body['mappings']) || !is_bool($body['enabled'])
+                || ($body['enabled'] ? !array_is_list($body['mappings']) : $body['mappings'] !== [])
+                || !hash_equals(TaskExecutor::hash($body), $hash)) { throw new \RuntimeException('Invalid Text Both settings.'); }
+            if ($body['enabled']) {
+                TextBoth::validateMappings($body['mappings']);
+            }
+            $routing = $body; $routing['version'] = 3;
+            $routing['mappings'] = $body['enabled'] ? [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a']] : [];
+            self::decode(json_encode($routing, JSON_THROW_ON_ERROR), TaskExecutor::hash($routing));
+            return $body;
+        }
         if (is_array($body) && ($body['version'] ?? null) === 4) {
             $legacy = $body;
             if (($body['include_child_entities'] ?? null) !== false || ($body['asset_types'] ?? null) !== ['Computer']
@@ -114,7 +130,7 @@ final class RestSettings extends \CommonDBTM
         global $DB;
         $head = Outbox::one('SELECT * FROM `' . self::HEAD . '` WHERE `scope_key` = ' . $DB->quote(self::scope($body)));
         if (!$head) { return $body['version'] === 1 && !self::history($body); }
-        return in_array($body['version'], [2, 3, 4], true) && $body['enabled'] && $head['settings_id'] === $body['id']
+        return in_array($body['version'], [2, 3, 4, 5], true) && $body['enabled'] && $head['settings_id'] === $body['id']
             && (int) $head['revision'] === $body['revision'];
     }
 
@@ -124,7 +140,7 @@ final class RestSettings extends \CommonDBTM
         $where = [];
         foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) { $where[] = '`' . $key . '` = ' . $DB->quote($body[$key]); }
         return Outbox::one('SELECT `id` FROM `' . self::getTable() . '` WHERE ' . implode(' AND ', $where)
-            . ' AND JSON_EXTRACT(`body`, \'$.version\') IN (2, 3, 4) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
+            . ' AND JSON_EXTRACT(`body`, \'$.version\') IN (2, 3, 4, 5) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
     }
 
     public static function authorize(array $body): array
@@ -148,7 +164,7 @@ final class RestSettings extends \CommonDBTM
         $fields = ['settings_id' => $body['id'], 'hash' => $input['hash'], 'body' => $input['body'],
             'binding' => self::binding($settings, $body['version']), 'entities_id' => $body['target_entity']];
         foreach (['connection_id', 'registration', 'generation', 'installation'] as $key) { $fields[$key] = $body[$key]; }
-        if (in_array($body['version'], [2, 3, 4], true)) { return $this->activate($body, $fields); }
+        if (in_array($body['version'], [2, 3, 4, 5], true)) { return $this->activate($body, $fields); }
         global $DB;
         $old = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['id']));
         if (!$old) {
@@ -172,6 +188,16 @@ final class RestSettings extends \CommonDBTM
             if (($settings['transport'] ?? 'adapter') !== 'rest_records' || self::binding($settings, 2) !== $fields['binding'] || !RestPeer::idle()) { throw new \RuntimeException('REST activation binding changed.'); }
             Outbox::sql('START TRANSACTION');
             try {
+                if ($body['version'] === 5 && $body['enabled']) {
+                    $target = array_replace($settings, ['itemtype' => 'Computer', 'items_id' => 0, 'entity_id' => $body['target_entity']]);
+                    ServiceContext::run($target, static function () use ($body, $target): void {
+                        ServiceContext::readComputer($target);
+                        foreach ($body['mappings'] as $mapping) {
+                            $pin = $mapping['b'];
+                            if (Snapshot::textPin($pin['capture_key'], $body['target_entity'], true, true) !== $pin) { throw new \RuntimeException('Text Both B definition changed.'); }
+                        }
+                    });
+                }
                 $scope = self::scope($body);
                 $head = Outbox::one('SELECT * FROM `' . self::HEAD . '` WHERE `scope_key` = ' . $DB->quote($scope) . ' FOR UPDATE');
                 if (!$head && self::history($body)) { throw new \RuntimeException('REST settings head missing; repair required.'); }
