@@ -51,5 +51,20 @@ namespace {
             if (permits($scope, $other)) { throw new RuntimeException('Caller filter replaced ACL: ' . $key); }
         }
     }
+    $_GET = ['searchText' => ['batch_id' => str_repeat('a', 32)]];
+    $scope = \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records');
+    if (($scope['AND']['records.batch_id'] ?? '') !== str_repeat('a', 32) || ($scope['AND']['records.compiler'] ?? null) !== 8) {
+        throw new RuntimeException('Batch lookup lacks mandatory exact predicates');
+    }
+    $row += ['records.batch_id' => str_repeat('a', 32), 'records.compiler' => 8];
+    $scope['records.batch_id'] = ['LIKE', '%']; $scope['records.compiler'] = ['LIKE', '%'];
+    if (permits($scope, array_replace($row, ['records.batch_id' => str_repeat('b', 32)]))
+        || permits($scope, array_replace($row, ['records.compiler' => 7]))) { throw new RuntimeException('Caller wildcard replaced exact batch/compiler predicates'); }
+    foreach (['%a%', '^' . str_repeat('a', 32) . '$', ['invalid']] as $bad) {
+        $_GET['searchText']['batch_id'] = $bad;
+        try { \GlpiPlugin\Assetsync20agent\RestWork::getSystemSQLCriteria('records'); throw new LogicException('Invalid batch query accepted'); }
+        catch (RuntimeException) {}
+    }
+    $_GET = [];
     echo "REST collection ACL passed: searchText cannot replace binding or entity predicates on either resource.\n";
 }

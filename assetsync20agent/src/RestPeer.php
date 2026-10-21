@@ -7,6 +7,14 @@ namespace GlpiPlugin\Assetsync20agent;
 /** Admission shared by the two stock REST resources; core still authenticates the session and IP. */
 final class RestPeer
 {
+    private static int $requestDeadline = 0;
+
+    public static function deadline(): int
+    {
+        if (self::$requestDeadline === 0) { self::$requestDeadline = hrtime(true) + 5_000_000_000; }
+        return self::$requestDeadline;
+    }
+
     public static function settings(): array
     {
         if (PHP_SAPI === 'cli' || session_status() === PHP_SESSION_ACTIVE
@@ -23,8 +31,16 @@ final class RestPeer
         if (strlen($json) > 49152) { throw new \RuntimeException('REST body exceeds limit.'); }
         $raw = $json === '' ? null : json_decode($json, true, 16, JSON_THROW_ON_ERROR);
         if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST'
-            && (!is_array($raw) || !is_array($raw['input'] ?? null) || array_is_list($raw['input'])
+            && (!is_array($raw) || !is_array($raw['input'] ?? null)
                 || array_diff(array_keys($raw), ['input', 'session_write']))) { throw new \RuntimeException('One REST input object is required.'); }
+        if (is_array($raw['input'] ?? null) && array_is_list($raw['input'])) {
+            self::deadline();
+            if (!str_ends_with(rawurldecode((string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH)), '\\RestWork')) { throw new \RuntimeException('Only work supports REST batches.'); }
+            self::validateBatch($raw['input']);
+        }
+        if (isset($_GET['searchText']['batch_id']) && (isset($_GET['debug']) || !in_array($_GET['get_hateoas'] ?? null, ['0', 0], true)
+            || !isset($_GET['range']) || !preg_match('/^([0-9]+)-([0-9]+)$/D', (string) $_GET['range'], $page)
+            || (int) $page[2] - (int) $page[1] >= 4)) { throw new \RuntimeException('REST batch result page exceeds limit.'); }
         if (isset($_GET['range']) && (!is_string($_GET['range']) || !preg_match('/^([0-9]+)-([0-9]+)$/D', $_GET['range'], $range)
             || (int) $range[2] < (int) $range[1] || (int) $range[2] - (int) $range[1] >= 10)) { throw new \RuntimeException('REST page exceeds limit.'); }
         if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET' && !preg_match('#/\d+$#D', (string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH))
@@ -59,6 +75,25 @@ final class RestPeer
         }
         if ($matches !== [(int) $settings['agent_peer_api_client']]) {
             throw new \RuntimeException('Native REST peer or API client mismatch.');
+        }
+    }
+
+    /** Validate the entire native list before core can call add() for its first row. */
+    private static function validateBatch(array $inputs): void
+    {
+        if (!array_is_list($inputs) || count($inputs) < 1 || count($inputs) > 10) { throw new \RuntimeException('REST batch exceeds limit.'); }
+        $group = null; $ids = [];
+        foreach ($inputs as $row) {
+            if (!is_array($row) || !is_string($row['body'] ?? null) || !is_string($row['hash'] ?? null)
+                || array_diff(array_keys($row), ['work_id', 'hash', 'body', 'entities_id'])) { throw new \RuntimeException('Invalid REST batch input.'); }
+            $body = RestWork::decode($row['body'], $row['hash']);
+            if ($body['version'] !== 8 || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
+                throw new \RuntimeException('Only distinct v8 work is admitted in a REST batch.');
+            }
+            $scope = [];
+            foreach (['batch_id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash', 'entity_id'] as $key) { $scope[$key] = $body[$key]; }
+            if ($group !== null && $group !== $scope) { throw new \RuntimeException('Mixed REST batch scope.'); }
+            $group = $scope; $ids[$body['id']] = true;
         }
     }
 

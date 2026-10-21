@@ -87,6 +87,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'wake_enabled' => $_POST['wake_enabled'] ?? '0',
                 'agent_api_url' => $_POST['agent_api_url'] ?? '',
                 'agent_rest_pair' => $_POST['agent_rest_pair'] ?? '',
+                'agent_rest_pairs' => $_POST['agent_rest_pairs'] ?? '',
                 'agent_rest_url' => $_POST['agent_rest_url'] ?? '',
                 'agent_app_token' => $_POST['agent_app_token'] ?? '',
                 'agent_user_token' => $_POST['agent_user_token'] ?? '',
@@ -332,6 +333,8 @@ echo '<tr><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><i
     . $html($connection['agent_api_url'] ?? '') . '"></td></tr>';
 echo '<tr><th><label for="agent_rest_pair">Name REST confirmed pair ID</label></th><td><input id="agent_rest_pair" name="agent_rest_pair" size="36" value="'
     . $html($connection['agent_rest_pair'] ?? '') . '"></td></tr>';
+echo '<tr><th><label for="agent_rest_pairs">Name REST v8 batch pair IDs</label></th><td><textarea id="agent_rest_pairs" name="agent_rest_pairs" rows="4" cols="36">'
+    . $html(implode("\n", $connection['agent_rest_pairs'] ?? [])) . '</textarea></td></tr>';
 echo '<tr><th><label for="agent_rest_url">Name REST API URL</label></th><td><input id="agent_rest_url" name="agent_rest_url" size="60" value="'
     . $html($connection['agent_rest_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI B app token', 'agent_user_token' => 'GLPI B user API token'] as $key => $label) {

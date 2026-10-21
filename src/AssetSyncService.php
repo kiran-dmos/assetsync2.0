@@ -96,6 +96,7 @@ final class AssetSyncService
                 return 0;
             }
             $locked = true;
+            RestWork::beginRun();
             GlpiBConnection::beginRunCache();
             EntitySyncRoute::beginRunCache();
             FieldMapping::beginRunCache();

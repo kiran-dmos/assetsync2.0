@@ -1,5 +1,59 @@
 # GLPI B Agent
 
+## Opt-In Name REST Batches (V8)
+
+Controller 0.9.1 and agent 0.8.1 add opt-in batching for independently confirmed
+Computer pairs with exactly native Name to Name and A authority. Update B first
+through GLPI's plugin Update action, then A. B's existing install hook adds nullable
+batch/result columns and a scoped index to its existing Work table; repeat Update
+preserves existing records. Keep the selected v7 pair in its existing setting.
+Use **Name REST v8 batch pair IDs** on the A connection for additional confirmed
+pairs. Blank keeps batching disabled. No mappings or pairs are enabled globally.
+
+A groups immutable v8 work only within one run, connection, binding, settings and
+target entity. Each row pins its batch ID before publication. B admits native input
+lists up to ten rows and 49,152 encoded request bytes; A currently publishes at most
+**four rows per batch**, shrinking further for the request-byte bound. This is a
+conservative supported batch size, not a ten-row throughput claim. Ten assets need
+three batches and six successful sync requests when every result is ready at its
+first GET. A warm ready batch uses one POST and one collection GET; auth, settings,
+polls, retries and continuation are additional requests counted separately.
+
+B validates the entire list's schema, hashes and shared scope before core adds any
+row. Native per-row authorization/execution failures may still yield 207 or 400.
+POST IDs indicate acceptance only, and response positions are not result identities.
+A matches collection results against exact stored work IDs, hashes and external
+bodies. A complete successful read can recover missing members with identical IDs;
+failed or partial-page reads remain unknown and never authorize a resend. Each A
+member finishes only under its own fresh queue claim and source/scope checks.
+
+The request shares one five-second monotonic deadline across native model instances.
+Later rows may remain unaccepted when that window expires; accepted unstarted rows
+can continue through identical POST. GET never compiles, executes or changes expiry.
+An expired accepted projection becomes stale on A. An executing empty projection
+can receive identical POST even after expiry solely to reconcile its retained journal;
+unresolved intent is never executed again. A local model overrun rolls back its
+transaction and retains uncertainty; successful v8 results persist start/end timing
+with verified readback. Native methods and database waits can exceed this cooperative
+budget; there is no hard five-second response guarantee.
+
+V8 executing projections commit with journal intent. Terminal projections, native
+model/History and journal results share a transaction. Lost/ambiguous commits cannot
+be inferred successful from an in-memory result. Collection reads use these stored
+outcomes directly. External body/hash/result remain exact; only v8 compiler internals
+are omitted from API replies. Each public row is bounded to 16,000 encoded bytes;
+four rows plus array punctuation fit the unchanged 64 KiB client cap. Batch reads
+require `get_hateoas=0`, no debug parameter and pages of at most four, with an exact
+32-hex batch predicate nested inside mandatory binding/entity SQL scope. Existing
+v7 virtual GET evidence and protocol 1-7 bodies, hashes and results are preserved.
+
+Focused component checks: `tests/agent-rest-batch.php`,
+`tests/agent-rest-batch-model.php`, `tests/agent-rest-batch-admission.php` and
+`tests/agent-rest-acl.php`. These use HTTP/native model doubles and SQLite; actual
+stock API batching, deadline/partial failures and transaction behavior require
+independent isolated qualification. This slice adds no B change queue/ACK flow,
+new field families, Both, creation, UUID or broader transport/settings redesign.
+
 ## Optional Name REST Records (Wave 1)
 
 After updating B first, A can opt one existing independently confirmed Computer
@@ -69,7 +123,7 @@ REST, TLS, native model/History and concurrency require isolated integration QA.
 
 ## Native-Only Setup And Upgrade
 
-Controller **0.9.0** and agent **0.8.0** use GLPI-native authentication for all
+Controller **0.9.1** and agent **0.8.1** use GLPI-native authentication for all
 agent communications. Custom registration bearer tokens and wake keys, their
 rotation controls, and B's notification-only REST mode are removed. Ordinary
 controller REST asset synchronization and its GLPI credentials remain supported.
@@ -178,7 +232,7 @@ and dropdowns remain unsupported. Existing one-way text, yesno and date mappings
 retain their protocol behavior and permission checks.
 
 Native Both was introduced in **B agent 0.5.3 / A controller 0.6.4**. For the current
-release use the B-first 0.8.0 / A 0.9.0 procedure above. Both sides must support
+release use the B-first 0.8.1 / A 0.9.1 procedure above. Both sides must support
 the native-only Agent API; no older-controller pull downgrade is attempted. Upgrade A before
 enabling Both. A withholds v6 tasks from older B and reports the upgrade requirement.
 There is no task downgrade or REST fallback. No new database table or column is

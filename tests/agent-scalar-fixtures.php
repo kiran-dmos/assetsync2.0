@@ -139,6 +139,12 @@ class_alias(Search::class, 'Glpi\\Search\\SearchOption');
 class Computer
 {
     public static function getTable(): string { return 'glpi_computers'; }
+    public function rawSearchOptions(): array
+    {
+        $options = [];
+        foreach (Search::$options as $id => $option) { $options[] = ['id' => $id] + $option; }
+        return $options;
+    }
     public array $fields = [];
     public static bool $allowUpdate = true;
     public static bool $allowRead = true;

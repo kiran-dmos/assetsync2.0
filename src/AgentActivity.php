@@ -78,7 +78,7 @@ final class AgentActivity
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
-            if (($body['version'] ?? 0) === 7) { $label = self::restLabel($task, $body, $context ?? []); }
+            if (in_array($body['version'] ?? 0, [7, 8], true)) { $label = self::restLabel($task, $body, $context ?? []); }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
             }
@@ -129,10 +129,13 @@ final class AgentActivity
         if (in_array($task['state'], ['accepted', 'finalizing'], true)
             && in_array($result['outcome'] ?? '', ['verified', 'unchanged'], true)) { return 'REST result received; A finalization pending'; }
         if (($result['outcome'] ?? '') === 'stale') { return 'REST expired or stale; retained for inspection'; }
+        if (in_array($result['outcome'] ?? '', ['blocked', 'uncertain'], true)) {
+            return 'REST ' . $result['outcome'] . '; retained for inspection';
+        }
         if ($task['state'] !== 'accepted' || $task['result'] !== '{}') { return 'REST ' . $task['state'] . '; retained for inspection'; }
         $label = match ($context['rest_state'] ?? '') {
             'accepted' => 'REST accepted on B; completion pending',
-            'executing' => 'REST executing on B; completion pending',
+            'executing' => 'REST B intent executing; completion unverified',
             'expired' => 'REST expired; retained for inspection',
             'not_found' => 'REST work not found on last check; completion unverified',
             default => empty($context['rest_sent']) ? 'REST dispatch pending' : 'REST outcome unknown; awaiting reconciliation',

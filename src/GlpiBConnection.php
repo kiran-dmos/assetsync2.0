@@ -169,12 +169,24 @@ final class GlpiBConnection
         $wakeEnabled = $mode === 'agent' && (!empty($input['wake_enabled']) || (!array_key_exists('wake_enabled', $input) && !empty($current['wake_enabled'])));
         $agent = $mode === 'agent' ? AgentSession::configuration($input, $current) : [];
         $restPair = trim((string) ($input['agent_rest_pair'] ?? $current['agent_rest_pair'] ?? ''));
+        $restPairs = $input['agent_rest_pairs'] ?? $current['agent_rest_pairs'] ?? [];
+        if (is_string($restPairs)) { $restPairs = preg_split('/[\s,]+/', trim($restPairs), -1, PREG_SPLIT_NO_EMPTY); }
+        if (!is_array($restPairs) || !array_is_list($restPairs) || count($restPairs) > 100) {
+            throw new \InvalidArgumentException('Choose at most 100 confirmed REST batch pairs.');
+        }
+        foreach ($restPairs as $id) {
+            if (!is_string($id) || !preg_match('/^[a-f0-9]{32}$/D', $id) || $id === $restPair
+                || !($pair = AgentTask::byId((string) ($input['id'] ?? ''), $id)) || !$pair['confirmed'] || $pair['itemtype'] !== 'Computer') {
+                throw new \InvalidArgumentException('REST batches require distinct confirmed Computer pairs; keep the v7 pair separate.');
+            }
+        }
+        $restPairs = array_values(array_unique($restPairs));
         $restUrl = trim((string) ($input['agent_rest_url'] ?? $current['agent_rest_url'] ?? ''));
-        if ($restPair !== '' && ($mode !== 'agent' || !preg_match('/^[a-f0-9]{32}$/D', $restPair) || !RestSession::validUrl($restUrl))) {
+        if (($restPair !== '' || $restPairs !== []) && ($mode !== 'agent' || ($restPair !== '' && !preg_match('/^[a-f0-9]{32}$/D', $restPair)) || !RestSession::validUrl($restUrl))) {
             throw new \InvalidArgumentException('REST records require an agent connection, confirmed pair ID and direct HTTPS apirest.php URL.');
         }
         return $agent + [
-            'agent_rest_pair' => $restPair, 'agent_rest_url' => $restUrl,
+            'agent_rest_pair' => $restPair, 'agent_rest_pairs' => $restPairs, 'agent_rest_url' => $restUrl,
             'mode'       => $mode,
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
@@ -1561,6 +1573,7 @@ final class GlpiBConnection
                 'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($savedConnection['agent_api_url'] ?? ''),
                 'agent_rest_pair' => (string) ($savedConnection['agent_rest_pair'] ?? ''),
+                'agent_rest_pairs' => (array) ($savedConnection['agent_rest_pairs'] ?? []),
                 'agent_rest_url' => (string) ($savedConnection['agent_rest_url'] ?? ''),
                 'agent_peer_user' => (string) ($savedConnection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($savedConnection['agent_peer_api_client'] ?? ''),
@@ -1595,6 +1608,7 @@ final class GlpiBConnection
                 'agent_auth' => 'glpi_session',
                 'agent_api_url' => (string) ($connection['agent_api_url'] ?? ''),
                 'agent_rest_pair' => (string) ($connection['agent_rest_pair'] ?? ''),
+                'agent_rest_pairs' => (array) ($connection['agent_rest_pairs'] ?? []),
                 'agent_rest_url' => (string) ($connection['agent_rest_url'] ?? ''),
                 'agent_peer_user' => (string) ($connection['agent_peer_user'] ?? ''),
                 'agent_peer_api_client' => (string) ($connection['agent_peer_api_client'] ?? ''),

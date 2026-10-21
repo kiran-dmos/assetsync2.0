@@ -70,7 +70,7 @@ namespace {
     $settings = ['mode' => 'agent', 'agent_auth' => 'glpi_session', 'agent_api_url' => 'https://controller.invalid/plugins/assetsync20/front/agent-api.php',
         'agent_app_token' => 'test-app', 'agent_user_token' => 'test-user'];
     \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
-    $check(plugin_version_assetsync20agent()['version'] === '0.8.0', 'B advertises the stock REST records package version.');
+    $check(plugin_version_assetsync20agent()['version'] === '0.8.1', 'B advertises the stock REST records package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);
