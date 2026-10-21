@@ -60,7 +60,42 @@ final class RestPeer
         \Session::initEntityProfiles((int) $settings['agent_peer_user']);
         \Session::changeProfile((int) $settings['agent_peer_profile']);
         self::entity($settings, (int) $settings['agent_peer_entity']);
+        // Core appends its active-entity criterion after the resource's final admission call.
+        if (isset($_GET['rest_entity'])) { self::entity($settings, self::lookupEntity($settings)); }
         return $settings;
+    }
+
+    private static function lookupEntity(array $settings): int
+    {
+        $value = $_GET['rest_entity'];
+        $path = rawurldecode((string) parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH));
+        // GLPI 11's front controller keeps SCRIPT_NAME=index.php for the stock API route.
+        $script = rawurldecode((string) ($_SERVER['SCRIPT_NAME'] ?? '/apirest.php'));
+        if (!preg_match('#^(.*)/(?:index|apirest)\.php$#D', $script, $mount)) { throw new \RuntimeException('Invalid REST script.'); }
+        $resource = $mount[1] . '/apirest.php/GlpiPlugin\\Assetsync20agent\\RestWork';
+        if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET' || !is_string($value) || !preg_match('/^(0|[1-9][0-9]*)$/D', $value)
+            || filter_var($value, FILTER_VALIDATE_INT) === false
+            || !preg_match('#^' . preg_quote($resource, '#') . '(?:/[1-9][0-9]*)?$#D', $path)) { throw new \RuntimeException('Invalid REST lookup entity.'); }
+        $entity = (int) $value;
+        self::grant($settings, $entity);
+        ServiceContext::readPermission(array_replace($settings, ['entity_id' => $entity]));
+        global $DB;
+        $where = ['`entities_id` = ' . $entity, '`binding` = ' . $DB->quote(RestSettings::binding($settings, 2))];
+        foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) { $where[] = '`' . $key . '` = ' . $DB->quote($settings[$key]); }
+        if (preg_match('#/([1-9][0-9]*)$#D', $path, $match)) {
+            if (!empty($_GET['searchText'])) { throw new \RuntimeException('Single REST lookup has unexpected filters.'); }
+            $where[] = '`id` = ' . (int) $match[1];
+            $where[] = '`compiler` IN (9, 10)';
+            if (!Outbox::one('SELECT `id` FROM `' . RestWork::getTable() . '` WHERE ' . implode(' AND ', $where))) { throw new \RuntimeException('REST lookup target unavailable.'); }
+        } else {
+            $search = $_GET['searchText'] ?? [];
+            $compiler = $search['compiler'] ?? null;
+            $key = $compiler === '9' ? 'work_id' : 'batch_id';
+            if (!in_array($compiler, ['9', '10'], true) || !is_string($search[$key] ?? null)
+                || !preg_match('/^[a-f0-9]{32}$/D', $search[$key]) || isset($search[$key === 'work_id' ? 'batch_id' : 'work_id'])
+                || !isset($_GET['range']) || isset($_GET['debug']) || ($_GET['get_hateoas'] ?? null) !== '0') { throw new \RuntimeException('Exact REST lookup scope required.'); }
+        }
+        return $entity;
     }
 
     public static function policy(array $settings): void
@@ -87,7 +122,7 @@ final class RestPeer
             if (!is_array($row) || !is_string($row['body'] ?? null) || !is_string($row['hash'] ?? null)
                 || array_diff(array_keys($row), ['work_id', 'hash', 'body', 'entities_id'])) { throw new \RuntimeException('Invalid REST batch input.'); }
             $body = RestWork::decode($row['body'], $row['hash']);
-            if (!in_array($body['version'], [8, 11], true) || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
+            if (!in_array($body['version'], [8, 10, 11], true) || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
                 throw new \RuntimeException('Only distinct supported work is admitted in a REST batch.');
             }
             $scope = [];

@@ -639,7 +639,7 @@ final class AssetSyncService
         }
         if ($agentConnection !== null && GlpiBConnection::isAgent($agentConnection)) {
             if (($agentConnection['agent_transport'] ?? 'adapter') === 'rest_records') {
-                AssetSyncQueue::block($job, 'REST records requires an explicitly opted-in confirmed Computer/Name pair.');
+                AssetSyncQueue::block($job, 'REST records requires a confirmed Computer pair in a current supported route.');
                 return;
             }
             AgentTask::process($job, function (array $changes, array $mappings) use ($itemtype, $itemsId): bool {

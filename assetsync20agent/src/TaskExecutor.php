@@ -13,7 +13,7 @@ final class TaskExecutor
 
     public static function validate(array $task, array $settings, bool $execution = true): void
     {
-        if (in_array($task['version'] ?? null, [7, 8], true)) {
+        if (in_array($task['version'] ?? null, [7, 8, 10], true)) {
             $original = $task; unset($original['hash']);
             if (($task['kind'] ?? '') !== 'apply' || ($task['itemtype'] ?? '') !== 'Computer'
                 || array_keys($task['changes'] ?? []) !== ['name'] || !is_string($task['rest_work_hash'] ?? null)
@@ -155,7 +155,7 @@ final class TaskExecutor
     /** Keys and generated model classes come only from fresh local official metadata. */
     public static function snapshot(array $settings, int $version = 2): array
     {
-        if (in_array($version, [7, 8], true)) { return self::nameSnapshot($settings); }
+        if (in_array($version, [7, 8, 10], true)) { return self::nameSnapshot($settings); }
         global $DB;
         $type = $settings['itemtype'] ?? 'Computer';
         $model = TargetScope::model($type);
@@ -296,7 +296,7 @@ final class TaskExecutor
             self::configuration($settings, $task['version'] < 3);
             return ServiceContext::run($settings, static function () use ($task, $settings, &$changed, &$attempted): array {
                 if ($task['version'] === 5) { return Creation::execute($task, $settings); }
-                if (in_array($task['version'], [6, 7, 8], true)) { return self::executeBoth($task, $settings); }
+                if (in_array($task['version'], [6, 7, 8, 10], true)) { return self::executeBoth($task, $settings); }
                 if ($task['kind'] === 'discover') {
                     return ['outcome' => 'unchanged', 'changed' => [], 'discovery' => self::discover($task, $settings)];
                 }
@@ -515,7 +515,7 @@ final class TaskExecutor
         $attempted = false;
         Outbox::sql('START TRANSACTION');
         try {
-            self::lockRows($settings, in_array($task['version'], [7, 8], true));
+            self::lockRows($settings, in_array($task['version'], [7, 8, 10], true));
             $before = self::snapshot($settings, $task['version']);
             if ($before['modification'] !== $task['guard']['modification'] || $before['native_values'] !== $task['guard']['native_values']
                 || self::identity($before) !== $task['identity']) {
@@ -582,7 +582,7 @@ final class TaskExecutor
             $snapshot['origin_epoch'] = $task['guard']['origin_epoch'];
             $result = ['outcome' => $changed === [] ? 'unchanged' : 'verified', 'changed' => $changed, 'snapshot' => $snapshot,
                 'mutation' => ['modification' => $snapshot['modification'], 'native_values' => $snapshot['native_values'], 'origin_epoch' => $task['guard']['origin_epoch']]];
-            if ($task['version'] === 8) {
+            if (in_array($task['version'], [8, 10], true)) {
                 // A local model may overrun the cooperative deadline; do not commit inferred success.
                 RestWork::authorizeTask($task);
                 if (time() > $task['expires']) { throw new \RuntimeException('REST work expired during local execution.'); }
@@ -590,7 +590,7 @@ final class TaskExecutor
             }
             if (!$DB->update(TaskJournal::TABLE, ['state' => $result['outcome'], 'result' => json_encode($result, JSON_THROW_ON_ERROR)],
                 ['id' => $task['id'], 'hash' => $task['hash'], 'result' => '{}']) || $DB->affectedRows() !== 1) { throw new \RuntimeException('V6 result storage failed.'); }
-            if ($task['version'] === 8) { RestWork::project($task, $result['outcome'], $result); }
+            if (in_array($task['version'], [8, 10], true)) { RestWork::project($task, $result['outcome'], $result); }
             Outbox::sql('COMMIT');
             return $result;
         } catch (\Throwable) {

@@ -50,26 +50,26 @@ final class TaskJournal
                 if (!$DB->insert(self::TABLE, ['id' => $id, 'hash' => $task['hash'], 'body' => json_encode($task, JSON_THROW_ON_ERROR),
                     'state' => 'executing', 'result' => '{}', 'created_at' => time(), 'registration' => $task['registration'],
                     'generation' => $task['generation'], 'installation' => $task['installation'], 'connection_id' => $task['connection_id'],
-                    'report_status' => in_array($task['version'], [7, 8], true) ? 'rest' : 'pending'])) { throw new \RuntimeException('Journal unavailable.'); }
-                if ($task['version'] === 8) { RestWork::project($task, 'executing', []); }
+                    'report_status' => in_array($task['version'], [7, 8, 10], true) ? 'rest' : 'pending'])) { throw new \RuntimeException('Journal unavailable.'); }
+                if (in_array($task['version'], [8, 10], true)) { RestWork::project($task, 'executing', []); }
                 Outbox::sql('COMMIT');
             } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
             $result = TaskExecutor::execute($task, $settings);
         }
-        if (($task['version'] === 5 && $task['kind'] === 'create') || (in_array($task['version'], [6, 7, 8], true) && $task['kind'] === 'apply')) {
+        if (($task['version'] === 5 && $task['kind'] === 'create') || (in_array($task['version'], [6, 7, 8, 10], true) && $task['kind'] === 'apply')) {
             // Creation and v6 apply write their result in the same transaction as their models.
             // A failed/ambiguous COMMIT must not report inferred success from an in-memory result.
             $saved = Outbox::one('SELECT * FROM `' . self::TABLE . '` WHERE `id` = ' . $DB->quote($id));
             if (!$saved) { throw new \RuntimeException($task['version'] === 5 ? 'Creation journal disappeared.' : 'V6 journal disappeared.'); }
             if ($saved['result'] !== '{}') { return json_decode($saved['result'], true, 32, JSON_THROW_ON_ERROR); }
-            if ($result['outcome'] === 'verified' || (in_array($task['version'], [6, 7, 8], true) && $result['outcome'] === 'unchanged')) { $result = ['outcome' => 'uncertain', 'changed' => []]; }
+            if ($result['outcome'] === 'verified' || (in_array($task['version'], [6, 7, 8, 10], true) && $result['outcome'] === 'unchanged')) { $result = ['outcome' => 'uncertain', 'changed' => []]; }
         }
         Outbox::sql('START TRANSACTION');
         try {
             if (!$DB->update(self::TABLE, ['state' => $result['outcome'], 'result' => json_encode($result, JSON_THROW_ON_ERROR)], ['id' => $id, 'result' => '{}'])) {
                 throw new \RuntimeException('Journal result unavailable.');
             }
-            if ($task['version'] === 8) { RestWork::project($task, $result['outcome'], $result); }
+            if (in_array($task['version'], [8, 10], true)) { RestWork::project($task, $result['outcome'], $result); }
             Outbox::sql('COMMIT');
         } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
         return $result;

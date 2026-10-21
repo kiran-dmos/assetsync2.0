@@ -414,13 +414,16 @@ final class AgentTask
             }
         }
         EntitySyncRoute::loadAll(true);
-        $match = EntitySyncRoute::matchAsset($type, (string) $pair['local_entity'], [], $pair['connection_id']);
+        $records = ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
+        $path = $records ? EntitySyncRoute::strictEntityPath((int) $pair['local_entity']) : [];
+        $match = EntitySyncRoute::matchAsset($type, (string) $pair['local_entity'], $path, $pair['connection_id']);
         $route = $match['matches'][0]['route'] ?? null;
         $link = AssetSyncLink::find($type, (int) $pair['local_id'], $pair['connection_id']);
         $links = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
             'itemtype' => $type, 'glpi_b_connection_id' => $pair['connection_id'], 'remote_items_id' => (int) $pair['computer_id']], 'LIMIT' => 2]));
         if (!$pair['confirmed'] || !$route || count($match['matches']) !== 1 || $match['conflicts'] !== []
-            || $route['id'] !== $pair['route_id'] || $route['include_child_entities'] || $route['asset_types'] !== [$type]
+            || $route['id'] !== $pair['route_id'] || (!$records && ($route['include_child_entities'] || $route['asset_types'] !== [$type]))
+            || ($records && $type !== 'Computer')
             || (int) $route['glpi_b_target_entity_id'] !== (int) $pair['entity_id'] || $route['glpi_b_target_entity_id'] === ''
             || (empty($pair['identity_basis']) ? trim((string) $computer->fields['serial']) !== $pair['serial']
                 : self::identity($computer->fields) !== json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['a']) || !$link || count($links) !== 1
@@ -457,13 +460,20 @@ final class AgentTask
             if (!$item->can((int) $pair['local_id'], READ) || !\Session::haveAccessToEntity((int) $pair['local_entity'])) { throw new \RuntimeException('Asset unavailable.'); }
             $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
             $route = EntitySyncRoute::find($routeId);
+            $records = ($scope['connection']['agent_transport'] ?? 'adapter') === 'rest_records';
+            if ($records) {
+                $match = EntitySyncRoute::matchAsset($type, (string) $pair['local_entity'], EntitySyncRoute::strictEntityPath((int) $pair['local_entity']), $pair['connection_id']);
+                if ($type !== 'Computer' || $match['conflicts'] !== [] || count($match['matches']) !== 1
+                    || $match['matches'][0]['route']['id'] !== $routeId) { throw new \RuntimeException('A unique current Computer route is required.'); }
+                $route = $match['matches'][0]['route'];
+            }
             if ((int) $pair['observed_at'] < time() - 300 || empty($snapshot['serial'])
                 || $snapshot['serial'] !== trim((string) $scope['asset']['serial'])
                 || ($snapshot['items_id'] ?? $snapshot['computer_id'] ?? null) !== (int) $pair['computer_id'] || ($snapshot['entity_id'] ?? null) !== (int) $pair['entity_id']
                 || ($snapshot['itemtype'] ?? 'Computer') !== $type
-                || !$route || !$route['active'] || $route['include_child_entities'] || $route['asset_types'] !== [$type]
+                || !$route || !$route['active'] || (!$records && ($route['include_child_entities'] || $route['asset_types'] !== [$type]))
                 || $route['glpi_b_connection_id'] !== $pair['connection_id'] || $route['glpi_b_target_entity_id'] === ''
-                || (int) $route['glpi_a_source_entity_id'] !== (int) $pair['local_entity']
+                || (!$records && (int) $route['glpi_a_source_entity_id'] !== (int) $pair['local_entity'])
                 || (int) $route['glpi_b_target_entity_id'] !== (int) $pair['entity_id']) {
                 throw new \RuntimeException('Fresh independent inspection, matching serial and an exact single-type route are required.');
             }
@@ -2074,7 +2084,7 @@ final class AgentTask
                 $nameContext = RestWork::assertNameSource($pair, $restBody, $nameEvidence);
                 if ($nameContext['fingerprint'] !== $fingerprint) { throw new \RuntimeException('Name Both final fingerprint changed.'); }
             }
-            if (in_array($restBody['version'] ?? 0, [7, 8], true)) {
+            if (in_array($restBody['version'] ?? 0, [7, 8, 10], true)) {
                 $lockedAsset = AgentInbox::one('SELECT * FROM `glpi_computers` WHERE `id` = ' . (int) $pair['local_id'] . ' FOR UPDATE');
                 RestWork::assertSource($pair, $restBody['source_hash'], $lockedAsset ?? []);
             }

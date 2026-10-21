@@ -64,24 +64,33 @@ final class RestSettings extends \CommonDBTM
         }
         $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id',
             'route_id', 'source_entity', 'target_entity', 'itemtype', 'mappings'];
-        if (($body['version'] ?? null) === 2) { $keys = array_merge($keys, ['revision', 'enabled']); }
+        if (in_array($body['version'] ?? null, [2, 3], true)) { $keys = array_merge($keys, ['revision', 'enabled']); }
+        if (($body['version'] ?? null) === 3) { $keys = array_merge($keys, ['include_child_entities', 'asset_types']); }
         if (!is_array($body) || array_diff(array_keys($body), $keys) || array_diff($keys, array_keys($body))
-            || (($body['version'] ?? null) === 2 && strlen($json) > 16384) || !hash_equals(TaskExecutor::hash($body), $hash) || !in_array($body['version'] ?? null, [1, 2], true)
+            || (in_array($body['version'] ?? null, [2, 3], true) && strlen($json) > 16384) || !hash_equals(TaskExecutor::hash($body), $hash) || !in_array($body['version'] ?? null, [1, 2, 3], true)
             || !preg_match('/^[a-f0-9]{32}$/D', $body['id'] ?? '') || $body['itemtype'] !== 'Computer'
             || !is_int($body['source_entity']) || $body['source_entity'] < 0
             || !is_int($body['target_entity']) || $body['target_entity'] < 0
             || !is_string($body['route_id']) || $body['route_id'] === '' || strlen($body['route_id']) > 255
             || ($body['mappings'] !== [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a']]
-                && !($body['version'] === 2 && ($body['enabled'] ?? null) === false && $body['mappings'] === []))) {
+                && !(in_array($body['version'], [2, 3], true) && ($body['enabled'] ?? null) === false && $body['mappings'] === []))) {
             throw new \RuntimeException('Unsupported immutable REST settings.');
         }
-        if ($body['version'] === 2) {
+        if (in_array($body['version'], [2, 3], true)) {
             if (!is_int($body['revision']) || $body['revision'] < 1 || !is_bool($body['enabled'])) { throw new \RuntimeException('Invalid REST settings revision.'); }
             foreach (['installation', 'registration', 'generation'] as $key) {
                 if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $body[$key])) { throw new \RuntimeException('Invalid REST settings binding.'); }
             }
             if (!is_string($body['connection_id']) || $body['connection_id'] === '' || strlen($body['connection_id']) > 255
                 || preg_match('/[\x00-\x20\x7f]/', $body['connection_id'])) { throw new \RuntimeException('Invalid REST connection.'); }
+        }
+        if ($body['version'] === 3) {
+            $types = $body['asset_types'];
+            if (!is_bool($body['include_child_entities']) || !is_array($types) || !array_is_list($types)
+                || count(array_filter($types, 'is_string')) !== count($types)
+                || array_diff($types, ['Computer', 'Monitor', 'Peripheral', 'Printer', 'Phone', 'NetworkEquipment'])) { throw new \RuntimeException('Invalid REST route types.'); }
+            $canonical = array_values(array_unique($types)); sort($canonical, SORT_STRING);
+            if ($canonical !== $types || ($body['enabled'] && !in_array('Computer', $types, true))) { throw new \RuntimeException('Unsupported REST route types.'); }
         }
         return $body;
     }
@@ -105,7 +114,7 @@ final class RestSettings extends \CommonDBTM
         global $DB;
         $head = Outbox::one('SELECT * FROM `' . self::HEAD . '` WHERE `scope_key` = ' . $DB->quote(self::scope($body)));
         if (!$head) { return $body['version'] === 1 && !self::history($body); }
-        return in_array($body['version'], [2, 4], true) && $body['enabled'] && $head['settings_id'] === $body['id']
+        return in_array($body['version'], [2, 3, 4], true) && $body['enabled'] && $head['settings_id'] === $body['id']
             && (int) $head['revision'] === $body['revision'];
     }
 
@@ -115,7 +124,7 @@ final class RestSettings extends \CommonDBTM
         $where = [];
         foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) { $where[] = '`' . $key . '` = ' . $DB->quote($body[$key]); }
         return Outbox::one('SELECT `id` FROM `' . self::getTable() . '` WHERE ' . implode(' AND ', $where)
-            . ' AND JSON_EXTRACT(`body`, \'$.version\') IN (2, 4) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
+            . ' AND JSON_EXTRACT(`body`, \'$.version\') IN (2, 3, 4) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
     }
 
     public static function authorize(array $body): array
@@ -139,7 +148,7 @@ final class RestSettings extends \CommonDBTM
         $fields = ['settings_id' => $body['id'], 'hash' => $input['hash'], 'body' => $input['body'],
             'binding' => self::binding($settings, $body['version']), 'entities_id' => $body['target_entity']];
         foreach (['connection_id', 'registration', 'generation', 'installation'] as $key) { $fields[$key] = $body[$key]; }
-        if (in_array($body['version'], [2, 4], true)) { return $this->activate($body, $fields); }
+        if (in_array($body['version'], [2, 3, 4], true)) { return $this->activate($body, $fields); }
         global $DB;
         $old = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['id']));
         if (!$old) {
@@ -166,6 +175,10 @@ final class RestSettings extends \CommonDBTM
                 $scope = self::scope($body);
                 $head = Outbox::one('SELECT * FROM `' . self::HEAD . '` WHERE `scope_key` = ' . $DB->quote($scope) . ' FOR UPDATE');
                 if (!$head && self::history($body)) { throw new \RuntimeException('REST settings head missing; repair required.'); }
+                if ($head) {
+                    $current = Outbox::one('SELECT `body`, `hash` FROM `' . self::getTable() . '` WHERE `settings_id` = ' . $DB->quote($head['settings_id']));
+                    if (!$current || self::decode($current['body'], $current['hash'])['version'] > $body['version']) { throw new \RuntimeException('REST settings version downgrade denied.'); }
+                }
                 if ($head && (int) $head['revision'] > $body['revision']) { throw new \RuntimeException('REST settings superseded.'); }
                 if ($head && (int) $head['revision'] === $body['revision'] && $head['settings_id'] !== $body['id']) { throw new \RuntimeException('REST settings revision conflict.'); }
                 $old = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['id']));

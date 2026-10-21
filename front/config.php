@@ -333,15 +333,15 @@ echo '<tr class="agent-adapter-setting"><td><label for="wake_enabled">Optional H
 echo '<tr class="agent-adapter-setting"><th><label for="agent_api_url">GLPI B Agent API URL</label></th><td><input id="agent_api_url" name="agent_api_url" size="60" value="'
     . $html($connection['agent_api_url'] ?? '') . '"></td></tr>';
 echo '<tr><th><label for="agent_transport">Agent transport</label></th><td><select id="agent_transport" name="agent_transport">';
-foreach (['adapter' => 'Agent adapter / legacy REST opt-in', 'rest_records' => 'A-driven REST records / settings v2'] as $value => $label) {
+foreach (['adapter' => 'Agent adapter / legacy REST opt-in', 'rest_records' => 'A-driven REST records'] as $value => $label) {
     echo '<option value="' . $value . '"' . (($connection['agent_transport'] ?? 'adapter') === $value ? ' selected' : '') . '>' . $label . '</option>';
 }
 echo '</select></td></tr>';
-echo '<tr><th><label for="agent_rest_pair">Name REST confirmed pair ID</label></th><td><input id="agent_rest_pair" name="agent_rest_pair" size="36" value="'
+echo '<tr><th><label for="agent_rest_pair">Legacy v7 Name pair ID</label></th><td><input id="agent_rest_pair" name="agent_rest_pair" size="36" value="'
     . $html($connection['agent_rest_pair'] ?? '') . '"></td></tr>';
-echo '<tr><th><label for="agent_rest_pairs">Name REST v8 batch pair IDs</label></th><td><textarea id="agent_rest_pairs" name="agent_rest_pairs" rows="4" cols="36">'
+echo '<tr><th><label for="agent_rest_pairs">Legacy v8 and Name Both pair IDs</label></th><td><textarea id="agent_rest_pairs" name="agent_rest_pairs" rows="4" cols="36">'
     . $html(implode("\n", $connection['agent_rest_pairs'] ?? [])) . '</textarea></td></tr>';
-echo '<tr><th><label for="agent_rest_url">Name REST API URL</label></th><td><input id="agent_rest_url" name="agent_rest_url" size="60" value="'
+echo '<tr><th><label for="agent_rest_url">GLPI B REST API URL</label></th><td><input id="agent_rest_url" name="agent_rest_url" size="60" value="'
     . $html($connection['agent_rest_url'] ?? '') . '"></td></tr>';
 foreach (['agent_app_token' => 'GLPI B app token', 'agent_user_token' => 'GLPI B user API token'] as $key => $label) {
     echo '<tr><th><label for="' . $key . '">' . $label . '</label></th><td><input type="password" id="' . $key . '" name="' . $key

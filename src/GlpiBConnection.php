@@ -334,7 +334,7 @@ final class GlpiBConnection
         try {
             if (class_exists('\Config') && method_exists('\Config', 'deleteConfigurationValues')) {
                 \Config::deleteConfigurationValues(self::CONTEXT, array_merge(
-                    [self::CONNECTIONS_KEY],
+                    [self::CONNECTIONS_KEY, 'rest_work_dispatch_cursor_v1'],
                     array_keys(self::OLD_KEYS)
                 ));
             }

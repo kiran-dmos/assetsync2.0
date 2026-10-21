@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace GlpiPlugin\Assetsync20;
 
-/** One selected pair uses durable stock REST records through the ordinary A queue. */
+/** Confirmed routes use durable stock REST records through the ordinary A queue. */
 final class RestWork
 {
     private const RESOURCE = 'GlpiPlugin%5CAssetsync20agent%5CRestWork';
     private const SETTINGS = 'GlpiPlugin%5CAssetsync20agent%5CRestSettings';
+    private const DISPATCH_CURSOR = 'rest_work_dispatch_cursor_v1';
     private static array $batches = [];
     private static bool $configuring = false;
 
@@ -77,6 +78,10 @@ final class RestWork
         $connections = array_filter(GlpiBConnection::loadAll(false, false), static fn (array $c): bool => GlpiBConnection::isAgent($c) && ($c['agent_transport'] ?? 'adapter') === 'rest_records');
         if ($connections === [] || !$DB->tableExists(AgentTask::BINDINGS)) { return; }
         $state = self::settingsState(); $before = $state;
+        $conflicted = [];
+        foreach (EntitySyncRoute::findConfigConflicts() as $conflict) {
+            if ($conflict['itemtype'] === 'Computer') { foreach ($conflict['route_ids'] as $id) { $conflicted[$id] = true; } }
+        }
         foreach ($connections as $connection) {
             if (!$connection['active']) { continue; }
             $binding = AgentTask::binding($connection['id']);
@@ -94,7 +99,7 @@ final class RestWork
                     && !isset($routes[$old['route_id']])) { $routes[$old['route_id']] = null; }
             }
             foreach ($routes as $routeId => $route) {
-                $base = ['version' => 2, 'installation' => $binding['installation'], 'registration' => $registration['id'],
+                $base = ['version' => 3, 'installation' => $binding['installation'], 'registration' => $registration['id'],
                     'generation' => $registration['generation'], 'connection_id' => $connection['id'], 'route_id' => (string) $routeId];
                 $key = self::settingsKey($base);
                 $old = isset($state[$key]) ? json_decode($state[$key]['body'], true, 32, JSON_THROW_ON_ERROR) : null;
@@ -109,15 +114,22 @@ final class RestWork
                         $mappings = [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => $row['source_of_truth']]];
                     }
                 }
-                // Version3 is reserved for the paused scope slice. Version4 adds only native Name Both.
-                if (($mappings[0]['source_of_truth'] ?? '') === 'both' || ($route === null && ($old['version'] ?? 0) === 4)) {
+                // A route that reached Both cannot silently fall back to A authority, even at a higher revision.
+                $both = ($mappings[0]['source_of_truth'] ?? '') === 'both' || ($old['version'] ?? 0) === 4;
+                if ($both) {
                     $base['version'] = 4;
                     $base += ['include_child_entities' => false, 'asset_types' => ['Computer']];
+                    if (($mappings[0]['source_of_truth'] ?? '') !== 'both') { $mappings = []; }
+                } else {
+                    $types = $route ? $route['asset_types'] : ($old['asset_types'] ?? ['Computer']);
+                    sort($types, SORT_STRING);
+                    $base += ['include_child_entities' => $route ? $route['include_child_entities'] : ($old['include_child_entities'] ?? false), 'asset_types' => $types];
                 }
                 $base += ['source_entity' => $route ? (int) $route['glpi_a_source_entity_id'] : $old['source_entity'],
                     'target_entity' => $route ? (int) $route['glpi_b_target_entity_id'] : $old['target_entity'],
                     'itemtype' => 'Computer', 'mappings' => $mappings,
-                    'enabled' => $route !== null && $route['active'] && !$route['include_child_entities'] && $route['asset_types'] === ['Computer']
+                    'enabled' => $route !== null && $route['active'] && in_array('Computer', $route['asset_types'], true) && !isset($conflicted[$routeId])
+                        && (!$both || (!$route['include_child_entities'] && $route['asset_types'] === ['Computer']))
                         && $route['glpi_b_target_entity_id'] !== '' && $route['glpi_a_source_entity_id'] !== '' && $mappings !== []];
                 $effective = AgentTask::hash($base);
                 if (($state[$key]['effective'] ?? '') === $effective) { continue; }
@@ -137,8 +149,8 @@ final class RestWork
         $chosen = null;
         self::configure(static function () use (&$chosen): void {
             $state = self::settingsState();
-            uasort($state, static fn (array $a, array $b): int => $a['next'] <=> $b['next']);
-            foreach ($state as $key => &$entry) {
+            $due = [];
+            foreach ($state as $key => $entry) {
                 if (!$entry['pending'] || $entry['next'] > time()) { continue; }
                 $body = json_decode($entry['body'], true, 32, JSON_THROW_ON_ERROR);
                 $connection = AgentInbox::connection($body['connection_id']);
@@ -146,11 +158,19 @@ final class RestWork
                 $binding = AgentTask::binding($connection['id']);
                 if (!$binding || $binding['registration'] !== $body['registration'] || $binding['installation'] !== $body['installation']
                     || AgentTask::registration($binding)['generation'] !== $body['generation']) { continue; }
-                $entry['next'] = time() + 10;
-                $chosen = ['key' => $key, 'entry' => $entry, 'body' => $body, 'connection' => $connection];
-                self::storeSettings($state);
-                break;
-            } unset($entry);
+                $due[$connection['id']][] = ['key' => $key, 'entry' => $entry, 'body' => $body, 'connection' => $connection];
+            }
+            if ($due === []) { return; }
+            ksort($due, SORT_STRING);
+            $cursor = \Config::getConfigurationValues(GlpiBConnection::CONTEXT, ['rest_settings_cursor'])['rest_settings_cursor'] ?? '';
+            $id = (string) array_key_first($due);
+            foreach (array_keys($due) as $candidate) { if (strcmp((string) $candidate, $cursor) > 0) { $id = (string) $candidate; break; } }
+            usort($due[$id], static fn (array $a, array $b): int => [$a['entry']['next'], $a['key']] <=> [$b['entry']['next'], $b['key']]);
+            $chosen = $due[$id][0]; $key = $chosen['key'];
+            $state[$key]['failures'] = min(4, ($state[$key]['failures'] ?? 0) + 1);
+            $state[$key]['next'] = time() + min(60, 10 * (2 ** ($state[$key]['failures'] - 1)));
+            self::storeSettings($state);
+            self::saveConfiguration(['rest_settings_cursor' => $id]);
         });
         if ($chosen === null || hrtime(true) + 1_000_000_000 >= $deadline) { return; }
         $connection = AgentInbox::connection($chosen['connection']['id']);
@@ -168,6 +188,7 @@ final class RestWork
                 $state = self::settingsState();
                 if (($state[$chosen['key']]['hash'] ?? '') !== $chosen['entry']['hash']) { return; }
                 $state[$chosen['key']]['pending'] = !$valid;
+                if ($valid) { $state[$chosen['key']]['failures'] = 0; }
                 $state[$chosen['key']]['dispatch'] = $diagnostic;
                 self::storeSettings($state);
                 if (!$valid) { return; }
@@ -249,7 +270,7 @@ final class RestWork
         self::saveReservation($task, $context);
         if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
         $client = new RestSession($connection, $deadline);
-        $lookup = self::RESOURCE . '?range=0-0&get_hateoas=0&searchText%5Bcompiler%5D=9&searchText%5Bwork_id%5D=' . $body['id'];
+        $lookup = self::RESOURCE . '?range=0-0&get_hateoas=0&searchText%5Bcompiler%5D=9&searchText%5Bwork_id%5D=' . $body['id'] . '&rest_entity=' . $body['entity_id'];
         try {
             $records = null;
             if ($context['rest_sent'] || $body['expires'] < time()) {
@@ -325,11 +346,22 @@ final class RestWork
         }
     }
 
-    public static function catalog(string $connectionId): array
+    public static function catalog(string $connectionId, ?int $entity = null): array
     {
         global $DB;
+        if ($entity === null) {
+            $entities = [];
+            foreach (EntitySyncRoute::loadAll(true) as $route) {
+                if ($route['active'] && $route['glpi_b_connection_id'] === $connectionId && $route['glpi_b_target_entity_id'] !== ''
+                    && in_array('Computer', $route['asset_types'], true)) { $entities[(int) $route['glpi_b_target_entity_id']] = true; }
+            }
+            if (count($entities) !== 1) { return ['success' => false, 'fields' => [], 'message' => 'Select one target entity for scoped Computer metadata.']; }
+            $entity = (int) array_key_first($entities);
+        }
+        if ($entity < 0) { throw new \RuntimeException('Invalid metadata entity.'); }
         foreach ($DB->request(['FROM' => AgentTask::TABLE, 'WHERE' => ['connection_id' => $connectionId, 'state' => 'observed',
-            new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') = 9")], 'ORDER' => 'created_at DESC, id DESC', 'LIMIT' => 10]) as $task) {
+            new \Glpi\DBAL\QueryExpression("JSON_EXTRACT(`body`, '$.version') = 9 AND JSON_EXTRACT(`body`, '$.entity_id') = " . $entity
+                . " AND JSON_UNQUOTE(JSON_EXTRACT(`body`, '$.itemtype')) = 'Computer'")], 'ORDER' => 'created_at DESC, id DESC', 'LIMIT' => 10]) as $task) {
             $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
             $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
             $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
@@ -346,16 +378,18 @@ final class RestWork
         if (!is_object($DB) || !method_exists($DB, 'tableExists') || !$DB->tableExists(AgentTask::PAIRS) || !$DB->tableExists(AgentTask::TABLE)) { return false; }
         $pair = AgentTask::pair($connection['id'], $type, $id);
         if (!$pair) { return false; }
+        if (($connection['agent_transport'] ?? 'adapter') === 'rest_records') { return true; }
         if (($connection['agent_rest_pair'] ?? '') === $pair['id'] || in_array($pair['id'], $connection['agent_rest_pairs'] ?? [], true)) { return true; }
         $task = AgentTask::outstanding($connection['id'], $pair);
-        return $task && in_array(json_decode($task['body'], true)['version'] ?? 0, [7, 8, 11], true);
+        return $task && in_array(json_decode($task['body'], true)['version'] ?? 0, [7, 8, 10, 11], true);
     }
 
     private static function context(array $pair, ?array $guarded = null): array
     {
         $scope = AgentTask::scope($pair);
         $connection = $scope['connection'];
-        if ($pair['itemtype'] !== 'Computer' || (($connection['agent_rest_pair'] ?? '') !== $pair['id']
+        $records = ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
+        if ($pair['itemtype'] !== 'Computer' || (!$records && ($connection['agent_rest_pair'] ?? '') !== $pair['id']
                 && !in_array($pair['id'], $connection['agent_rest_pairs'] ?? [], true))
             || !RestSession::validUrl($connection['agent_rest_url'] ?? '')) { throw new \RuntimeException('Selected REST pair is unavailable.'); }
         FieldMapping::endRunCache();
@@ -375,13 +409,20 @@ final class RestWork
             'mappings' => [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a']]];
         $settings = ['version' => 1, 'id' => substr(AgentTask::hash($settings), 0, 32)] + $settings;
         $entry = self::settingsState()[self::settingsKey($settings)] ?? null;
-        if ($entry && (($connection['agent_transport'] ?? 'adapter') !== 'rest_records' || !in_array($pair['id'], $connection['agent_rest_pairs'] ?? [], true))) {
-            throw new \RuntimeException('Retained v2 route requires REST records transport and explicit v8 pair opt-in. No protocol downgrade.');
+        if ($entry && !$records) {
+            throw new \RuntimeException('Retained versioned route requires REST records transport. No protocol downgrade.');
         }
-        if (($connection['agent_transport'] ?? 'adapter') === 'rest_records' && in_array($pair['id'], $connection['agent_rest_pairs'] ?? [], true)) {
+        if ($records) {
             if (!$entry) { throw new \RuntimeException('REST settings publication pending.'); }
             $settings = json_decode($entry['body'], true, 32, JSON_THROW_ON_ERROR);
             if (!$settings['enabled']) { throw new \RuntimeException('REST route is disabled or unsupported.'); }
+            if (!in_array($settings['version'], [3, 4], true)) { throw new \RuntimeException('Scoped REST settings publication pending.'); }
+            if ($settings['version'] === 3) {
+                if ($entry['pending']) { throw new \RuntimeException('REST settings publication pending.'); }
+                $route = $scope['route']; $types = $route['asset_types']; sort($types, SORT_STRING);
+                if ($settings['source_entity'] !== (int) $route['glpi_a_source_entity_id'] || $settings['target_entity'] !== (int) $pair['entity_id']
+                    || $settings['include_child_entities'] !== $route['include_child_entities'] || $settings['asset_types'] !== $types) { throw new \RuntimeException('REST source/target policy changed.'); }
+            } elseif ($scope['route']['include_child_entities'] || $scope['route']['asset_types'] !== ['Computer']) { throw new \RuntimeException('Name Both requires its exact single-type route.'); }
         }
         if ($row['source_of_truth'] === 'both') {
             if (($settings['version'] ?? 0) !== 4 || $settings['mappings'][0]['source_of_truth'] !== 'both') { throw new \RuntimeException('Name Both settings4 publication pending.'); }
@@ -451,7 +492,7 @@ final class RestWork
     {
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
         $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
-        return ($body['version'] ?? 0) === 8 && ($result['outcome'] ?? '') === 'stale'
+        return in_array($body['version'] ?? 0, [8, 10], true) && ($result['outcome'] ?? '') === 'stale'
             && ($result['reason'] ?? '') === 'settings_superseded' && ($result['changed'] ?? null) === [];
     }
 
@@ -476,7 +517,7 @@ final class RestWork
             $task = AgentTask::outstanding($pair['connection_id'], $pair);
             if ($task) {
                 $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-                if (!in_array($body['version'], [7, 8, 11], true)) { throw new \RuntimeException('Resolve the retained agent operation before switching this pair to REST records.'); }
+                if (!in_array($body['version'], [7, 8, 10, 11], true)) { throw new \RuntimeException('Resolve the retained agent operation before switching this pair to REST records.'); }
                 if ($task['result'] === '{}') {
                     if ($body['version'] === 11) {
                         if (self::neverReserved($task) && ($body['source_hash'] !== $context['source_hash']
@@ -488,7 +529,7 @@ final class RestWork
                 }
                 $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
                 if ($body['version'] === 11) { NameBoth::finish($task, $job, $pair, $context, $body, $result); return; }
-                if (self::superseded($task) && $context['settings']['version'] === 2 && $body['settings_id'] !== $context['settings']['id']) {
+                if (self::superseded($task) && in_array($context['settings']['version'], [2, 3], true) && $body['settings_id'] !== $context['settings']['id']) {
                     AgentInbox::sql('START TRANSACTION');
                     try {
                         if (!AssetSyncQueue::owns($job)) { throw new \RuntimeException('REST superseded queue claim changed.'); }
@@ -533,8 +574,9 @@ final class RestWork
                 'settings_hash' => AgentTask::hash($context['settings']), 'pair_id' => $pair['id'], 'itemtype' => 'Computer',
                 'items_id' => (int) $pair['computer_id'], 'entity_id' => (int) $pair['entity_id'], 'identity' => $context['identity'],
                 'name' => (string) $context['asset']['name'], 'source_hash' => $context['source_hash'], 'expires' => time() + 300];
-            if (in_array($pair['id'], $context['connection']['agent_rest_pairs'] ?? [], true)) {
-                $body['version'] = 8;
+            if (($context['connection']['agent_transport'] ?? 'adapter') === 'rest_records' || in_array($pair['id'], $context['connection']['agent_rest_pairs'] ?? [], true)) {
+                $body['version'] = $context['settings']['version'] === 3 ? 10 : 8;
+                if ($body['version'] === 10) { $body['source_asset_entity'] = (int) $context['asset']['entities_id']; }
                 if (isset($context['evidence'])) {
                     $body['version'] = 11;
                     unset($body['name']);
@@ -745,6 +787,83 @@ final class RestWork
         }
     }
 
+    /** Advance durable selection only. A cursor is never permission to reserve or send its task. */
+    private static function dispatchCandidate(int $deadline, bool $first): ?array
+    {
+        global $DB;
+        if (hrtime(true) + 2_000_000_000 >= $deadline || !AgentWake::transactionIdle() || AssetUuidOperation::hasAssetLocks()) { return null; }
+        $lock = $DB->quote('assetsync20:dispatch:' . AssetSyncLockName::databaseHash($DB));
+        if ((int) (AgentInbox::one('SELECT COALESCE(IS_USED_LOCK(' . $lock . ') = CONNECTION_ID(), 0) AS owned')['owned'] ?? 1) !== 0) { return null; }
+        if ((int) (AgentInbox::one('SELECT GET_LOCK(' . $lock . ', 0) AS acquired')['acquired'] ?? 0) !== 1) { return null; }
+        try {
+            if (hrtime(true) + 2_000_000_000 >= $deadline) { return null; }
+            // Idle autocommit plus the selection lock gives each selector a fresh Config read.
+            $raw = \Config::getConfigurationValues(GlpiBConnection::CONTEXT, [self::DISPATCH_CURSOR])[self::DISPATCH_CURSOR] ?? null;
+            $cursor = $raw === null ? ['after' => null, 'ceiling' => null] : json_decode($raw, true, 32, JSON_THROW_ON_ERROR);
+            if (!is_array($cursor) || array_keys($cursor) !== ['after', 'ceiling']) { throw new \RuntimeException('REST dispatch cursor unavailable.'); }
+            foreach ($cursor as $point) {
+                if ($point !== null && (!is_array($point) || array_keys($point) !== ['created_at', 'id']
+                    || !is_int($point['created_at']) || !is_string($point['id']) || strlen($point['id']) > 32)) {
+                    throw new \RuntimeException('REST dispatch cursor unavailable.');
+                }
+            }
+            if (($cursor['ceiling'] === null && $cursor['after'] !== null)
+                || ($cursor['after'] !== null && [$cursor['after']['created_at'], $cursor['after']['id']] > [$cursor['ceiling']['created_at'], $cursor['ceiling']['id']])) {
+                throw new \RuntimeException('REST dispatch cursor order unavailable.');
+            }
+            // Only the first selection may wrap a sweep completed in an earlier pass.
+            for ($wrap = 0; $wrap < 2; $wrap++) {
+                $where = '`slot` IS NOT NULL AND `state` = \'accepted\' AND `result` = \'{}\'';
+                $bodyJson = "(CASE WHEN JSON_VALID(`body`) THEN `body` ELSE '{}' END)";
+                $contextJson = "(CASE WHEN JSON_VALID(`context`) THEN `context` ELSE '{}' END)";
+                $where .= ' AND JSON_EXTRACT(' . $bodyJson . ', \'$.version\') IN (7, 8, 10, 11)'
+                    . ' AND COALESCE(JSON_EXTRACT(' . $contextJson . ', \'$.rest_until\'), 0) <= ' . time()
+                    . ' AND COALESCE(JSON_EXTRACT(' . $contextJson . ', \'$.rest_next\'), 0) <= ' . time();
+                if ($cursor['ceiling'] === null) {
+                    $last = AgentInbox::one('SELECT `created_at`, `id` FROM `' . AgentTask::TABLE . '` WHERE ' . $where . ' ORDER BY `created_at` DESC, `id` DESC LIMIT 1');
+                    if (!$last) { return null; }
+                    $cursor['ceiling'] = ['created_at' => (int) $last['created_at'], 'id' => $last['id']];
+                }
+                $ceiling = $cursor['ceiling'];
+                $where .= ' AND (`created_at` < ' . $ceiling['created_at'] . ' OR (`created_at` = ' . $ceiling['created_at'] . ' AND `id` <= ' . $DB->quote($ceiling['id']) . '))';
+                if ($cursor['after'] !== null) {
+                    $after = $cursor['after'];
+                    $where .= ' AND (`created_at` > ' . $after['created_at'] . ' OR (`created_at` = ' . $after['created_at'] . ' AND `id` > ' . $DB->quote($after['id']) . '))';
+                }
+                $task = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE ' . $where . ' ORDER BY `created_at`, `id` LIMIT 1');
+                $cursor = $task ? ['after' => ['created_at' => (int) $task['created_at'], 'id' => $task['id']], 'ceiling' => $ceiling]
+                    : ['after' => null, 'ceiling' => null];
+                if ($task || !$first) { break; }
+            }
+            $json = json_encode($cursor, JSON_THROW_ON_ERROR);
+            \Config::setConfigurationValues(GlpiBConnection::CONTEXT, [self::DISPATCH_CURSOR => $json]);
+            if ((\Config::getConfigurationValues(GlpiBConnection::CONTEXT, [self::DISPATCH_CURSOR])[self::DISPATCH_CURSOR] ?? null) !== $json) {
+                throw new \RuntimeException('REST dispatch cursor persistence failed.');
+            }
+            return $task;
+        } finally {
+            if ((int) (AgentInbox::one('SELECT RELEASE_LOCK(' . $lock . ') AS released')['released'] ?? 0) !== 1) {
+                throw new \RuntimeException('REST dispatch selection lock release unavailable.');
+            }
+        }
+    }
+
+    /** Malformed retained dispatch evidence is held byte-for-byte, not repaired or coerced. */
+    private static function dispatchReady(array $task, array $body): bool
+    {
+        try {
+            $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            return in_array($body['version'] ?? null, [7, 8, 10, 11], true) && ($body['id'] ?? null) === $task['id']
+                && ($body['connection_id'] ?? null) === $task['connection_id'] && AgentTask::hash($body) === $task['hash']
+                && is_string($body['pair_id'] ?? null) && ($task['slot'] ?? null) === 'pair:' . $body['pair_id']
+                && ($body['version'] === 7 || (is_string($body['batch_id'] ?? null) && preg_match('/^[a-f0-9]{32}$/D', $body['batch_id'])))
+                && is_array($context) && is_bool($context['rest_sent'] ?? null) && is_int($context['rest_until'] ?? null)
+                && is_int($context['rest_next'] ?? null) && $context['rest_until'] <= time() && $context['rest_next'] <= time()
+                && is_string($context['rest_lease'] ?? null) && ($context['rest_lease'] === '' || preg_match('/^[a-f0-9]{32}$/D', $context['rest_lease']))
+                && is_array($context['settings'] ?? null);
+        } catch (\JsonException | \TypeError) { return false; }
+    }
+
     /** Only invoked after the outer run and asset locks are released. */
     public static function sendPending(int $deadline): void
     {
@@ -757,14 +876,26 @@ final class RestWork
         if (hrtime(true) + 2_000_000_000 >= $deadline) { return; }
         self::sendRead($deadline);
         if (hrtime(true) + 2_000_000_000 >= $deadline) { return; }
-        $task = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE `slot` IS NOT NULL AND `state` = \'accepted\' AND `result` = \'{}\'
-            AND JSON_EXTRACT(`body`, \'$.version\') IN (7, 8, 11) AND COALESCE(JSON_EXTRACT(`context`, \'$.rest_until\'), 0) <= ' . time()
-            . ' AND COALESCE(JSON_EXTRACT(`context`, \'$.rest_next\'), 0) <= ' . time() . ' ORDER BY `created_at`, `id` LIMIT 1');
-        if (!$task) { return; }
-        $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-        if (in_array($body['version'], [8, 11], true)) { self::sendBatch($task, $body, $deadline); return; }
+        for ($examined = 0; $examined < 32 && hrtime(true) + 2_000_000_000 < $deadline; $examined++) {
+            $task = self::dispatchCandidate($deadline, $examined === 0);
+            if (!$task) { return; }
+            if (hrtime(true) + 2_000_000_000 >= $deadline) { return; }
+            try { $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR); }
+            catch (\JsonException) { continue; }
+            if (!is_array($body) || !self::dispatchReady($task, $body)) { continue; }
+            $connection = AgentInbox::connection($task['connection_id']);
+            if (!$connection || ($body['version'] === 10 && ($connection['agent_transport'] ?? 'adapter') !== 'rest_records')) { continue; }
+            if (in_array($body['version'], [8, 10, 11], true)) {
+                if (self::sendBatch($task, $body, $deadline)) { return; }
+            } elseif (self::sendSingle($task, $body, $deadline)) { return; }
+        }
+    }
+
+    private static function sendSingle(array $task, array $body, int $deadline): bool
+    {
+        global $DB;
         $pair = AgentTask::byId($task['connection_id'], $body['pair_id']);
-        if (!$pair) { return; }
+        if (!$pair) { return false; }
         $reserved = null;
         AssetUuidOperation::withAssetLock('Computer', (int) $pair['local_id'], static function () use ($pair, $task, &$reserved): void {
             self::context($pair);
@@ -775,10 +906,11 @@ final class RestWork
                 ['id' => $task['id'], 'context' => $task['context'], 'state' => 'accepted']) || $DB->affectedRows() !== 1) { return; }
             $reserved = $context;
         });
-        if ($reserved === null || AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) { return; }
+        if ($reserved === null) { return false; }
+        if (AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) { return true; }
         $task['context'] = json_encode($reserved, JSON_THROW_ON_ERROR);
         $connection = GlpiBConnection::find($task['connection_id']);
-        if (!$connection || !$connection['active']) { return; }
+        if (!$connection || !$connection['active']) { return true; }
         if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
         $client = new RestSession($connection, $deadline);
         $reserved['rest_state'] = 'unknown';
@@ -791,7 +923,7 @@ final class RestWork
                     'body' => json_encode($settings, JSON_THROW_ON_ERROR)]);
                 $valid = $response['status'] === 201 && is_int($response['body']['id'] ?? null) && $response['body']['id'] > 0;
                 self::diagnose($reserved, $client, 'settings_post', $valid);
-                if (!$valid) { return; }
+                if (!$valid) { return true; }
                 $receipts[$receiptKey] = $response['body']['id'];
                 \Config::setConfigurationValues(GlpiBConnection::CONTEXT, ['rest_settings_receipts' => json_encode($receipts, JSON_THROW_ON_ERROR)]);
             }
@@ -799,13 +931,13 @@ final class RestWork
             if ($reserved['rest_sent'] || $body['expires'] < time()) {
                 // A failed GET is unknown, never evidence that a previous POST was absent.
                 $record = self::lookup($client, $body['id'], $reserved);
-                if ($record === null) { return; }
+                if ($record === null) { return true; }
             }
             if ($record === [] && $body['expires'] < time()) {
                 $reserved['rest_state'] = 'expired';
                 self::saveReservation($task, $reserved, ['outcome' => 'stale', 'changed' => []]);
                 $DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']);
-                return;
+                return true;
             }
             if ($record === null || $record === [] || ($record['state'] ?? '') === 'accepted') {
                 $reserved['rest_sent'] = true;
@@ -826,7 +958,7 @@ final class RestWork
                 elseif ($record !== null) {
                     $reserved['rest_error'] = ['phase' => 'work_get', 'status' => 200, 'error' => 'invalid_response', 'at' => time()];
                 }
-                return;
+                return true;
             }
             $reserved['rest_state'] = in_array($record['state'] ?? '', ['accepted', 'executing', 'expired'], true)
                 ? $record['state'] : 'unknown';
@@ -835,13 +967,13 @@ final class RestWork
                 $result = json_decode($record['result'] ?? '{}', true, 32, JSON_THROW_ON_ERROR);
                 if ($result === []) {
                     if (($record['state'] ?? '') === 'expired') { $result = ['outcome' => 'stale', 'changed' => []]; }
-                    else { return; }
+                    else { return true; }
                 }
                 self::validateResult($body, $result);
             } catch (\Throwable) {
                 $reserved['rest_state'] = 'unknown';
                 $reserved['rest_error'] = ['phase' => 'result', 'status' => 200, 'error' => 'invalid_result', 'at' => time()];
-                return;
+                return true;
             }
             $reserved['rest_state'] = $result['outcome'];
             self::saveReservation($task, $reserved, $result);
@@ -854,6 +986,7 @@ final class RestWork
                 self::saveReservation($task, $reserved);
             }
         }
+        return true;
     }
 
     /** Keep the last failure even when a later GET successfully observes acceptance. */
@@ -923,7 +1056,7 @@ final class RestWork
         if (!in_array($result['outcome'] ?? '', ['verified', 'unchanged', 'stale', 'blocked', 'uncertain'], true)
             || !is_array($result['changed'] ?? null) || array_diff(array_keys($result['changed']), ['name'])) { throw new \RuntimeException('Invalid REST result.'); }
         if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) { return; }
-        if ($body['version'] === 8) {
+        if (in_array($body['version'], [8, 10], true)) {
             $timing = $result['timing'] ?? [];
             if (!is_int($timing['started_at'] ?? null) || !is_int($timing['finished_at'] ?? null)
                 || ($timing['within_deadline'] ?? null) !== true || $timing['started_at'] < $body['expires'] - 300
@@ -942,38 +1075,42 @@ final class RestWork
     }
 
     /** The existing task rows are the durable batch membership; all network work follows reservation. */
-    private static function sendBatch(array $first, array $body, int $deadline): void
+    private static function sendBatch(array $first, array $body, int $deadline): bool
     {
         global $DB;
         $members = iterator_to_array($DB->request(['FROM' => AgentTask::TABLE, 'WHERE' => ['connection_id' => $first['connection_id'],
             new \Glpi\DBAL\QueryExpression('JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.batch_id\')) = ' . $DB->quote($body['batch_id']))],
             'ORDER' => 'id ASC', 'LIMIT' => 5]));
-        if (count($members) > 4 || $members === []) { return; }
-        $expected = []; $entries = []; $client = null;
+        if (count($members) > 4 || $members === []) { return false; }
+        $expected = []; $entries = []; $client = null; $reservedAny = false;
         try {
             foreach ($members as $task) {
-                $member = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+                try { $member = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR); }
+                catch (\JsonException) { return false; }
+                if (!is_array($member)) { return false; }
                 foreach (['version', 'batch_id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash', 'entity_id'] as $key) {
-                    if (($member[$key] ?? null) !== $body[$key]) { throw new \RuntimeException('REST batch membership changed.'); }
+                    if (($member[$key] ?? null) !== ($body[$key] ?? null)) { return false; }
                 }
-                if (AgentTask::hash($member) !== $task['hash']) { throw new \RuntimeException('REST batch hash changed.'); }
+                if (AgentTask::hash($member) !== $task['hash']) { return false; }
                 $expected[$task['id']] = $task;
             }
             foreach ($expected as $task) {
                 if ($task['state'] !== 'accepted' || !$task['slot'] || $task['result'] !== '{}') { continue; }
                 $member = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+                if (!self::dispatchReady($task, $member) || hrtime(true) + 2_000_000_000 >= $deadline) { continue; }
                 $pair = AgentTask::byId($task['connection_id'], $member['pair_id']);
-                if (!$pair) { return; }
+                if (!$pair) { continue; }
                 $reserved = null;
-                AssetUuidOperation::withAssetLock('Computer', (int) $pair['local_id'], static function () use ($pair, $task, $member, &$reserved): void {
+                AssetUuidOperation::withAssetLock('Computer', (int) $pair['local_id'], static function () use ($pair, $task, $member, &$reserved, &$reservedAny): void {
                     global $DB;
                     $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                     $connection = AgentInbox::connection($pair['connection_id']);
-                    $historical = in_array($context['settings']['version'] ?? 1, [2, 4], true) || ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
+                    if ($member['version'] === 10 && (!$connection || ($connection['agent_transport'] ?? 'adapter') !== 'rest_records')) { return; }
+                    $historical = in_array($context['settings']['version'] ?? 1, [2, 3, 4], true) || ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
                     try {
                         $scope = self::context($pair);
                         if (AgentTask::hash($scope['settings']) !== $member['settings_hash']) { throw new \RuntimeException('REST settings changed before dispatch.'); }
-                        $sourceChanged = $member['version'] === 11 && $scope['source_hash'] !== $member['source_hash'];
+                        $sourceChanged = in_array($member['version'], [10, 11], true) && $scope['source_hash'] !== $member['source_hash'];
                         // Eligibility ignores bookkeeping; an immutable execution must still match its exact source.
                         $context['rest_observe_only'] = $sourceChanged;
                     } catch (\RuntimeException $error) {
@@ -981,10 +1118,11 @@ final class RestWork
                         // Changed rules can still collect original evidence, but never resend old commands.
                         $context['rest_observe_only'] = true;
                     }
-                    if ($member['version'] === 11 && empty($context['rest_sent']) && $context['rest_observe_only']) {
+                    if (in_array($member['version'], [10, 11], true) && empty($context['rest_sent']) && $context['rest_observe_only']) {
                         // Keep the stale slot, but let later batches advance without HTTP for this preparation.
                         $context['rest_next'] = time() + 10;
-                        self::deferUnsent($task, $context);
+                        if ($member['version'] === 11) { self::deferUnsent($task, $context); }
+                        else { self::saveReservation($task, $context); }
                         return;
                     }
                     $context['rest_reconcile_only'] = false;
@@ -998,23 +1136,23 @@ final class RestWork
                     if ($context['rest_until'] > time() || $context['rest_next'] > time()) { return; }
                     $context['rest_lease'] = bin2hex(random_bytes(16)); $context['rest_until'] = time() + 30;
                     if ($member['version'] === 11) {
-                        if (self::saveReservation($task, $context)) { $reserved = $context; }
+                        if (self::saveReservation($task, $context)) { $reserved = $context; $reservedAny = true; }
                         return;
                     }
                     if ($DB->update(AgentTask::TABLE, ['context' => json_encode($context, JSON_THROW_ON_ERROR)],
-                        ['id' => $task['id'], 'context' => $task['context'], 'state' => 'accepted', 'result' => '{}']) && $DB->affectedRows() === 1) { $reserved = $context; }
+                        ['id' => $task['id'], 'context' => $task['context'], 'state' => 'accepted', 'result' => '{}']) && $DB->affectedRows() === 1) { $reserved = $context; $reservedAny = true; }
                 });
                 if ($reserved === null) {
-                    if ($member['version'] === 11) { continue; }
-                    return;
+                    if (in_array($member['version'], [10, 11], true)) { continue; }
+                    return $reservedAny;
                 }
                 $task['context'] = json_encode($reserved, JSON_THROW_ON_ERROR);
                 $reserved['rest_state'] = 'unknown'; $reserved['rest_members'] = array_keys($expected);
                 $entries[$task['id']] = ['task' => $task, 'body' => $member, 'context' => $reserved];
             }
-            if ($entries === [] || AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) { return; }
+            if ($entries === [] || AssetUuidOperation::hasAssetLocks() || !AgentWake::transactionIdle()) { return $reservedAny; }
             $connection = GlpiBConnection::find($first['connection_id']);
-            if (!$connection || !$connection['active']) { return; }
+            if (!$connection || !$connection['active'] || ($body['version'] === 10 && ($connection['agent_transport'] ?? 'adapter') !== 'rest_records')) { return $reservedAny; }
             if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
             $client = new RestSession($connection, $deadline);
             $settings = reset($entries)['context']['settings'];
@@ -1024,7 +1162,7 @@ final class RestWork
                 $response = $client->request('POST', self::SETTINGS, ['settings_id' => $settings['id'], 'hash' => $body['settings_hash'], 'body' => json_encode($settings, JSON_THROW_ON_ERROR)]);
                 $valid = $response['status'] === 201 && is_int($response['body']['id'] ?? null) && $response['body']['id'] > 0;
                 foreach ($entries as &$entry) { self::diagnose($entry['context'], $client, 'settings_post', $valid); } unset($entry);
-                if (!$valid) { return; }
+                if (!$valid) { return $reservedAny; }
                 $receipts[$receiptKey] = $response['body']['id'];
                 \Config::setConfigurationValues(GlpiBConnection::CONTEXT, ['rest_settings_receipts' => json_encode($receipts, JSON_THROW_ON_ERROR)]);
             }
@@ -1032,7 +1170,7 @@ final class RestWork
             foreach ($entries as $entry) {
                 if ($entry['context']['rest_sent'] || $entry['body']['expires'] < time() || !empty($entry['context']['rest_observe_only'])) {
                     $records = self::lookupBatch($client, $body['batch_id'], $expected, $entries);
-                    if ($records === null) { return; }
+                    if ($records === null) { return $reservedAny; }
                     self::observeBatch($entries, $records);
                     break;
                 }
@@ -1049,7 +1187,7 @@ final class RestWork
                 if (!self::saveReservation($entry['task'], $entry['context'])) { $entry['fenced_out'] = true; continue; }
                 $inputs[] = ['work_id' => $entry['task']['id'], 'hash' => $entry['task']['hash'], 'body' => $entry['task']['body']];
             } unset($entry);
-            if ($inputs === []) { return; }
+            if ($inputs === []) { return $reservedAny; }
             if (strlen(json_encode(['session_write' => false, 'input' => $inputs], JSON_THROW_ON_ERROR)) > 49152) { throw new \RuntimeException('REST batch exceeds request budget.'); }
             $response = $client->request('POST', self::RESOURCE, $inputs);
             // Native per-row IDs, including 207/400 details, never establish mutation or absence.
@@ -1068,12 +1206,15 @@ final class RestWork
                 } unset($entry);
             }
         }
+        return $reservedAny;
     }
 
     private static function lookupBatch(RestSession $client, string $batch, array $expected, array &$entries): ?array
     {
-        $version = json_decode(reset($expected)['body'], true, 32, JSON_THROW_ON_ERROR)['version'];
-        $response = $client->request('GET', self::RESOURCE . '?range=0-' . ($version === 11 ? '1' : '3') . '&get_hateoas=0&searchText%5Bbatch_id%5D=' . $batch . ($version === 11 ? '&searchText%5Bcompiler%5D=11' : ''));
+        $body = json_decode(reset($expected)['body'], true, 32, JSON_THROW_ON_ERROR);
+        $version = $body['version'];
+        $scope = $version === 10 ? '&searchText%5Bcompiler%5D=10&rest_entity=' . $body['entity_id'] : ($version === 11 ? '&searchText%5Bcompiler%5D=11' : '');
+        $response = $client->request('GET', self::RESOURCE . '?range=0-' . ($version === 11 ? '1' : '3') . '&get_hateoas=0&searchText%5Bbatch_id%5D=' . $batch . $scope);
         $valid = $response['status'] === 200 && array_is_list($response['body']) && count($response['body']) <= ($version === 11 ? 2 : 4);
         $records = [];
         if ($valid) {

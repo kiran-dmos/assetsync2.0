@@ -78,7 +78,7 @@ final class AgentActivity
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
-            if (in_array($body['version'] ?? 0, [7, 8, 11], true)) { $label = self::restLabel($task, $body, $context ?? []); }
+            if (in_array($body['version'] ?? 0, [7, 8, 10, 11], true)) { $label = self::restLabel($task, $body, $context ?? []); }
             if (($body['version'] ?? 0) === 9) { $label = $state === 'observed' ? 'REST inspection received; confirmation remains separate' : 'REST inspection ' . $state; }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
@@ -142,7 +142,9 @@ final class AgentActivity
             'executing' => 'REST B intent executing; completion unverified',
             'expired' => 'REST expired; retained for inspection',
             'not_found' => 'REST work not found on last check; completion unverified',
-            default => empty($context['rest_sent']) ? 'REST dispatch pending' : 'REST outcome unknown; awaiting reconciliation',
+            default => ($body['version'] ?? 0) === 10 && !empty($context['rest_observe_only']) && empty($context['rest_sent'])
+                ? 'REST current source or scope changed; dispatch held for inspection'
+                : (empty($context['rest_sent']) ? 'REST dispatch pending' : 'REST outcome unknown; awaiting reconciliation'),
         };
         $phases = ['init_session' => 'session initialization', 'settings_post' => 'settings POST', 'work_post' => 'work POST',
             'work_lookup' => 'work lookup', 'work_get' => 'work GET', 'result' => 'result validation'];

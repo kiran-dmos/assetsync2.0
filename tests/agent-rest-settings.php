@@ -101,7 +101,7 @@ $connection = GlpiBConnection::find('b');
 agentCheck(empty($connection['agent_api_url']) && empty($connection['agent_peer_user']) && $connection['agent_user_token'] === 'native-b-user',
     'A REST setup needs no adapter URL or incoming A peer configuration.');
 $first = settingsEntry();
-agentCheck(settingsBody()['revision'] === 1 && settingsBody()['enabled'], 'Saved effective Name rules allocate initial durable v2.');
+agentCheck(settingsBody()['version'] === 3 && settingsBody()['revision'] === 1 && settingsBody()['enabled'], 'Saved effective Name rules allocate initial durable scoped settings3.');
 GlpiBConnection::save(array_replace($connection, ['name' => 'Renamed display only']));
 $route = EntitySyncRoute::find('route');
 EntitySyncRoute::save(array_replace($route, ['name' => 'Renamed route only']));
@@ -186,7 +186,8 @@ AssetSyncQueue::notify('Computer', 101, 'b');
 RestWork::process(AssetSyncQueue::claimDue(1)[0]);
 $old = AgentTask::outstanding('b', $pair);
 $oldBody = json_decode($old['body'], true);
-agentCheck(json_decode($old['context'], true)['settings']['version'] === 2, 'Name work pins immutable v2 without changing v8 schema.');
+agentCheck(json_decode($old['context'], true)['settings']['version'] === 3 && $oldBody['version'] === 10,
+    'New scoped Name work pins immutable settings3/Work10 without changing retained v2/v8 schemas.');
 $accepted = settingsWorkRecord($old);
 settingsDispatch([['status' => 201, 'body' => [['id' => 77]]], ['status' => 200, 'body' => [$accepted]]]);
 EntitySyncRoute::save(array_replace(EntitySyncRoute::find('route'), ['active' => false]));
@@ -219,7 +220,7 @@ agentCheck(AgentTask::outstanding('b', $pair) === null && queue()['status'] === 
 GlpiBConnection::save(array_replace(GlpiBConnection::find('b'), ['agent_transport' => 'adapter']));
 AssetSyncQueue::notify('Computer', 101, 'b');
 RestWork::process(AssetSyncQueue::claimDue(1)[0]);
-agentCheck(AgentTask::outstanding('b', $pair) === null && queue()['status'] === 'blocked', 'Transport rollback cannot silently publish v1-policy REST work for a retained v2 route.');
+agentCheck(AgentTask::outstanding('b', $pair) === null && queue()['status'] === 'blocked', 'Transport rollback cannot silently publish v1-policy REST work for a retained versioned route.');
 
 $pair = settingsSetup(); publishPolicy();
 RestWork::requestRead('b', 100);
@@ -245,7 +246,7 @@ $prepare->invoke($service, 'Computer', 101, 'b', false, time() + 20, microtime(t
 $service->processQueue(1);
 agentCheck(iterator_to_array($DB->request(['FROM' => AgentTask::TABLE])) === $before,
     'Records backfill plus queue processing publishes no legacy match task for an unpaired asset.');
-agentCheck(queue()['status'] === 'blocked' && str_contains(queue()['last_error'], 'explicitly opted-in confirmed'),
+agentCheck(queue()['status'] === 'blocked' && str_contains(queue()['last_error'], 'confirmed Computer pair'),
     'Unpaired Records backfill is visibly unsupported, not an adapter matching fallback.');
 
 $connection = GlpiBConnection::find('b');

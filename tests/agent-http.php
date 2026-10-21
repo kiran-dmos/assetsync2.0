@@ -77,7 +77,7 @@ namespace {
     }
     httpSettings($settings);
     \GlpiPlugin\Assetsync20agent\AgentSession::begin(hrtime(true) + 30_000_000_000);
-    $check(plugin_version_assetsync20agent()['version'] === '0.8.4', 'B advertises the stock REST records package version.');
+    $check(plugin_version_assetsync20agent()['version'] === '0.8.5', 'B advertises the stock REST records package version.');
     $sent = ['registration' => str_repeat('b', 32), 'generation' => str_repeat('c', 32), 'computer_id' => 101, 'revision' => 3,
         'lifecycle' => 'present', 'fingerprint' => 'local-only', 'claim_token' => 'local-only'];
     Worker::send($settings, $sent, hrtime(true) + 900_000_000);

@@ -40,7 +40,7 @@ final class RestWork extends \CommonDBTM
         parent::unsetUndisclosedFields($fields);
         if ((int) ($fields['compiler'] ?? 0) === 11 && ($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
             && ($fields['result'] ?? '{}') !== '{}') { NameBoth::assertReadable($fields); }
-        if (in_array((int) ($fields['compiler'] ?? 0), [8, 9, 11], true)) {
+        if (in_array((int) ($fields['compiler'] ?? 0), [8, 9, 10, 11], true)) {
             unset($fields['execution_settings'], $fields['task_body'], $fields['task_hash']);
         } elseif ((int) ($fields['compiler'] ?? 0) === 7) {
             unset($fields['batch_id'], $fields['expires']);
@@ -51,7 +51,7 @@ final class RestWork extends \CommonDBTM
     /** Called only inside the journal/model transaction, never from GET. */
     public static function project(array $task, string $state, array $result): void
     {
-        if ($task['version'] !== 8) { return; }
+        if (!in_array($task['version'], [8, 10], true)) { return; }
         global $DB;
         $row = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `work_id` = ' . $DB->quote($task['id']));
         if (!$row || $row['hash'] !== $task['rest_work_hash'] || $row['task_hash'] !== $task['hash']
@@ -135,13 +135,14 @@ final class RestWork extends \CommonDBTM
             $where['AND'][$table . '.entities_id'] = array_values(array_intersect($where['AND'][$table . '.entities_id'], $entities)) ?: [-1];
         } else { $where[] = new \Glpi\DBAL\QueryExpression('`' . $table . '`.`compiler` <> 9'); }
         // v8 is exposed only through explicitly bounded batch reads, not legacy collections.
-        if (!isset($_GET['searchText']['batch_id'])) { $where[] = new \Glpi\DBAL\QueryExpression('`' . $table . '`.`compiler` NOT IN (8, 11)'); }
+        if (!isset($_GET['searchText']['batch_id'])) { $where[] = new \Glpi\DBAL\QueryExpression('`' . $table . '`.`compiler` NOT IN (8, 10, 11)'); }
         else {
             $batch = $_GET['searchText']['batch_id'];
             if (!is_string($batch) || !preg_match('/^[a-f0-9]{32}$/D', $batch)) { throw new \RuntimeException('Exact REST batch ID required.'); }
             $where['AND'][$table . '.batch_id'] = $batch;
             $compiler = $_GET['searchText']['compiler'] ?? '8';
-            if (!in_array($compiler, ['8', '11'], true)) { throw new \RuntimeException('Unsupported REST batch compiler.'); }
+            if (!in_array($compiler, ['8', '10', '11'], true)) { throw new \RuntimeException('Unsupported REST batch compiler.'); }
+            if ($compiler === '10' && !isset($_GET['rest_entity'])) { throw new \RuntimeException('Exact REST lookup entity required.'); }
             if ($compiler === '11' && (isset($_GET['debug']) || ($_GET['get_hateoas'] ?? null) !== '0'
                 || !is_string($_GET['range'] ?? null) || !preg_match('/^([0-9]+)-([0-9]+)$/D', $_GET['range'], $page)
                 || (int) $page[2] < (int) $page[1] || (int) $page[2] - (int) $page[1] >= 2)) {
@@ -149,6 +150,7 @@ final class RestWork extends \CommonDBTM
             }
             $where['AND'][$table . '.compiler'] = (int) $compiler;
         }
+        if (isset($_GET['rest_entity'])) { $where['AND'][$table . '.entities_id'] = (int) $_GET['rest_entity']; }
         $where[] = new \Glpi\DBAL\QueryExpression('((' . ($read ? '`' . $table . '`.`compiler` = 9 AND JSON_EXTRACT(`' . $table . '`.`body`, \'$.kind\') = \'metadata\'' : '0') . ') OR EXISTS (SELECT 1 FROM `glpi_computers` AS `rest_target`
             WHERE `rest_target`.`id` = JSON_EXTRACT(`' . $table . '`.`body`, \'$.items_id\')
             AND `rest_target`.`entities_id` = `' . $table . '`.`entities_id`
@@ -199,9 +201,10 @@ final class RestWork extends \CommonDBTM
         }
         $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id',
             'settings_hash', 'pair_id', 'itemtype', 'items_id', 'entity_id', 'identity', 'name', 'source_hash', 'expires'];
-        if (($body['version'] ?? null) === 8) { $keys[] = 'batch_id'; }
+        if (in_array($body['version'] ?? null, [8, 10], true)) { $keys[] = 'batch_id'; }
+        if (($body['version'] ?? null) === 10) { $keys[] = 'source_asset_entity'; }
         if (!is_array($body) || array_diff(array_keys($body), $keys) || array_diff($keys, array_keys($body))
-            || strlen($json) > 32768 || !hash_equals(TaskExecutor::hash($body), $hash) || !in_array($body['version'], [7, 8], true)
+            || strlen($json) > 32768 || !hash_equals(TaskExecutor::hash($body), $hash) || !in_array($body['version'], [7, 8, 10], true)
             || $body['itemtype'] !== 'Computer' || !is_int($body['items_id']) || $body['items_id'] <= 0
             || !is_int($body['entity_id']) || $body['entity_id'] < 0 || !is_int($body['expires'])
             || !is_string($body['name']) || strlen($body['name']) > 255
@@ -212,9 +215,10 @@ final class RestWork extends \CommonDBTM
         foreach (['id', 'settings_id', 'pair_id', 'registration', 'generation', 'installation'] as $key) {
             if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $body[$key])) { throw new \RuntimeException('Invalid REST ID.'); }
         }
-        if ($body['version'] === 8 && (!is_string($body['batch_id']) || !preg_match('/^[a-f0-9]{32}$/D', $body['batch_id']))) {
+        if (in_array($body['version'], [8, 10], true) && (!is_string($body['batch_id']) || !preg_match('/^[a-f0-9]{32}$/D', $body['batch_id']))) {
             throw new \RuntimeException('Invalid REST batch ID.');
         }
+        if ($body['version'] === 10 && (!is_int($body['source_asset_entity']) || $body['source_asset_entity'] < 0)) { throw new \RuntimeException('Invalid REST source asset entity.'); }
         foreach (['settings_hash', 'source_hash'] as $key) {
             if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{64}$/D', $body[$key])) { throw new \RuntimeException('Invalid REST hash.'); }
         }
@@ -239,6 +243,12 @@ final class RestWork extends \CommonDBTM
         if ($policy['binding'] !== RestSettings::binding($settings, $document['version'])) { throw new \RuntimeException('Pinned REST binding changed.'); }
         RestSettings::authorize($document);
         if ($document['target_entity'] !== $body['entity_id']) { throw new \RuntimeException('Pinned REST route changed.'); }
+        if ($body['version'] === 10) {
+            if ($document['version'] !== 3 || !in_array($body['itemtype'], $document['asset_types'], true)
+                || (!$document['include_child_entities'] && $body['source_asset_entity'] !== $document['source_entity'])) { throw new \RuntimeException('Pinned REST source scope changed.'); }
+        } elseif ($document['version'] === 3 || ($document['version'] === 4 && $body['version'] !== 11)) {
+            throw new \RuntimeException('Versioned REST scope requires its matching work compiler.');
+        }
         return $settings;
     }
 
@@ -256,7 +266,7 @@ final class RestWork extends \CommonDBTM
         $this->deadline = hrtime(true) + 5_000_000_000;
         if (array_diff(array_keys($input), ['work_id', 'hash', 'body', 'entities_id', '_add'])) { throw new \RuntimeException('Unknown REST work input.'); }
         $body = self::decode((string) ($input['body'] ?? ''), (string) ($input['hash'] ?? ''));
-        if (in_array($body['version'], [8, 9, 11], true)) { $this->deadline = RestPeer::deadline(); }
+        if (in_array($body['version'], [8, 9, 10, 11], true)) { $this->deadline = RestPeer::deadline(); }
         $settings = self::authorize($body);
         if (($input['work_id'] ?? '') !== $body['id'] || !RestPeer::idle()) { throw new \RuntimeException('REST acceptance unavailable.'); }
         global $DB;
@@ -271,7 +281,7 @@ final class RestWork extends \CommonDBTM
                 'binding' => self::workBinding($body, $settings), 'entities_id' => $body['entity_id'], 'accepted_at' => time(),
                 'task_body' => '{}', 'execution_settings' => '{}'];
             foreach (['connection_id', 'registration', 'generation', 'installation'] as $key) { $fields[$key] = $body[$key]; }
-            if (in_array($body['version'], [8, 9, 11], true)) {
+            if (in_array($body['version'], [8, 9, 10, 11], true)) {
                 if (hrtime(true) >= $this->deadline) { throw new \RuntimeException('REST batch acceptance deadline reached.'); }
                 $fields += ['compiler' => $body['version'], 'batch_id' => $body['batch_id'] ?? null, 'state' => 'accepted', 'result' => '{}', 'expires' => $body['expires']];
                 self::assertResponseSize($fields + ['id' => PHP_INT_MAX]);
@@ -319,7 +329,7 @@ final class RestWork extends \CommonDBTM
             if (!$journal) {
                 $policy = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['settings_id']));
                 $document = RestSettings::decode($policy['body'], $policy['hash']);
-                if (!RestSettings::active($document) || (in_array($document['version'], [2, 4], true) && ($settings['transport'] ?? 'adapter') !== 'rest_records')) {
+                if (!RestSettings::active($document) || (in_array($document['version'], [2, 3, 4], true) && ($settings['transport'] ?? 'adapter') !== 'rest_records')) {
                     $this->storeObservation(['outcome' => 'stale', 'changed' => [], 'reason' => 'settings_superseded']);
                     return;
                 }
@@ -336,7 +346,7 @@ final class RestWork extends \CommonDBTM
             if ($this->fields['task_body'] === '{}') {
                 $snapshot = ServiceContext::run($target, static fn (): array => TaskExecutor::snapshot($target, $body['version']));
                 $task = ['version' => $body['version'], 'id' => $body['id'], 'kind' => 'apply'];
-                if ($body['version'] === 8) { $task['batch_id'] = $body['batch_id']; }
+                if (in_array($body['version'], [8, 10], true)) { $task['batch_id'] = $body['batch_id']; }
                 foreach (['installation', 'registration', 'generation', 'connection_id', 'pair_id', 'itemtype', 'items_id', 'entity_id'] as $key) { $task[$key] = $body[$key]; }
                 $task += ['serial' => $body['identity']['serial'], 'policy' => $body['settings_hash'], 'expires' => $body['expires'],
                     'changes' => ['name' => ['type' => 'text', 'metadata' => $snapshot['fields']['name']['metadata'],
@@ -431,7 +441,7 @@ final class RestWork extends \CommonDBTM
         if ($execution) {
             $policy = Outbox::one('SELECT * FROM `' . RestSettings::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['settings_id']));
             $document = RestSettings::decode($policy['body'], $policy['hash']);
-            if (!RestSettings::active($document) || ($document['version'] === 2 && ($settings['transport'] ?? 'adapter') !== 'rest_records')) { throw new \RuntimeException('REST settings superseded.'); }
+            if (!RestSettings::active($document) || (in_array($document['version'], [2, 3, 4], true) && ($settings['transport'] ?? 'adapter') !== 'rest_records')) { throw new \RuntimeException('REST settings superseded.'); }
         }
     }
 
@@ -440,7 +450,7 @@ final class RestWork extends \CommonDBTM
         if (!parent::getFromDB($ID)) { return false; }
         $body = self::decode($this->fields['body'], $this->fields['hash']);
         if ($this->fields['binding'] !== self::workBinding($body, self::authorize($body))) { return false; }
-        if (in_array($body['version'], [8, 9, 11], true)) {
+        if (in_array($body['version'], [8, 9, 10, 11], true)) {
             if (($_SERVER['REQUEST_METHOD'] ?? '') === 'GET'
                 && (isset($_GET['debug']) || !in_array($_GET['get_hateoas'] ?? null, ['0', 0], true))) { throw new \RuntimeException('Bounded REST response options required.'); }
             return true;

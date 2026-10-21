@@ -1,5 +1,54 @@
 # GLPI B Agent
 
+## Scoped REST Routing Checkpoint (Settings3 / Work10)
+
+Controller **0.9.5** and agent **0.8.5** add a bounded routing extension for
+confirmed Computer pairs with one native Name mapping owned by GLPI A. This
+checkpoint does not add custom-field sync, creation, or child-scope Both.
+Install B before A through the supported plugin Update and Enable lifecycle.
+Quiesce workers and saves during the upgrade, preserve pending work and journals,
+and follow the browser-capture coverage limitations below. A plugin update does
+not manufacture original edit evidence for older values.
+
+A's saved Entity Route selects the connection, source entity, optional source
+children and exact B target entity. Complete source ancestry is required; the
+existing deepest-route and conflict rules still apply. A and B entity IDs are
+independent. An existing confirmed target is never moved or relinked because a
+route changes. Participation comes from the confirmed pair and current route;
+the legacy REST pair selection remains for old protocols, not a second route list.
+Mixed-type routes may include Computer, but this checkpoint executes only Computer.
+
+Settings3 and Work10 are distinct schemas, not extensions to old task bodies.
+They share the existing settings scope, monotonic revision and active head with
+Settings2 and Settings4. A lower schema cannot replace a newer active head, even
+with a higher revision. Unchanged Settings4 Name Both documents stay unchanged.
+If a changed scope cannot be represented by its frozen Settings4 schema, A
+publishes a valid higher-revision disable record and holds the scope visibly.
+It does not silently choose A authority, downgrade, or reinterpret retained work.
+A later explicit schema is required for child-scope Both and broader mappings.
+
+Settings publication takes fair turns across connections, with bounded retry
+backoff. Disabled connections make no authentication requests. Late replies
+cannot acknowledge a newer settings revision. Metadata and stored-result reads
+use the exact binding, type and authorized target entity, with fresh direct API
+and service-account grants. They do not execute work, broaden entity grants, or
+fall back to REST asset operations. A provides its own source-ancestry proof; B
+does not independently claim to know A's entity tree.
+
+These are implementation limits, not production-scale or latency guarantees.
+Host tests and isolated native verification must be recorded separately. All old
+work bodies, hashes, results and mutation journals remain retained. Name Both
+Work11 and its bounded never-reserved recovery below keep their existing rules.
+
+Work dispatch examines at most32 due candidates per invocation under the existing
+deadline. A small persisted cursor advances before each attempt and sweeps a fixed
+upper boundary, so a retained malformed or non-reservable task cannot permanently
+hide healthy work behind it. A successful reservation ends selection for that
+pass. Cursor selection uses a short local lock, released before asset locks or
+network requests. Skipping a candidate does not change its body, result, lease,
+retry time or authorization. Invalid held work is not repaired or certified by
+this selection change; its evidence remains available for investigation.
+
 ## Original-Edit Name Both Checkpoint (Settings4 / Work11)
 
 Controller **0.9.4** and agent **0.8.4** add the first original-field Both
@@ -10,7 +59,7 @@ needed beyond the installed capture heads and existing settings/work/journal
 tables. Keep the pair explicitly selected in the existing v8 batch pair list.
 Choose Both in the existing mapping control; A publishes settings4 with a new
 durable revision. Old peers reject it, without a legacy/transport fallback.
-Settings3/Work10 remain reserved for the separately paused scope expansion.
+Settings3/Work10 provide the separate A-authoritative routing checkpoint above.
 Protocols/settings1-9 retain their original schemas, bodies, hashes and replays.
 
 This is **Name-only, not complete Both support**. Broader supported native/custom

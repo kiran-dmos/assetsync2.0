@@ -498,6 +498,36 @@ final class EntitySyncRoute
         return array_key_exists($itemtype, FieldMapping::assetTypes()) ? $itemtype : '';
     }
 
+    /** New REST callers require a complete root-to-asset path, not the legacy partial fallback. */
+    public static function strictEntityPath(int $entityId): array
+    {
+        global $DB;
+        if ($entityId < 0 || !is_object($DB) || !method_exists($DB, 'request')) { throw new \RuntimeException('Complete entity ancestry unavailable.'); }
+        $path = [];
+        try {
+            while (count($path) < 100) {
+                if (in_array((string) $entityId, $path, true)) { break; }
+                $rows = $DB->request(['SELECT' => ['id', 'entities_id'], 'FROM' => 'glpi_entities', 'WHERE' => ['id' => $entityId], 'LIMIT' => 2]);
+                if (!is_iterable($rows)) { break; }
+                $rows = array_values(is_array($rows) ? $rows : iterator_to_array($rows));
+                if (count($rows) !== 1 || (!is_int($rows[0]['id'] ?? null) && !is_string($rows[0]['id'] ?? null))
+                    || !ctype_digit((string) $rows[0]['id']) || (int) $rows[0]['id'] !== $entityId
+                    || !array_key_exists('entities_id', $rows[0])) { break; }
+                $path[] = (string) $entityId;
+                $parent = $rows[0]['entities_id'];
+                if ($entityId === 0) {
+                    // Stock Entity forces NULL for root; retained zero-parent roots are equivalent.
+                    if (!in_array($parent, [null, 0, '0'], true)) { break; }
+                    return array_reverse($path);
+                }
+                if ((!is_int($parent) && !is_string($parent)) || !ctype_digit((string) $parent)
+                    || filter_var($parent, FILTER_VALIDATE_INT) === false) { break; }
+                $entityId = (int) $parent;
+            }
+        } catch (\Throwable) { throw new \RuntimeException('Complete entity ancestry unavailable.'); }
+        throw new \RuntimeException('Complete entity ancestry unavailable.');
+    }
+
     /**
      * @param list<string|int|array<string,mixed>> $entityPathIds
      * @return list<string>
