@@ -78,6 +78,7 @@ final class AgentActivity
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
+            if (($body['version'] ?? 0) === 7) { $label = self::restLabel($task, $body, $context ?? []); }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
             }
@@ -119,5 +120,45 @@ final class AgentActivity
                 . $html($queue['last_error'] ?: 'Matching ' . $queue['status']) . '</td></tr>';
         }
         echo '</table>';
+    }
+
+    private static function restLabel(array $task, array $body, array $context): string
+    {
+        $result = json_decode($task['result'], true);
+        if (in_array($task['state'], ['verified', 'unchanged'], true)) { return 'REST ' . $task['state']; }
+        if (in_array($task['state'], ['accepted', 'finalizing'], true)
+            && in_array($result['outcome'] ?? '', ['verified', 'unchanged'], true)) { return 'REST result received; A finalization pending'; }
+        if (($result['outcome'] ?? '') === 'stale') { return 'REST expired or stale; retained for inspection'; }
+        if ($task['state'] !== 'accepted' || $task['result'] !== '{}') { return 'REST ' . $task['state'] . '; retained for inspection'; }
+        $label = match ($context['rest_state'] ?? '') {
+            'accepted' => 'REST accepted on B; completion pending',
+            'executing' => 'REST executing on B; completion pending',
+            'expired' => 'REST expired; retained for inspection',
+            'not_found' => 'REST work not found on last check; completion unverified',
+            default => empty($context['rest_sent']) ? 'REST dispatch pending' : 'REST outcome unknown; awaiting reconciliation',
+        };
+        $phases = ['init_session' => 'session initialization', 'settings_post' => 'settings POST', 'work_post' => 'work POST',
+            'work_lookup' => 'work lookup', 'work_get' => 'work GET', 'result' => 'result validation'];
+        $errors = ['invalid_url' => 'invalid endpoint configuration', 'budget_exhausted' => 'time budget exhausted',
+            'transport_failed' => 'transport failed', 'invalid_response' => 'invalid response', 'http_error' => 'HTTP error',
+            'invalid_result' => 'invalid result', 'ERROR_SESSION_TOKEN_INVALID' => 'session token rejected',
+            'ERROR_SESSION_TOKEN_MISSING' => 'session token missing', 'ERROR_APP_TOKEN_PARAMETERS_MISSING' => 'app token missing',
+            'ERROR_WRONG_APP_TOKEN_PARAMETER' => 'app token rejected', 'ERROR_LOGIN_PARAMETERS_MISSING' => 'login parameters missing',
+            'ERROR_GLPI_LOGIN_USER_TOKEN' => 'user token rejected', 'ERROR_NOT_ALLOWED_IP' => 'caller IP rejected',
+            'ERROR_RIGHT_MISSING' => 'native right missing', 'ERROR_GLPI_ADD' => 'record add failed'];
+        $failure = $context['rest_error'] ?? [];
+        if (isset($phases[$failure['phase'] ?? ''], $errors[$failure['error'] ?? ''])) {
+            $label .= '; last failure: ' . $phases[$failure['phase']] . ' - ' . $errors[$failure['error']];
+            if (is_int($failure['status'] ?? null) && $failure['status'] >= 100 && $failure['status'] <= 599) {
+                $label .= ' (HTTP ' . $failure['status'] . ')';
+            }
+        }
+        if (is_int($context['rest_next'] ?? null) && $context['rest_next'] > 0) {
+            $label .= '; next attempt ' . gmdate('Y-m-d H:i:s', $context['rest_next']) . ' UTC';
+        }
+        if (is_int($body['expires'] ?? null)) {
+            $label .= '; execution window ' . ($body['expires'] < time() ? 'ended ' : 'ends ') . gmdate('Y-m-d H:i:s', $body['expires']) . ' UTC';
+        }
+        return $label;
     }
 }

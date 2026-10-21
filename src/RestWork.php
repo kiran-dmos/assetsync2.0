@@ -163,6 +163,7 @@ final class RestWork
         if (!$connection || !$connection['active']) { return; }
         if (session_status() === PHP_SESSION_ACTIVE) { session_write_close(); }
         $client = new RestSession($connection, $deadline);
+        $reserved['rest_state'] = 'unknown';
         try {
             $settings = $reserved['settings'];
             $receiptKey = hash('sha256', $connection['id'] . $connection['agent_rest_url'] . $body['settings_hash']);
@@ -170,17 +171,20 @@ final class RestWork
             if (empty($receipts[$receiptKey])) {
                 $response = $client->request('POST', self::SETTINGS, ['settings_id' => $settings['id'], 'hash' => $body['settings_hash'],
                     'body' => json_encode($settings, JSON_THROW_ON_ERROR)]);
-                if ($response['status'] !== 201 || !is_int($response['body']['id'] ?? null)) { return; }
+                $valid = $response['status'] === 201 && is_int($response['body']['id'] ?? null) && $response['body']['id'] > 0;
+                self::diagnose($reserved, $client, 'settings_post', $valid);
+                if (!$valid) { return; }
                 $receipts[$receiptKey] = $response['body']['id'];
                 \Config::setConfigurationValues(GlpiBConnection::CONTEXT, ['rest_settings_receipts' => json_encode($receipts, JSON_THROW_ON_ERROR)]);
             }
             $record = null;
             if ($reserved['rest_sent'] || $body['expires'] < time()) {
                 // A failed GET is unknown, never evidence that a previous POST was absent.
-                $record = self::lookup($client, $body['id']);
+                $record = self::lookup($client, $body['id'], $reserved);
                 if ($record === null) { return; }
             }
             if ($record === [] && $body['expires'] < time()) {
+                $reserved['rest_state'] = 'expired';
                 self::saveReservation($task, $reserved, ['outcome' => 'stale', 'changed' => []]);
                 $DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']);
                 return;
@@ -190,36 +194,76 @@ final class RestWork
                 self::saveReservation($task, $reserved);
                 $response = $client->request('POST', self::RESOURCE, ['work_id' => $body['id'], 'hash' => $task['hash'], 'body' => $task['body']]);
                 $id = $response['body']['id'] ?? null;
-                if ($response['status'] === 201 && is_int($id) && $id > 0) {
+                $valid = $response['status'] === 201 && is_int($id) && $id > 0;
+                self::diagnose($reserved, $client, 'work_post', $valid);
+                if ($valid) {
                     $response = $client->request('GET', self::RESOURCE . '/' . $id);
+                    self::diagnose($reserved, $client, 'work_get', $response['status'] === 200);
                     $record = $response['status'] === 200 ? $response['body'] : null;
-                } else { $record = self::lookup($client, $body['id']); }
+                } else { $record = self::lookup($client, $body['id'], $reserved); }
             }
             if (!$record || ($record['work_id'] ?? '') !== $body['id'] || ($record['hash'] ?? '') !== $task['hash']
-                || ($record['body'] ?? '') !== $task['body']) { return; }
-            $result = json_decode($record['result'] ?? '{}', true, 32, JSON_THROW_ON_ERROR);
-            if ($result === []) {
-                if (($record['state'] ?? '') === 'expired') { $result = ['outcome' => 'stale', 'changed' => []]; }
-                else { return; }
+                || ($record['body'] ?? '') !== $task['body']) {
+                if ($record === []) { $reserved['rest_state'] = 'not_found'; }
+                elseif ($record !== null) {
+                    $reserved['rest_error'] = ['phase' => 'work_get', 'status' => 200, 'error' => 'invalid_response', 'at' => time()];
+                }
+                return;
             }
-            self::validateResult($body, $result);
+            $reserved['rest_state'] = in_array($record['state'] ?? '', ['accepted', 'executing', 'expired'], true)
+                ? $record['state'] : 'unknown';
+            $reserved['rest_observed_at'] = time();
+            try {
+                $result = json_decode($record['result'] ?? '{}', true, 32, JSON_THROW_ON_ERROR);
+                if ($result === []) {
+                    if (($record['state'] ?? '') === 'expired') { $result = ['outcome' => 'stale', 'changed' => []]; }
+                    else { return; }
+                }
+                self::validateResult($body, $result);
+            } catch (\Throwable) {
+                $reserved['rest_state'] = 'unknown';
+                $reserved['rest_error'] = ['phase' => 'result', 'status' => 200, 'error' => 'invalid_result', 'at' => time()];
+                return;
+            }
+            $reserved['rest_state'] = $result['outcome'];
             self::saveReservation($task, $reserved, $result);
             $DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $task['queue_id'], 'status' => 'waiting_agent']);
         } finally {
-            $client->close();
-            $reserved['rest_until'] = 0; $reserved['rest_next'] = time() + 10;
-            self::saveReservation($task, $reserved);
+            try { $client->close(); }
+            finally {
+                $reserved['rest_until'] = 0; $reserved['rest_next'] = time() + 10;
+                $reserved['rest_expires'] = $body['expires'];
+                self::saveReservation($task, $reserved);
+            }
         }
     }
 
-    private static function lookup(RestSession $client, string $id): ?array
+    /** Keep the last failure even when a later GET successfully observes acceptance. */
+    private static function diagnose(array &$context, RestSession $client, string $phase, bool $valid): void
+    {
+        $diagnostic = $client->diagnostic();
+        $diagnostic['phase'] = $diagnostic['phase'] === 'init_session' ? 'init_session' : $phase;
+        if (!$valid && $diagnostic['error'] === '') { $diagnostic['error'] = 'invalid_response'; }
+        $diagnostic['at'] = time();
+        $context['rest_dispatch'] = $diagnostic;
+        if ($diagnostic['phase'] === 'work_post') { $context['rest_post'] = $diagnostic; }
+        if ($diagnostic['error'] !== '') { $context['rest_error'] = $diagnostic; }
+    }
+
+    private static function lookup(RestSession $client, string $id, array &$context): ?array
     {
         $response = $client->request('GET', self::RESOURCE . '?range=0-1&searchText%5Bwork_id%5D=' . $id);
-        if ($response['status'] !== 200 || !array_is_list($response['body']) || count($response['body']) > 1) { return null; }
+        $valid = $response['status'] === 200 && array_is_list($response['body']) && count($response['body']) <= 1;
+        self::diagnose($context, $client, 'work_lookup', $valid);
+        if (!$valid) { return null; }
         if ($response['body'] === []) { return []; }
         $record = $response['body'][0];
-        if (($record['work_id'] ?? '') !== $id || !is_numeric($record['id'] ?? null)) { return null; }
+        if (!is_array($record) || ($record['work_id'] ?? '') !== $id || !is_numeric($record['id'] ?? null)) {
+            self::diagnose($context, $client, 'work_lookup', false);
+            return null;
+        }
         $response = $client->request('GET', self::RESOURCE . '/' . (int) $record['id']);
+        self::diagnose($context, $client, 'work_get', $response['status'] === 200);
         return $response['status'] === 200 ? $response['body'] : null;
     }
 

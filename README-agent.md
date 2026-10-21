@@ -33,10 +33,16 @@ uncertain evidence before switching transport; disabling the opt-in cannot send
 pending REST work through the legacy executor.
 
 If local service login or permissions prevent compilation after acceptance, Work
-remains `accepted` with no mutation journal or result. A displays waiting work and
-retries after GET reconciliation; it does not retain the POST's specific error
-text. Restoring permissions before expiry permits the identical Work to continue.
-Otherwise unstarted work expires and A retains a stale result for inspection.
+remains `accepted` with no mutation journal or result. A retains the request phase,
+HTTP status and an allowlisted error code in the existing task context, along with
+the last Work POST diagnostic, observed state, next attempt and execution expiry.
+Activity shows accepted work as completion pending and distinguishes an unknown
+outcome from a received result awaiting A finalization. A generic HTTP 400 does
+not identify a permission failure. Response text, payloads, tokens and URLs are
+never retained in these diagnostics. Restoring permissions before expiry permits
+the identical Work to continue after GET reconciliation. Otherwise unstarted work
+expires and A retains a stale result for inspection. Failed GET never authorizes
+resending an ambiguous POST.
 
 Resource admission rechecks the pinned native account, exact profile/entity
 grant, native READ, account/MFA policy and App-Token on every operation. An app
@@ -56,7 +62,9 @@ Existing protocol 1-6 bodies, hashes, results and default behavior are retained.
 
 Focused offline checks: `tests/agent-rest-acl.php`, `tests/agent-rest-name.php`,
 `tests/agent-rest-coexistence.php`, `tests/agent-rest-journal.php` and
-`tests/agent-rest-observation.php`. Actual core
+`tests/agent-rest-observation.php`. `tests/agent-rest-dispatch.php` exercises
+diagnostics, deny/restore continuation, ambiguous POST/GET, expiry, redaction and
+standalone session compatibility with mocked HTTP. Actual core
 REST, TLS, native model/History and concurrency require isolated integration QA.
 
 ## Native-Only Setup And Upgrade
