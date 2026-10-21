@@ -35,11 +35,21 @@ save can therefore advance the exact execution guard without publishing Name
 work. Both the scanner and queued-hook processing check this locally: zero
 per-asset/auth requests and no invented verified/link success. A local skip does
 not update the last probe time. Full immutable guards remain in prepared Work11
-and are rechecked before dispatch and under owned transaction locks. An unsent
-preparation with changed or unavailable source evidence makes zero HTTP/auth
-requests and retains its slot; its deferred turn does not block later batches.
-Already-sent work with a changed source is observation-only, not permission to
-replay the obsolete mutation. A midflight change may still hold work conservatively.
+and are rechecked before dispatch and under owned transaction locks. A preparation
+with changed or unavailable source evidence makes zero HTTP/auth requests. Only
+work proven **never reserved for dispatch** can be replaced: its initialized lease
+must still be empty, its result empty and its current pair slot unchanged. A's
+ordinary queue claim then rechecks fresh source evidence, rules and the confirmed
+pair before atomically transferring the slot to a new immutable work ID and batch.
+The old body, hash, result and job remain intact, with a superseded status and
+successor reference. Replacement does not count as a successful sync.
+
+An expired lease is not proof that work was never dispatched. Any retained lease,
+attempt marker, mutation receipt or uncertain result prevents this replacement.
+Reservation and attempt markers are fenced durably before HTTP so a paused old
+dispatcher cannot send or finalize replaced work. Already-sent work with a changed
+source is observation-only, not permission to replay the obsolete mutation.
+Unavailable fresh evidence or a midflight change can still hold work conservatively.
 
 A's ordinary bounded backfill scanner currently schedules an unchanged pair
 again after **60 seconds since its last completed reconciliation** to discover
@@ -84,7 +94,8 @@ the immutable body/hash/result, letting a genuinely newer edit be reconsidered.
 Uncertain/executing/ambiguous work remains held; no blanket slot reset is provided.
 A later B edit can also fail the exact guard on terminal GET disclosure, leaving
 A unable to observe that immutable result and its slot held. This is a known
-finite checkpoint limitation, not automatic stale-slot recovery or full liveness.
+finite checkpoint limitation. The bounded never-reserved replacement above does
+not provide general stale-slot recovery or full liveness.
 
 Host suites `agent-name-both*.php` exercise protocol/decision parity, response
 bounds, guards, committed fresh-process evidence recovery, model rollback,

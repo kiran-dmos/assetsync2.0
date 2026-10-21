@@ -401,6 +401,12 @@ final class RestWork
         $task = AgentTask::outstanding($pair['connection_id'], $pair);
         if ($task) {
             $version = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR)['version'] ?? 0;
+            if (self::neverReserved($task)) {
+                try { $fresh = self::context($pair); }
+                catch (\Throwable) { return true; }
+                $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+                return $body['source_hash'] !== $fresh['source_hash'] || $body['settings_hash'] !== AgentTask::hash($fresh['settings']);
+            }
             return self::superseded($task) || ($version === 11 && $task['result'] !== '{}' && in_array($task['state'], ['accepted', 'origin_pending', 'finalizing'], true));
         }
         try { $context = self::context($pair); }
@@ -471,7 +477,15 @@ final class RestWork
             if ($task) {
                 $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
                 if (!in_array($body['version'], [7, 8, 11], true)) { throw new \RuntimeException('Resolve the retained agent operation before switching this pair to REST records.'); }
-                if ($task['result'] === '{}') { AgentTask::write(AssetSyncQueue::waitForAgent($job)); return; }
+                if ($task['result'] === '{}') {
+                    if ($body['version'] === 11) {
+                        if (self::neverReserved($task) && ($body['source_hash'] !== $context['source_hash']
+                            || $body['settings_hash'] !== AgentTask::hash($context['settings']))) {
+                            self::replaceUnsent($task, $job, $pair, $context);
+                        } else { self::parkName($task, $job); }
+                    } else { AgentTask::write(AssetSyncQueue::waitForAgent($job)); }
+                    return;
+                }
                 $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
                 if ($body['version'] === 11) { NameBoth::finish($task, $job, $pair, $context, $body, $result); return; }
                 if (self::superseded($task) && $context['settings']['version'] === 2 && $body['settings_id'] !== $context['settings']['id']) {
@@ -575,6 +589,160 @@ final class RestWork
     private static function workJson(array $body): string
     {
         return json_encode($body, JSON_THROW_ON_ERROR | ($body['version'] === 11 ? JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES : 0));
+    }
+
+    /** Empty sticky lease is evidence of NEVER reserved; its expiry or sent=false alone is not. */
+    private static function neverReserved(array $task): bool
+    {
+        try {
+            $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+            $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash',
+                'pair_id', 'itemtype', 'items_id', 'entity_id', 'identity', 'source', 'source_hash', 'source_fingerprint', 'expires', 'batch_id'];
+            if (!is_array($body) || array_diff(array_keys($body), $keys) || array_diff($keys, array_keys($body))) { return false; }
+            if (($body['version'] ?? null) !== 11 || $body['id'] !== $task['id'] || AgentTask::hash($body) !== $task['hash']
+                || ($task['slot'] ?? null) !== 'pair:' . $body['pair_id'] || $task['connection_id'] !== $body['connection_id']
+                || $task['state'] !== 'accepted' || $task['result'] !== '{}' || !is_array($context)
+                || ($context['rest_sent'] ?? null) !== false || ($context['rest_lease'] ?? null) !== ''
+                || ($context['rest_until'] ?? null) !== 0 || !is_int($context['rest_next'] ?? null)
+                || !is_array($context['settings'] ?? null) || AgentTask::hash($context['settings']) !== $body['settings_hash']
+                || ($context['settings']['id'] ?? null) !== $body['settings_id'] || ($context['settings']['version'] ?? null) !== 4
+                || array_diff(array_keys($context), ['settings', 'rest_next', 'rest_sent', 'rest_lease', 'rest_until', 'rest_observe_only'])
+                || (array_key_exists('rest_observe_only', $context) && !is_bool($context['rest_observe_only']))
+                || $body['itemtype'] !== 'Computer' || !is_int($body['items_id']) || $body['items_id'] < 1
+                || !is_int($body['entity_id']) || $body['entity_id'] < 0 || !is_int($body['expires'])
+                || !is_array($body['identity']) || !in_array(array_keys($body['identity']), [['serial'], ['serial', 'otherserial']], true)) { return false; }
+            foreach (['id', 'installation', 'registration', 'generation', 'settings_id', 'pair_id', 'batch_id'] as $key) {
+                if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{32}$/D', $body[$key])) { return false; }
+            }
+            foreach (['settings_hash', 'source_hash', 'source_fingerprint'] as $key) {
+                if (!is_string($body[$key]) || !preg_match('/^[a-f0-9]{64}$/D', $body[$key])) { return false; }
+            }
+            $identity = AgentTask::identity($body['identity'] + ['otherserial' => '']);
+            if (array_intersect_key($identity, $body['identity']) !== $body['identity']) { return false; }
+            foreach (['mutation', 'receipt', 'local_mutation', 'origin_pending', 'name_origin_pending', 'superseded_by'] as $key) {
+                if (array_key_exists($key, $context)) { return false; }
+            }
+            NameBoth::validateEnvelope($body['source']);
+            return $body['source_hash'] === AgentTask::hash($body['source']);
+        } catch (\Throwable) { return false; }
+    }
+
+    /** Binary equality matters for JSON/text columns; context also pins the exact sticky dispatch lease. */
+    private static function nameFence(array $task): string
+    {
+        global $DB;
+        $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+        if (!is_string($context['rest_lease'] ?? null)) { throw new \RuntimeException('REST dispatch lease unavailable.'); }
+        $where = [];
+        foreach (['id', 'body', 'hash', 'slot', 'state', 'result', 'context', 'queue_id', 'job'] as $key) {
+            if (!array_key_exists($key, $task)) { throw new \RuntimeException('REST dispatch fence unavailable.'); }
+            $where[] = $task[$key] === null ? '`' . $key . '` IS NULL'
+                : 'CAST(`' . $key . '` AS BINARY)=CAST(' . $DB->quote((string) $task[$key]) . ' AS BINARY)';
+        }
+        $where[] = 'CAST(JSON_UNQUOTE(JSON_EXTRACT(`context`, \'$.rest_lease\')) AS BINARY)=CAST(' . $DB->quote($context['rest_lease']) . ' AS BINARY)';
+        return implode(' AND ', $where);
+    }
+
+    private static function lockedName(array $task): ?array
+    {
+        return AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE ' . self::nameFence($task) . ' FOR UPDATE');
+    }
+
+    /** Wake only this eligible parked task. Never replace a running queue claim or notification counters. */
+    private static function deferUnsent(array $task, array $context): void
+    {
+        global $DB;
+        if (!AgentWake::transactionIdle()) { throw new \RuntimeException('REST deferred wake requires an idle connection.'); }
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            if (!self::lockedName($task) || !self::saveReservation($task, $context)) { AgentInbox::sql('ROLLBACK'); return; }
+            if (self::neverReserved($task)) { self::wakeNameQueue($task); }
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    /** Task lock precedes queue lock at both result receipt and empty-result parking. */
+    private static function wakeNameQueue(array $task): void
+    {
+        global $DB;
+        $queue = AgentInbox::one('SELECT * FROM `' . AssetSyncQueue::TABLE . '` WHERE `id`=' . (int) $task['queue_id'] . ' FOR UPDATE');
+        $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        $pair = AgentTask::byId($task['connection_id'], $body['pair_id']);
+        if (!$pair || !$queue || $queue['status'] !== 'waiting_agent' || ($queue['claim_token'] ?? '') !== ''
+            || $queue['glpi_b_connection_id'] !== $task['connection_id'] || $queue['itemtype'] !== $pair['itemtype']
+            || (int) $queue['items_id'] !== (int) $pair['local_id']) { return; }
+        AgentTask::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'],
+            ['id' => $queue['id'], 'status' => 'waiting_agent', 'claim_token' => '']));
+        if ($DB->affectedRows() !== 1) { throw new \RuntimeException('REST deferred queue changed.'); }
+    }
+
+    private static function parkName(array $task, array $job): void
+    {
+        global $DB;
+        if (!AgentWake::transactionIdle()) { throw new \RuntimeException('REST queue parking requires an idle connection.'); }
+        AgentInbox::sql('START TRANSACTION');
+        try {
+            // A result may have arrived after process() read it. Serialize parking with its receipt.
+            $current = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE `id`=' . $DB->quote($task['id']) . ' FOR UPDATE');
+            if (!$current || $current['body'] !== $task['body'] || $current['hash'] !== $task['hash'] || $current['slot'] !== $task['slot']
+                || !AssetSyncQueue::owns($job)) { throw new \RuntimeException('REST queue ownership changed.'); }
+            AgentTask::write(AssetSyncQueue::waitForAgent($job));
+            if ($current['result'] !== '{}') { self::wakeNameQueue($current); }
+            AgentInbox::sql('COMMIT');
+        } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+    }
+
+    /** Replace only proven unstarted work, under the existing short current-policy lock/owned transaction. */
+    private static function replaceUnsent(array $task, array $job, array $pair, array $context): void
+    {
+        global $DB;
+        if (!self::neverReserved($task) || !isset($context['evidence']) || $context['settings']['version'] !== 4) { self::parkName($task, $job); return; }
+        $oldBody = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
+        $body = array_replace($oldBody, ['id' => bin2hex(random_bytes(16)), 'batch_id' => bin2hex(random_bytes(16)),
+            'settings_id' => $context['settings']['id'], 'settings_hash' => AgentTask::hash($context['settings']),
+            'source' => $context['evidence'], 'source_hash' => $context['source_hash'], 'source_fingerprint' => $context['fingerprint'], 'expires' => time() + 300]);
+        $json = self::workJson($body); $hash = AgentTask::hash($body);
+        if (strlen(json_encode(['session_write' => false, 'input' => [['work_id' => $body['id'], 'hash' => $hash, 'body' => $json]]], JSON_THROW_ON_ERROR)) > 49152) {
+            throw new \RuntimeException('REST replacement exceeds request budget.');
+        }
+        try { self::configure(static function () use ($task, $job, $pair, $context, $body, $json, $hash, $DB): void {
+            $binding = AgentInbox::one('SELECT * FROM `' . AgentTask::BINDINGS . '` WHERE `connection_id`=' . $DB->quote($pair['connection_id']) . ' FOR UPDATE');
+            if (!$binding || $binding['installation'] !== $body['installation'] || $binding['registration'] !== $body['registration']
+                || AgentTask::registration($binding)['generation'] !== $body['generation']) { throw new \RuntimeException('REST replacement binding changed.'); }
+            if (!self::lockedName($task) || !self::neverReserved($task)) { throw new \RuntimeException('REST unstarted work changed.'); }
+            $lockedPair = AgentInbox::one('SELECT * FROM `' . AgentTask::PAIRS . '` WHERE `id`=' . $DB->quote($pair['id']) . ' FOR UPDATE');
+            if (!$lockedPair || $lockedPair !== $pair) { throw new \RuntimeException('REST confirmed pair changed.'); }
+            AgentInbox::sql('SELECT `id` FROM `' . AssetSyncQueue::TABLE . '` WHERE `id`=' . (int) $job['id'] . ' FOR UPDATE');
+            AgentInbox::sql('SELECT `id` FROM `' . AssetSyncLink::TABLE . '` WHERE `itemtype`=\'Computer\' AND `items_id`=' . (int) $pair['local_id']
+                . ' AND `glpi_b_connection_id`=' . $DB->quote($pair['connection_id']) . ' FOR UPDATE');
+            if ((int) $task['queue_id'] !== (int) $job['id'] || !AssetSyncQueue::owns($job)) { throw new \RuntimeException('REST replacement queue claim changed.'); }
+            $fresh = self::assertNameSource($lockedPair, $body, $context['evidence']);
+            if ($fresh['source_hash'] !== $body['source_hash'] || $fresh['identity'] !== $body['identity']) { throw new \RuntimeException('REST replacement source changed.'); }
+            $oldContext = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            $oldContext['superseded_by'] = $body['id'];
+            AgentTask::write($DB->update(AgentTask::TABLE, ['slot' => null, 'state' => 'superseded', 'context' => json_encode($oldContext, JSON_THROW_ON_ERROR)],
+                [new \Glpi\DBAL\QueryExpression(self::nameFence($task))]));
+            if ($DB->affectedRows() !== 1) { throw new \RuntimeException('REST supersession fence changed.'); }
+            AgentTask::write($DB->insert(AgentTask::TABLE, ['id' => $body['id'], 'connection_id' => $pair['connection_id'], 'slot' => $task['slot'],
+                'body' => $json, 'hash' => $hash, 'state' => 'accepted', 'result' => '{}', 'queue_id' => $job['id'], 'job' => json_encode($job, JSON_THROW_ON_ERROR),
+                'context' => json_encode(['settings' => $fresh['settings'], 'rest_next' => 0, 'rest_sent' => false, 'rest_lease' => '', 'rest_until' => 0], JSON_THROW_ON_ERROR),
+                'created_at' => time(), 'expires' => $body['expires']]));
+            AgentTask::write(AssetSyncQueue::waitForAgent($job));
+        }, true); }
+        catch (\Throwable $error) {
+            // A COMMIT reply can be lost after the atomic slot transfer. Read durable identities, never retry from memory.
+            if (AgentWake::transactionIdle()) {
+                $old = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE `id`=' . $DB->quote($task['id']));
+                $new = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE `id`=' . $DB->quote($body['id']));
+                $oldContext = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR); $oldContext['superseded_by'] = $body['id'];
+                if ($old && $new && $old['state'] === 'superseded' && $old['slot'] === null
+                    && $old['body'] === $task['body'] && $old['hash'] === $task['hash'] && $old['result'] === $task['result'] && $old['job'] === $task['job']
+                    && $old['context'] === json_encode($oldContext, JSON_THROW_ON_ERROR) && $new['body'] === $json && $new['hash'] === $hash
+                    && (int) $new['queue_id'] === (int) $job['id'] && $new['job'] === json_encode($job, JSON_THROW_ON_ERROR)) { return; }
+            }
+            throw $error;
+        }
     }
 
     /** Only invoked after the outer run and asset locks are released. */
@@ -717,17 +885,36 @@ final class RestWork
         return $response['status'] === 200 ? $response['body'] : null;
     }
 
-    private static function saveReservation(array &$task, array $context, ?array $result = null): void
+    private static function saveReservation(array &$task, array $context, ?array $result = null): bool
     {
         global $DB;
         $fields = ['context' => json_encode($context, JSON_THROW_ON_ERROR)];
         if ($result !== null) { $fields += ['result' => json_encode($result, JSON_THROW_ON_ERROR), 'result_received_at' => time()]; }
+        if ((json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR)['version'] ?? 0) === 11) {
+            $before = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
+            if ($task['state'] !== 'accepted' || $task['slot'] === null || !is_string($context['rest_lease'] ?? null)
+                || !is_bool($before['rest_sent'] ?? null) || !is_bool($context['rest_sent'] ?? null)
+                || !is_int($before['rest_until'] ?? null) || !is_int($context['rest_until'] ?? null)
+                || !is_int($before['rest_next'] ?? null) || !is_int($context['rest_next'] ?? null)
+                || ($context['rest_lease'] !== '' && !preg_match('/^[a-f0-9]{32}$/D', $context['rest_lease']))
+                || (($before['rest_lease'] ?? null) !== '' && $context['rest_lease'] === '')
+                || (($before['rest_sent'] ?? null) === true && ($context['rest_sent'] ?? null) !== true)
+                || (($context['rest_sent'] ?? null) === true && $context['rest_lease'] === '')) { return false; }
+            AgentTask::write($DB->update(AgentTask::TABLE, $fields, [new \Glpi\DBAL\QueryExpression(self::nameFence($task))]));
+            $next = array_replace($task, $fields);
+            if ($DB->affectedRows() !== 1 && !AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE ' . self::nameFence($next))) {
+                return false;
+            }
+            $task = $next; // Includes our result: later cleanup must fence the newly persisted receipt, not {}.
+            return true;
+        }
         AgentTask::write($DB->update(AgentTask::TABLE, $fields, ['id' => $task['id'], 'hash' => $task['hash'], 'context' => $task['context']]));
         if ($DB->affectedRows() !== 1) {
             $saved = AgentInbox::one('SELECT `context` FROM `' . AgentTask::TABLE . '` WHERE `id` = ' . $DB->quote($task['id']) . ' AND `hash` = ' . $DB->quote($task['hash']));
             if (($saved['context'] ?? null) !== $fields['context']) { throw new \RuntimeException('REST dispatch reservation changed.'); }
         }
         $task['context'] = $fields['context'];
+        return true;
     }
 
     private static function validateResult(array $body, array $result): void
@@ -797,7 +984,7 @@ final class RestWork
                     if ($member['version'] === 11 && empty($context['rest_sent']) && $context['rest_observe_only']) {
                         // Keep the stale slot, but let later batches advance without HTTP for this preparation.
                         $context['rest_next'] = time() + 10;
-                        self::saveReservation($task, $context);
+                        self::deferUnsent($task, $context);
                         return;
                     }
                     $context['rest_reconcile_only'] = false;
@@ -810,6 +997,10 @@ final class RestWork
                         || AgentTask::registration($binding)['generation'] !== $member['generation']) { return; }
                     if ($context['rest_until'] > time() || $context['rest_next'] > time()) { return; }
                     $context['rest_lease'] = bin2hex(random_bytes(16)); $context['rest_until'] = time() + 30;
+                    if ($member['version'] === 11) {
+                        if (self::saveReservation($task, $context)) { $reserved = $context; }
+                        return;
+                    }
                     if ($DB->update(AgentTask::TABLE, ['context' => json_encode($context, JSON_THROW_ON_ERROR)],
                         ['id' => $task['id'], 'context' => $task['context'], 'state' => 'accepted', 'result' => '{}']) && $DB->affectedRows() === 1) { $reserved = $context; }
                 });
@@ -848,13 +1039,14 @@ final class RestWork
             }
             $inputs = [];
             foreach ($entries as &$entry) {
+                if (!empty($entry['fenced_out'])) { continue; }
                 $record = $records[$entry['task']['id']] ?? null;
                 if (!empty($entry['context']['rest_observe_only']) && (empty($entry['context']['rest_reconcile_only']) || $record === null)) { continue; }
                 $pending = $entry['body']['version'] === 11 && ($record['state'] ?? '') === 'origin_pending';
                 if ($entry['task']['result'] !== '{}' || ($entry['body']['expires'] < time() && ($record['state'] ?? '') !== 'executing' && !$pending)) { continue; }
                 if ($record !== null && (!in_array($record['state'] ?? '', ['accepted', 'executing', 'origin_pending'], true) || ($record['result'] ?? '{}') !== '{}')) { continue; }
                 $entry['context']['rest_sent'] = true;
-                self::saveReservation($entry['task'], $entry['context']);
+                if (!self::saveReservation($entry['task'], $entry['context'])) { $entry['fenced_out'] = true; continue; }
                 $inputs[] = ['work_id' => $entry['task']['id'], 'hash' => $entry['task']['hash'], 'body' => $entry['task']['body']];
             } unset($entry);
             if ($inputs === []) { return; }
@@ -869,6 +1061,7 @@ final class RestWork
             try { if ($client !== null) { $client->close(); } }
             finally {
                 foreach ($entries as &$entry) {
+                    if (!empty($entry['fenced_out'])) { continue; }
                     $entry['context']['rest_until'] = 0; $entry['context']['rest_next'] = time() + 10;
                     $entry['context']['rest_expires'] = $entry['body']['expires'];
                     self::saveReservation($entry['task'], $entry['context']);
@@ -916,10 +1109,20 @@ final class RestWork
                 $entry['context']['rest_error'] = ['phase' => 'result', 'status' => 200, 'error' => 'invalid_result', 'at' => time()];
                 continue;
             }
-            self::saveReservation($entry['task'], $entry['context'], $result);
+            if ($entry['body']['version'] === 11) {
+                if (!AgentWake::transactionIdle()) { throw new \RuntimeException('REST observation requires an idle connection.'); }
+                AgentInbox::sql('START TRANSACTION');
+                try {
+                    if (!self::lockedName($entry['task']) || !self::saveReservation($entry['task'], $entry['context'], $result)) {
+                        AgentInbox::sql('ROLLBACK'); $entry['fenced_out'] = true; continue;
+                    }
+                    self::wakeNameQueue($entry['task']);
+                    AgentInbox::sql('COMMIT');
+                } catch (\Throwable $error) { $DB->doQuery('ROLLBACK'); throw $error; }
+            } else { self::saveReservation($entry['task'], $entry['context'], $result); }
             $entry['task']['result'] = json_encode($result, JSON_THROW_ON_ERROR);
             $entry['context']['rest_state'] = $result['outcome'] === 'stale' ? 'expired' : $result['outcome'];
-            AgentTask::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $entry['task']['queue_id'], 'status' => 'waiting_agent']));
+            if ($entry['body']['version'] !== 11) { AgentTask::write($DB->update(AssetSyncQueue::TABLE, ['status' => 'pending'], ['id' => (int) $entry['task']['queue_id'], 'status' => 'waiting_agent'])); }
         } unset($entry);
     }
 }

@@ -125,6 +125,7 @@ final class AgentActivity
 
     private static function restLabel(array $task, array $body, array $context): string
     {
+        if ($task['state'] === 'superseded' && ($body['version'] ?? 0) === 11) { return 'REST never-reserved preparation superseded locally; no dispatch or completion'; }
         if ($task['state'] === 'origin_pending' || ($context['rest_state'] ?? '') === 'origin_pending') { return 'REST model committed; original field evidence pending qualification'; }
         if ($task['state'] === 'conflict') { return 'REST Name conflict; no mutation, original intervals need review'; }
         $result = json_decode($task['result'], true);
