@@ -408,6 +408,8 @@ final class TaskExecutor
             });
         } catch (\Throwable) {
             return ['outcome' => $attempted ? 'uncertain' : ($changed !== [] ? 'partial' : 'blocked'), 'changed' => $changed];
+        } finally {
+            FieldEvidence::finishWork();
         }
     }
 

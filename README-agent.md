@@ -1,5 +1,117 @@
 # GLPI B Agent
 
+## Local Browser Field Evidence (Capture Only)
+
+Controller **0.9.3** and agent **0.8.3** add independently packaged local field
+capture. Update each plugin through GLPI's normal Update action, then Enable it.
+Quiesce asset saves and workers during Update/Enable/Disable: old or unloaded
+in-flight requests cannot acquire the new capture hook retroactively.
+Each install/upgrade, activation and deactivation rotates an internal coverage
+epoch. Existing evidence tables are retained; an absent pre-upgrade protocol
+marker is inert, and a new head starts unknown. No historical backfill or
+add-origin inference occurs. There is no mapping/route/transport switch for
+capturing local facts.
+The private table has a `model_class` index for covering bootstrap class
+discovery; this is not a measured large-installation performance claim.
+
+The technical envelope is native Computer Name and Comments, plus existing
+generated Computer Fields single text/textarea rows. Native-only saves do not
+depend on Fields. Generated classes remain hooked even when their old container
+or business mapping is disabled. Capture does not grant permissions, change
+inventory/readonly behavior, add missing child rows, or change any REST body,
+hash, result or legacy Both behavior. **This slice does not enable REST Both.**
+
+A private head per local Computer/field records a generation, every unfinished
+attempt token, overlap taint and an optional candidate. Registration precedes
+model SQL. Fresh locking reads must agree with model-loaded old values and row
+identity; postprocessed changes must agree with full typed readback and fresh
+metadata. Failed registration cancels the model call with a sanitized error
+before remaining plugin callbacks can continue. One completion cannot clear
+another token. Overflow preserves all unfinished tokens and cancels new saves.
+Coverage and shared Fields definitions use portable `LOCK IN SHARE MODE`
+current reads, including absent/inactive coverage decisions; an old ordinary
+Config/RR snapshot cannot bypass registration. These readers are compatible
+across assets, not exclusive global locks. Per-asset head/value reads still lock
+their own rows. No caller isolation is changed. Fresh human origins require
+transaction-idle pre-capture. Trustworthy loaded-old proof is checked separately:
+an exact trusted scope can inherit its original event inside the caller's
+transaction, and proven unchanged fields can retain their earlier origin after
+commit. Unscoped or legacy changed fields stay unknown; rollback restores the
+original evidence along with the model change.
+
+Exact field History references and one expected official History projection
+corroborate a genuine typed transition. History's 255-character truncation and
+JSON blanking never substitute for the full value hash. Fields parent History
+is written after the child post-hook, so its candidate remains unfinished until
+that parent row exists. References come from fresh official definitions, not a
+profile-filtered CLI search-option list. Only hashes and metadata identities,
+not raw field values or credentials, are persisted.
+Technical field identity excludes labels, readonly/default/display settings,
+parent entity and deleted scope. Unchanged field evidence survives those UI or
+scope changes; storage/type/reference changes invalidate it. Business callers
+must still enforce fresh permissions, readonly policy and current entity scope.
+
+Origin bounds are inclusive database UTC seconds read with zero-argument
+`UNIX_TIMESTAMP()` before/after the model operation. Cross-second and long saves
+are valid intervals; backwards time is unknown. These are model-save bounds,
+not commit timestamps. A future Both comparison must require strictly disjoint
+intervals and comparable installation clocks; UTC alone does not prove clock
+trust. This capture-only release performs no winning-side selection.
+
+One request-end callback makes a bounded, non-waiting pass over only its own
+tokens, requiring the original connection, an idle transaction probe and fresh
+value/metadata/History/generation checks. It never starts, commits or rolls back
+a transaction. Active caller transactions, fatal interruption, missing context
+or missing delayed History leave pending unknown. A no-post no-op can preserve
+an earlier origin only with uninterrupted value, metadata and field-History
+proof. Ordinary GET requests and public settlement remain read-only/forbidden:
+they never settle, clean up or promote candidates. No hook changes caller
+transaction ownership. Crash orphans have no timeout-to-success or automatic reap.
+The pass has a 100 ms cooperative budget and no sleep/retry; database/native
+calls can exceed it, so it is not a hard request-latency guarantee.
+
+Before that pass drains candidates, one bounded metadata-only CAS statement
+hands off up to 1,024 exact post receipts (256 KiB predicate cap) from the clean,
+idle, original-connection callback. Change and unchanged-field post receipts
+retain their original bounds and generation. `FieldEvidence::settle(id, key)`
+provides a single-head POST/CLI fallback with fresh value/metadata/History/epoch,
+generation and overlap checks; it is not a new remote endpoint. Pre-only attempts
+and candidates without that request-end proof cannot recover into success.
+The next model POST/worker may settle a clean deferred receipt before registering
+new work; GET cannot. Larger handoffs and unresolved attempts stay unknown.
+Existing A job and B executor finalizers also finish their own metadata after
+model transactions/wrappers, before later jobs/network, so long-running CLI
+workers need not exit to clear ordinary attempts. At that explicit existing job
+boundary, a legitimate legacy web-Cron job running under GET can finish only
+its own process-owned tokens after its transaction/wrapper ends. This does not
+initiate sync under GET or permit public GET settlement. Completed owners/frames are
+removed from memory; durable foreign/orphan attempts are never silently reset.
+Budget-spilled post ownership is released from memory only after the entire
+exact CAS handoff succeeds. Unknown legacy/foreign-context post receipts may
+retire **unknown**, never publish an origin; any qualified or inherited change
+still requires the exact parent History corroboration above.
+
+Current evidence also validates the coverage epoch, local revision, full typed
+hash, metadata, anchor contents and latest **field-specific** History watermark
+across all actors/values. Unexplained rows, deleted anchors and logged browser
+edit/revert during missed capture return unknown. Raw SQL, selective History
+deletion and arbitrary missing-code/global-capture outages are not universally
+covered. No heartbeat or History-only origin reconstruction is attempted.
+Exact process-local trusted sync scopes can inherit a verified event only for
+the exact asset, field and before/after hashes. Existing legacy/derived internal
+sync scopes remain unknown; a service-account browser edit is not suppressed
+merely because of its username. Unscoped API/CLI/inventory writes also remain
+unknown, including retained legacy REST callers; they do not mint a new human
+origin. An explicit trusted exact sync scope may still inherit its verified
+original event in those contexts.
+
+`php tests/field-evidence.php` exercises both packaged helpers with SQL/CAS and
+model doubles, including actual PHP fatal shutdown, fresh-process deferred
+settlement and more than 32 jobs through real job finalizers. Full host regressions/lints
+are required before freeze. Ordinary Chrome/official Fields, InnoDB contention,
+callback lifecycle and protected legacy-row preservation remain independent
+Debugger gates; these host checks do not establish live browser qualification.
+
 ## A-Driven REST Setup And Settings (4a)
 
 Controller **0.9.2** and agent **0.8.2** add an explicit **REST records** transport.

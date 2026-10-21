@@ -605,6 +605,7 @@ final class AssetSyncService
             AssetUuidOperation::withAssetLock((string) ($job['itemtype'] ?? ''), (int) ($job['items_id'] ?? 0), fn () => $this->processLockedJob($job));
         } finally {
             $cleanup = GlpiBConnection::endOrdinaryAttempt();
+            FieldEvidence::finishWork();
             if (isset($cleanup['cleanup_failure'])) {
                 $this->pauseConnection((string) ($job['glpi_b_connection_id'] ?? ''), $cleanup['cleanup_failure']);
                 if ($this->runMetrics !== null) {

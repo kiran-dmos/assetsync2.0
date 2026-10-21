@@ -6,6 +6,17 @@ namespace GlpiPlugin\Assetsync20agent;
 
 final class ChangeHook
 {
+    public static function beforeUpdate(object $item): void
+    {
+        FieldEvidence::before($item);
+    }
+
+    public static function updated(object $item): void
+    {
+        FieldEvidence::after($item);
+        self::record($item, false);
+    }
+
     public static function changed(object $item): void
     {
         self::record($item, false);

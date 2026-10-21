@@ -226,6 +226,10 @@ final class FakeDB
         if ($sql === 'SELECT DATABASE() AS database_name') {
             return [['database_name' => $this->databaseName]];
         }
+        if ($sql === "SELECT `value` FROM `glpi_configs` WHERE `context`='plugin:assetsync20' AND `name`='field_evidence_capture' LOCK IN SHARE MODE") {
+            $value = Config::$values['plugin:assetsync20']['field_evidence_capture'] ?? null;
+            return $value === null ? [] : [['value' => $value]];
+        }
         if (preg_match('/\bMD5\s*\(/i', $sql)) {
             throw new RuntimeException('FUNCTION glpi.MD5 does not exist');
         }
@@ -1530,7 +1534,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.9.2',
+    'version' => '0.9.3',
 ];
 
 foreach ($expectations as $key => $expected) {

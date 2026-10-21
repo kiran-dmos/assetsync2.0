@@ -19,7 +19,8 @@ function plugin_assetsync20_install(): bool
     EntitySyncRoute::install();
 
     if (!AssetSyncLink::install() || !AssetSyncQueue::install() || !AssetUuidOperation::install()
-        || !\GlpiPlugin\Assetsync20\AgentInbox::install() || !\GlpiPlugin\Assetsync20\AgentTask::install()) {
+        || !\GlpiPlugin\Assetsync20\AgentInbox::install() || !\GlpiPlugin\Assetsync20\AgentTask::install()
+        || !\GlpiPlugin\Assetsync20\FieldEvidence::install()) {
         return false;
     }
 
@@ -31,6 +32,7 @@ function plugin_assetsync20_install(): bool
 function plugin_assetsync20_uninstall(): bool
 {
     global $DB;
+    \GlpiPlugin\Assetsync20\FieldEvidence::deactivate();
     if ($DB->tableExists(\GlpiPlugin\Assetsync20\AgentInbox::REGISTRATIONS)
         && !$DB->update(\GlpiPlugin\Assetsync20\AgentInbox::REGISTRATIONS, ['active' => 0], ['active' => 1])) {
         return false;

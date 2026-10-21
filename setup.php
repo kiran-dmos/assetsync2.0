@@ -11,7 +11,7 @@ use GlpiPlugin\Assetsync20\FieldMapping;
  * GLPI bootstrap for the assetsync2.0 plugin.
  */
 
-define('PLUGIN_ASSETSYNC20_VERSION', '0.9.2');
+define('PLUGIN_ASSETSYNC20_VERSION', '0.9.3');
 define('PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION', '11.0.0');
 define('PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION', '12.0.0');
 define('PLUGIN_ASSETSYNC20_MIN_PHP_VERSION', '8.2.0');
@@ -36,6 +36,7 @@ function plugin_init_assetsync20(): void
     $PLUGIN_HOOKS['menu_toadd'][Plugin::KEY] = [
         'config' => Menu::class,
     ];
+    $PLUGIN_HOOKS['post_init'][Plugin::KEY] = 'plugin_assetsync20_capture_hooks';
 
     foreach (array_keys(FieldMapping::assetTypes()) as $itemtype) {
         $PLUGIN_HOOKS['item_add'][Plugin::KEY][$itemtype] = [
@@ -58,6 +59,27 @@ function plugin_init_assetsync20(): void
             ];
         }
     }
+    plugin_assetsync20_capture_hooks();
+}
+
+function plugin_assetsync20_capture_hooks(): void
+{
+    global $PLUGIN_HOOKS;
+    // Fields registers its autoloader after our initial plugin setup.
+    foreach (\GlpiPlugin\Assetsync20\FieldEvidence::hookTypes() as $itemtype) {
+        $PLUGIN_HOOKS['pre_item_update'][Plugin::KEY][$itemtype] = [AssetChangeHook::class, 'beforeUpdate'];
+        $PLUGIN_HOOKS['item_update'][Plugin::KEY][$itemtype] = [AssetChangeHook::class, 'onUpdate'];
+    }
+}
+
+function plugin_assetsync20_activate(): void
+{
+    \GlpiPlugin\Assetsync20\FieldEvidence::activate();
+}
+
+function plugin_assetsync20_deactivate(): void
+{
+    \GlpiPlugin\Assetsync20\FieldEvidence::deactivate();
 }
 
 function plugin_version_assetsync20(): array

@@ -58,7 +58,7 @@ final class ServiceContext
             if (!\Session::changeActiveEntities((int) $settings['entity_id'], false)) {
                 throw new \RuntimeException('Service entity activation failed.');
             }
-            return $operation();
+            return FieldEvidence::withoutOrigin($operation);
         } catch (\Glpi\Exception\RedirectException $error) {
             throw new \RuntimeException('Service authentication requires an interactive step.', 0, $error);
         } finally {

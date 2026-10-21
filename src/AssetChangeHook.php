@@ -15,7 +15,13 @@ final class AssetChangeHook
 
     public static function onUpdate(object $item): void
     {
+        FieldEvidence::after($item);
         self::queueItem($item);
+    }
+
+    public static function beforeUpdate(object $item): void
+    {
+        FieldEvidence::before($item);
     }
 
     public static function withoutQueue(callable $callback): bool
@@ -23,7 +29,7 @@ final class AssetChangeHook
         self::$suppressionDepth++;
 
         try {
-            return (bool) $callback();
+            return (bool) FieldEvidence::withoutOrigin($callback);
         } finally {
             self::$suppressionDepth--;
         }

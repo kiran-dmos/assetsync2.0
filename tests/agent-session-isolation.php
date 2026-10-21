@@ -28,6 +28,7 @@ namespace GlpiPlugin\Assetsync20agent {
     function session_write_close(): bool { \HttpSessionFixture::$active = false; return true; }
 }
 namespace {
+    require __DIR__ . '/../assetsync20agent/src/autoload.php';
     require __DIR__ . '/../assetsync20agent/src/ServiceContext.php';
     final class HttpSessionFixture {
         public static array $options;
