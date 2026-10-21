@@ -87,14 +87,15 @@ final class RestPeer
             if (!is_array($row) || !is_string($row['body'] ?? null) || !is_string($row['hash'] ?? null)
                 || array_diff(array_keys($row), ['work_id', 'hash', 'body', 'entities_id'])) { throw new \RuntimeException('Invalid REST batch input.'); }
             $body = RestWork::decode($row['body'], $row['hash']);
-            if ($body['version'] !== 8 || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
-                throw new \RuntimeException('Only distinct v8 work is admitted in a REST batch.');
+            if (!in_array($body['version'], [8, 11], true) || ($row['work_id'] ?? null) !== $body['id'] || isset($ids[$body['id']])) {
+                throw new \RuntimeException('Only distinct supported work is admitted in a REST batch.');
             }
             $scope = [];
-            foreach (['batch_id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash', 'entity_id'] as $key) { $scope[$key] = $body[$key]; }
+            foreach (['version', 'batch_id', 'installation', 'registration', 'generation', 'connection_id', 'settings_id', 'settings_hash', 'entity_id'] as $key) { $scope[$key] = $body[$key]; }
             if ($group !== null && $group !== $scope) { throw new \RuntimeException('Mixed REST batch scope.'); }
             $group = $scope; $ids[$body['id']] = true;
         }
+        if ($group['version'] === 11 && count($inputs) > 2) { throw new \RuntimeException('Name Both evidence is bounded to two rows per batch.'); }
     }
 
     public static function binding(array $settings): string

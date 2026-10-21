@@ -105,9 +105,14 @@ final class RestWork
                 if (count($rows) === 1) {
                     $row = array_values($rows)[0];
                     if (in_array($row['glpi_a_field_key'] ?? '', ['name', 'Computer.name'], true)
-                        && in_array($row['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true) && ($row['source_of_truth'] ?? '') === 'glpi_a') {
-                        $mappings = [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'glpi_a']];
+                        && in_array($row['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true) && in_array($row['source_of_truth'] ?? '', ['glpi_a', 'both'], true)) {
+                        $mappings = [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => $row['source_of_truth']]];
                     }
+                }
+                // Version3 is reserved for the paused scope slice. Version4 adds only native Name Both.
+                if (($mappings[0]['source_of_truth'] ?? '') === 'both' || ($route === null && ($old['version'] ?? 0) === 4)) {
+                    $base['version'] = 4;
+                    $base += ['include_child_entities' => false, 'asset_types' => ['Computer']];
                 }
                 $base += ['source_entity' => $route ? (int) $route['glpi_a_source_entity_id'] : $old['source_entity'],
                     'target_entity' => $route ? (int) $route['glpi_b_target_entity_id'] : $old['target_entity'],
@@ -117,7 +122,7 @@ final class RestWork
                 $effective = AgentTask::hash($base);
                 if (($state[$key]['effective'] ?? '') === $effective) { continue; }
                 $document = $base + ['revision' => ($old['revision'] ?? 0) + 1];
-                $document = ['version' => 2, 'id' => substr(AgentTask::hash($document), 0, 32)] + $document;
+                $document = ['version' => $base['version'], 'id' => substr(AgentTask::hash($document), 0, 32)] + $document;
                 $state[$key] = ['effective' => $effective, 'body' => json_encode($document, JSON_THROW_ON_ERROR),
                     'hash' => AgentTask::hash($document), 'pending' => true, 'next' => 0];
             }
@@ -343,10 +348,10 @@ final class RestWork
         if (!$pair) { return false; }
         if (($connection['agent_rest_pair'] ?? '') === $pair['id'] || in_array($pair['id'], $connection['agent_rest_pairs'] ?? [], true)) { return true; }
         $task = AgentTask::outstanding($connection['id'], $pair);
-        return $task && in_array(json_decode($task['body'], true)['version'] ?? 0, [7, 8], true);
+        return $task && in_array(json_decode($task['body'], true)['version'] ?? 0, [7, 8, 11], true);
     }
 
-    private static function context(array $pair): array
+    private static function context(array $pair, ?array $guarded = null): array
     {
         $scope = AgentTask::scope($pair);
         $connection = $scope['connection'];
@@ -359,7 +364,7 @@ final class RestWork
         $row = array_values($rows)[0];
         if (!in_array($row['glpi_a_field_key'] ?? '', ['name', 'Computer.name'], true)
             || !in_array($row['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true)
-            || ($row['source_of_truth'] ?? '') !== 'glpi_a') { throw new \RuntimeException('Name REST supports native Name to Name with glpi_a authority only.'); }
+            || !in_array($row['source_of_truth'] ?? '', ['glpi_a', 'both'], true)) { throw new \RuntimeException('Name REST supports native Name to Name only.'); }
         $snapshot = json_decode($pair['snapshot'], true, 32, JSON_THROW_ON_ERROR);
         $identity = !empty($pair['identity_basis']) ? json_decode($pair['identity_basis'], true, 32, JSON_THROW_ON_ERROR)['b']
             : (array_key_exists('otherserial', $snapshot) ? AgentTask::identity($snapshot) : ['serial' => $pair['serial']]);
@@ -378,6 +383,15 @@ final class RestWork
             $settings = json_decode($entry['body'], true, 32, JSON_THROW_ON_ERROR);
             if (!$settings['enabled']) { throw new \RuntimeException('REST route is disabled or unsupported.'); }
         }
+        if ($row['source_of_truth'] === 'both') {
+            if (($settings['version'] ?? 0) !== 4 || $settings['mappings'][0]['source_of_truth'] !== 'both') { throw new \RuntimeException('Name Both settings4 publication pending.'); }
+            NameBoth::localItem($pair, false);
+            $evidence = $guarded ?? FieldEvidence::envelope((int) $pair['local_id'], 'native:name');
+            NameBoth::validateEnvelope($evidence);
+            if (NameBoth::normalize($scope['asset']['name']) !== NameBoth::normalize($evidence['value'])) { throw new \RuntimeException('Name source changed during preparation.'); }
+            return $scope + ['settings' => $settings, 'source_hash' => AgentTask::hash($evidence), 'identity' => $identity,
+                'evidence' => $evidence, 'fingerprint' => NameBoth::fingerprint(AgentTask::hash($settings), AgentTask::identity($scope['asset']), $evidence)];
+        }
         $source = AgentTask::hash([AgentTask::hash($settings), AgentTask::identity($scope['asset']), (string) $scope['asset']['name']]);
         return $scope + ['settings' => $settings, 'source_hash' => $source, 'identity' => $identity];
     }
@@ -385,10 +399,46 @@ final class RestWork
     public static function needsWork(array $pair, bool $force): bool
     {
         $task = AgentTask::outstanding($pair['connection_id'], $pair);
-        if ($task) { return self::superseded($task); }
+        if ($task) {
+            $version = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR)['version'] ?? 0;
+            return self::superseded($task) || ($version === 11 && $task['result'] !== '{}' && in_array($task['state'], ['accepted', 'origin_pending', 'finalizing'], true));
+        }
         try { $context = self::context($pair); }
         catch (\Throwable) { return true; }
-        return $force || ($pair['local_fingerprint'] ?? '') !== $context['source_hash'];
+        return $force || ($pair['local_fingerprint'] ?? '') !== ($context['fingerprint'] ?? $context['source_hash']) || self::probeDue($pair, $context);
+    }
+
+    /** Interim current-state reconciliation, not the future immutable change/ACK delivery protocol. */
+    public static function probeDue(array $pair, array $context): bool
+    {
+        return ($context['settings']['version'] ?? 0) === 4 && (int) ($pair['checked_at'] ?? 0) <= time() - 60;
+    }
+
+    public static function assertNameSource(array $pair, array $body, array $evidence): array
+    {
+        FieldEvidence::assertGuard((int) $pair['local_id'], 'native:name', $evidence);
+        $context = self::context($pair, $evidence);
+        foreach (['installation', 'registration', 'connection_id'] as $key) {
+            if ($body[$key] !== $pair[$key]) { throw new \RuntimeException('Name Both pair binding changed.'); }
+        }
+        if ($body['settings_hash'] !== AgentTask::hash($context['settings']) || $body['settings_id'] !== $context['settings']['id']
+            || $body['generation'] !== $context['registration']['generation'] || $body['items_id'] !== (int) $pair['computer_id']
+            || $body['entity_id'] !== (int) $pair['entity_id'] || $body['pair_id'] !== $pair['id']) {
+            throw new \RuntimeException('Name Both policy or confirmed target changed.');
+        }
+        return $context;
+    }
+
+    public static function assertNamePolicy(array $pair, array $body): void
+    {
+        $scope = AgentTask::scope($pair);
+        $entry = self::settingsState()[self::settingsKey($body + ['route_id' => $pair['route_id']])] ?? null;
+        FieldMapping::endRunCache();
+        $rows = array_values(FieldMapping::load($pair['connection_id'], 'Computer'));
+        if (($scope['connection']['agent_transport'] ?? '') !== 'rest_records' || !$entry || $entry['hash'] !== $body['settings_hash']
+            || count($rows) !== 1 || ($rows[0]['source_of_truth'] ?? '') !== 'both'
+            || !in_array($rows[0]['glpi_a_field_key'] ?? '', ['name', 'Computer.name'], true)
+            || !in_array($rows[0]['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true)) { throw new \RuntimeException('Name Both policy changed.'); }
     }
 
     private static function superseded(array $task): bool
@@ -420,9 +470,10 @@ final class RestWork
             $task = AgentTask::outstanding($pair['connection_id'], $pair);
             if ($task) {
                 $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-                if (!in_array($body['version'], [7, 8], true)) { throw new \RuntimeException('Resolve the retained agent operation before switching this pair to REST records.'); }
+                if (!in_array($body['version'], [7, 8, 11], true)) { throw new \RuntimeException('Resolve the retained agent operation before switching this pair to REST records.'); }
                 if ($task['result'] === '{}') { AgentTask::write(AssetSyncQueue::waitForAgent($job)); return; }
                 $result = json_decode($task['result'], true, 32, JSON_THROW_ON_ERROR);
+                if ($body['version'] === 11) { NameBoth::finish($task, $job, $pair, $context, $body, $result); return; }
                 if (self::superseded($task) && $context['settings']['version'] === 2 && $body['settings_id'] !== $context['settings']['id']) {
                     AgentInbox::sql('START TRANSACTION');
                     try {
@@ -456,6 +507,12 @@ final class RestWork
                 AgentTask::finish($task, $job, $result['outcome'], !empty($job['previous_needs_recheck']), $context['source_hash']);
                 return;
             }
+            if (isset($context['fingerprint']) && ($pair['local_fingerprint'] ?? '') === $context['fingerprint']
+                && !self::probeDue($pair, $context) && (int) ($job['agent_snapshot'] ?? 0) <= (int) ($job['agent_completed'] ?? 0)) {
+                // Hooks remain light. A queued unmapped edit is consumed locally without claiming a verified sync.
+                AgentTask::write(AssetSyncQueue::finish($job, 'Mapped Name unchanged; no REST work published.'));
+                return;
+            }
             $body = ['version' => 7, 'id' => bin2hex(random_bytes(16))];
             foreach (['installation', 'registration', 'connection_id'] as $key) { $body[$key] = $pair[$key]; }
             $body += ['generation' => $context['registration']['generation'], 'settings_id' => $context['settings']['id'],
@@ -464,14 +521,20 @@ final class RestWork
                 'name' => (string) $context['asset']['name'], 'source_hash' => $context['source_hash'], 'expires' => time() + 300];
             if (in_array($pair['id'], $context['connection']['agent_rest_pairs'] ?? [], true)) {
                 $body['version'] = 8;
+                if (isset($context['evidence'])) {
+                    $body['version'] = 11;
+                    unset($body['name']);
+                    $body['source'] = $context['evidence'];
+                    $body['source_fingerprint'] = $context['fingerprint'];
+                }
                 $key = AgentTask::hash([$context['settings'], $context['connection']['agent_rest_url'], AgentSession::fingerprint($context['connection'])]);
                 $batch = self::$batches[$key] ?? ['id' => bin2hex(random_bytes(16)), 'inputs' => []];
                 $body['batch_id'] = $batch['id'];
-                $input = ['work_id' => $body['id'], 'hash' => AgentTask::hash($body), 'body' => json_encode($body, JSON_THROW_ON_ERROR)];
-                if (count($batch['inputs']) >= 4 || strlen(json_encode(['session_write' => false, 'input' => [...$batch['inputs'], $input]], JSON_THROW_ON_ERROR)) > 49152) {
+                $input = ['work_id' => $body['id'], 'hash' => AgentTask::hash($body), 'body' => self::workJson($body)];
+                if (count($batch['inputs']) >= ($body['version'] === 11 ? 2 : 4) || strlen(json_encode(['session_write' => false, 'input' => [...$batch['inputs'], $input]], JSON_THROW_ON_ERROR)) > 49152) {
                     $batch = ['id' => bin2hex(random_bytes(16)), 'inputs' => []];
                     $body['batch_id'] = $batch['id'];
-                    $input = ['work_id' => $body['id'], 'hash' => AgentTask::hash($body), 'body' => json_encode($body, JSON_THROW_ON_ERROR)];
+                    $input = ['work_id' => $body['id'], 'hash' => AgentTask::hash($body), 'body' => self::workJson($body)];
                 }
                 if (strlen(json_encode(['session_write' => false, 'input' => [$input]], JSON_THROW_ON_ERROR)) > 49152) {
                     throw new \RuntimeException('REST batch work exceeds request budget.');
@@ -484,7 +547,7 @@ final class RestWork
             try {
                 if (!AssetSyncQueue::owns($job)) { throw new \RuntimeException('REST queue claim changed.'); }
                 AgentTask::write($DB->insert(AgentTask::TABLE, ['id' => $body['id'], 'connection_id' => $pair['connection_id'],
-                    'slot' => 'pair:' . $pair['id'], 'hash' => $hash, 'body' => json_encode($body, JSON_THROW_ON_ERROR),
+                    'slot' => 'pair:' . $pair['id'], 'hash' => $hash, 'body' => self::workJson($body),
                     'state' => 'accepted', 'result' => '{}', 'queue_id' => (int) $job['id'], 'job' => json_encode($job, JSON_THROW_ON_ERROR),
                     'context' => json_encode($stored, JSON_THROW_ON_ERROR), 'created_at' => time(), 'expires' => $body['expires']]));
                 AgentTask::write(AssetSyncQueue::waitForAgent($job));
@@ -499,9 +562,19 @@ final class RestWork
                         AgentTask::write(AssetSyncQueue::retry($job, $error->getMessage()));
                         AgentInbox::sql('COMMIT');
                     } catch (\Throwable $storage) { $DB->doQuery('ROLLBACK'); throw $storage; }
-                } else { AgentTask::write(AssetSyncQueue::block($job, $error->getMessage())); }
+                } else {
+                    $message = ($body['version'] ?? 0) === 11
+                        ? 'Name Both validation or local evidence recovery is unavailable; immutable work retained, completion unverified.'
+                        : $error->getMessage();
+                    AgentTask::write(AssetSyncQueue::block($job, $message));
+                }
             }
         }
+    }
+
+    private static function workJson(array $body): string
+    {
+        return json_encode($body, JSON_THROW_ON_ERROR | ($body['version'] === 11 ? JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES : 0));
     }
 
     /** Only invoked after the outer run and asset locks are released. */
@@ -517,11 +590,11 @@ final class RestWork
         self::sendRead($deadline);
         if (hrtime(true) + 2_000_000_000 >= $deadline) { return; }
         $task = AgentInbox::one('SELECT * FROM `' . AgentTask::TABLE . '` WHERE `slot` IS NOT NULL AND `state` = \'accepted\' AND `result` = \'{}\'
-            AND JSON_EXTRACT(`body`, \'$.version\') IN (7, 8) AND COALESCE(JSON_EXTRACT(`context`, \'$.rest_until\'), 0) <= ' . time()
+            AND JSON_EXTRACT(`body`, \'$.version\') IN (7, 8, 11) AND COALESCE(JSON_EXTRACT(`context`, \'$.rest_until\'), 0) <= ' . time()
             . ' AND COALESCE(JSON_EXTRACT(`context`, \'$.rest_next\'), 0) <= ' . time() . ' ORDER BY `created_at`, `id` LIMIT 1');
         if (!$task) { return; }
         $body = json_decode($task['body'], true, 32, JSON_THROW_ON_ERROR);
-        if ($body['version'] === 8) { self::sendBatch($task, $body, $deadline); return; }
+        if (in_array($body['version'], [8, 11], true)) { self::sendBatch($task, $body, $deadline); return; }
         $pair = AgentTask::byId($task['connection_id'], $body['pair_id']);
         if (!$pair) { return; }
         $reserved = null;
@@ -659,6 +732,7 @@ final class RestWork
 
     private static function validateResult(array $body, array $result): void
     {
+        if ($body['version'] === 11) { NameBoth::validateResult($body, $result); return; }
         if (!in_array($result['outcome'] ?? '', ['verified', 'unchanged', 'stale', 'blocked', 'uncertain'], true)
             || !is_array($result['changed'] ?? null) || array_diff(array_keys($result['changed']), ['name'])) { throw new \RuntimeException('Invalid REST result.'); }
         if (!in_array($result['outcome'], ['verified', 'unchanged'], true)) { return; }
@@ -708,15 +782,23 @@ final class RestWork
                     global $DB;
                     $context = json_decode($task['context'], true, 32, JSON_THROW_ON_ERROR);
                     $connection = AgentInbox::connection($pair['connection_id']);
-                    $historical = ($context['settings']['version'] ?? 1) === 2 || ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
+                    $historical = in_array($context['settings']['version'] ?? 1, [2, 4], true) || ($connection['agent_transport'] ?? 'adapter') === 'rest_records';
                     try {
                         $scope = self::context($pair);
                         if (AgentTask::hash($scope['settings']) !== $member['settings_hash']) { throw new \RuntimeException('REST settings changed before dispatch.'); }
-                        $context['rest_observe_only'] = false;
+                        $sourceChanged = $member['version'] === 11 && $scope['source_hash'] !== $member['source_hash'];
+                        // Eligibility ignores bookkeeping; an immutable execution must still match its exact source.
+                        $context['rest_observe_only'] = $sourceChanged;
                     } catch (\RuntimeException $error) {
                         if (!$historical) { throw $error; }
                         // Changed rules can still collect original evidence, but never resend old commands.
                         $context['rest_observe_only'] = true;
+                    }
+                    if ($member['version'] === 11 && empty($context['rest_sent']) && $context['rest_observe_only']) {
+                        // Keep the stale slot, but let later batches advance without HTTP for this preparation.
+                        $context['rest_next'] = time() + 10;
+                        self::saveReservation($task, $context);
+                        return;
                     }
                     $context['rest_reconcile_only'] = false;
                     if ($context['rest_observe_only'] && ($connection['agent_transport'] ?? 'adapter') === 'rest_records') {
@@ -731,7 +813,10 @@ final class RestWork
                     if ($DB->update(AgentTask::TABLE, ['context' => json_encode($context, JSON_THROW_ON_ERROR)],
                         ['id' => $task['id'], 'context' => $task['context'], 'state' => 'accepted', 'result' => '{}']) && $DB->affectedRows() === 1) { $reserved = $context; }
                 });
-                if ($reserved === null) { return; }
+                if ($reserved === null) {
+                    if ($member['version'] === 11) { continue; }
+                    return;
+                }
                 $task['context'] = json_encode($reserved, JSON_THROW_ON_ERROR);
                 $reserved['rest_state'] = 'unknown'; $reserved['rest_members'] = array_keys($expected);
                 $entries[$task['id']] = ['task' => $task, 'body' => $member, 'context' => $reserved];
@@ -765,8 +850,9 @@ final class RestWork
             foreach ($entries as &$entry) {
                 $record = $records[$entry['task']['id']] ?? null;
                 if (!empty($entry['context']['rest_observe_only']) && (empty($entry['context']['rest_reconcile_only']) || $record === null)) { continue; }
-                if ($entry['task']['result'] !== '{}' || ($entry['body']['expires'] < time() && ($record['state'] ?? '') !== 'executing')) { continue; }
-                if ($record !== null && (!in_array($record['state'] ?? '', ['accepted', 'executing'], true) || ($record['result'] ?? '{}') !== '{}')) { continue; }
+                $pending = $entry['body']['version'] === 11 && ($record['state'] ?? '') === 'origin_pending';
+                if ($entry['task']['result'] !== '{}' || ($entry['body']['expires'] < time() && ($record['state'] ?? '') !== 'executing' && !$pending)) { continue; }
+                if ($record !== null && (!in_array($record['state'] ?? '', ['accepted', 'executing', 'origin_pending'], true) || ($record['result'] ?? '{}') !== '{}')) { continue; }
                 $entry['context']['rest_sent'] = true;
                 self::saveReservation($entry['task'], $entry['context']);
                 $inputs[] = ['work_id' => $entry['task']['id'], 'hash' => $entry['task']['hash'], 'body' => $entry['task']['body']];
@@ -793,8 +879,9 @@ final class RestWork
 
     private static function lookupBatch(RestSession $client, string $batch, array $expected, array &$entries): ?array
     {
-        $response = $client->request('GET', self::RESOURCE . '?range=0-3&get_hateoas=0&searchText%5Bbatch_id%5D=' . $batch);
-        $valid = $response['status'] === 200 && array_is_list($response['body']) && count($response['body']) <= 4;
+        $version = json_decode(reset($expected)['body'], true, 32, JSON_THROW_ON_ERROR)['version'];
+        $response = $client->request('GET', self::RESOURCE . '?range=0-' . ($version === 11 ? '1' : '3') . '&get_hateoas=0&searchText%5Bbatch_id%5D=' . $batch . ($version === 11 ? '&searchText%5Bcompiler%5D=11' : ''));
+        $valid = $response['status'] === 200 && array_is_list($response['body']) && count($response['body']) <= ($version === 11 ? 2 : 4);
         $records = [];
         if ($valid) {
             foreach ($response['body'] as $record) {
@@ -816,7 +903,7 @@ final class RestWork
             $record = $records[$id] ?? null;
             $entry['context']['rest_observed_at'] = time();
             $entry['context']['rest_state'] = $record === null ? 'not_found'
-                : (in_array($record['state'] ?? '', ['accepted', 'executing'], true) ? $record['state'] : 'unknown');
+                : (in_array($record['state'] ?? '', ['accepted', 'executing', 'origin_pending'], true) ? $record['state'] : 'unknown');
             try {
                 $result = $record === null ? [] : json_decode($record['result'] ?? '{}', true, 32, JSON_THROW_ON_ERROR);
                 if ($result === []) {

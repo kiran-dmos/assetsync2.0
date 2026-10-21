@@ -138,6 +138,11 @@ class_alias(Search::class, 'Glpi\\Search\\SearchOption');
 
 class Computer
 {
+    public array|false $input = [];
+    public array $updates = [];
+    public array $oldvalues = [];
+    public static ?Closure $beforeModelUpdate = null;
+    public static ?Closure $afterModelUpdate = null;
     public static function getTable(): string { return 'glpi_computers'; }
     public function rawSearchOptions(): array
     {
@@ -178,15 +183,20 @@ class Computer
     public function update(array $input): bool
     {
         global $DB;
+        $this->input = $input;
+        $this->updates = []; $this->oldvalues = [];
+        if (self::$beforeModelUpdate) { (self::$beforeModelUpdate)($this); }
         $id = $input['id'];
         foreach (array_diff_key($input, ['id' => true]) as $column => $value) {
             $old = $DB->firstRow(static::getTable(), ['id' => $id])[$column];
+            $this->updates[] = $column; $this->oldvalues[$column] = $old;
             $DB->update(static::getTable(), [$column => $value], ['id' => $id]);
             Log::record($id, $column, $old, $value, static::class);
         }
         if ($DB->fieldExists(static::getTable(), 'date_mod')) {
             $DB->update(static::getTable(), ['date_mod' => $_SESSION['glpi_currenttime'] ?? gmdate('Y-m-d H:i:s')], ['id' => $id]);
         }
+        if (self::$afterModelUpdate) { (self::$afterModelUpdate)($this); }
         return true;
     }
 }

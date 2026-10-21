@@ -210,6 +210,114 @@ final class FieldEvidence
         } catch (\Throwable) { return null; }
     }
 
+    /** Idle preparation only. Unknown origin is a fact, not a fabricated browser timestamp. */
+    public static function envelope(int $computerId, string $key): array
+    {
+        if (!self::idle()) { throw new \RuntimeException('Field evidence preparation requires an idle connection.'); }
+        return self::currentEnvelope($computerId, $key);
+    }
+
+    /** The caller owns its model transaction; this takes current per-field/value locks, never a transaction. */
+    public static function assertGuard(int $computerId, string $key, array $captured): void
+    {
+        if (self::currentEnvelope($computerId, $key) !== $captured) {
+            throw new \RuntimeException('Original field evidence changed.');
+        }
+    }
+
+    private static function currentEnvelope(int $id, string $key): array
+    {
+        $marker = self::marker();
+        if (!$marker || !$marker['active']) { throw new \RuntimeException('Original field capture is inactive.'); }
+        $descriptor = self::descriptorForKey($key);
+        $head = self::head($id, $key, false);
+        $fresh = self::snapshot($id, $descriptor);
+        $history = self::history($id, $descriptor);
+        $state = $head['state'] ?? null;
+        $current = $state['current'] ?? null;
+        $origin = null;
+        if ($state && $state['attempts'] === [] && !$state['overflow'] && $state['epoch'] === $marker['epoch']
+            && $current && $current['revision'] === $head['generation'] && $current['value'] === $fresh['hash']
+            && $current['meta'] === $fresh['meta'] && $current['anchor'] === $history['anchor']
+            && ($current['anchor']['id'] ?? null) === $history['latest'] && self::validOrigin($current['origin'])) {
+            $origin = $current['origin'];
+        }
+        if (self::head($id, $key, false) !== $head || self::marker() !== $marker) {
+            throw new \RuntimeException('Original field evidence changed.');
+        }
+        return ['value' => $fresh['value'], 'hash' => $fresh['hash'], 'meta' => $fresh['meta'], 'origin' => $origin,
+            'guard' => ['epoch' => $marker['epoch'], 'generation' => $head['generation'] ?? null,
+                'head' => $head ? hash('sha256', $head['raw']) : null, 'history' => $history]];
+    }
+
+    /** Persist alongside the model and History in the SAME owned transaction, before committing. */
+    public static function inheritedReceipt(int $id, string $key, array $origin): array
+    {
+        if (!self::validOrigin($origin)) { throw new \RuntimeException('Inherited field origin is invalid.'); }
+        $descriptor = self::descriptorForKey($key);
+        $head = self::head($id, $key);
+        if ($head['state']['overflow'] || count($head['state']['attempts']) !== 1) {
+            throw new \RuntimeException('Inherited field capture is ambiguous.');
+        }
+        $token = array_key_first($head['state']['attempts']);
+        $owner = self::$owned[$id . ':' . $key . ':' . $token] ?? null;
+        $attempt = $head['state']['attempts'][$token];
+        $candidate = $attempt['candidate'];
+        $fresh = self::snapshot($id, $descriptor);
+        $history = self::history($id, $descriptor);
+        $rows = $candidate ? self::historyAfter($id, $descriptor, $candidate['watermark']) : [];
+        if (!$owner || !self::sameConnection($owner) || !self::uninterrupted($head, $owner)
+            || !$candidate || $candidate['kind'] !== 'change' || $candidate['origin'] !== $origin
+            || $candidate['value'] !== $fresh['hash'] || $candidate['meta'] !== $fresh['meta']
+            || count($rows) !== 1 || (int) $rows[0]['id'] !== $history['latest']
+            || ($rows[0]['itemtype_link'] ?? '') !== '' || (int) $rows[0]['linked_action'] !== 0
+            || self::projection($rows[0]['old_value'], $rows[0]['new_value'], false) !== $candidate['projection']) {
+            throw new \RuntimeException('Inherited field History is not verified.');
+        }
+        return ['computer_id' => $id, 'field_key' => $key, 'token' => $token, 'generation' => $head['generation'],
+            'epoch' => $candidate['epoch'], 'candidate' => self::candidateHash($candidate), 'origin' => $origin,
+            'value_hash' => $fresh['hash'], 'meta' => $fresh['meta'], 'anchor' => $history['anchor']];
+    }
+
+    /** Trusted committed receipt recovery. Never calls a model, invents time, or promotes a pre-only orphan. */
+    public static function settleInherited(array $receipt): array
+    {
+        global $DB;
+        if (!self::idle() || strtoupper($_SERVER['REQUEST_METHOD'] ?? '') === 'GET') {
+            throw new \RuntimeException('Inherited field settlement requires an idle job or POST.');
+        }
+        $id = $receipt['computer_id']; $key = $receipt['field_key'];
+        $head = self::head($id, $key);
+        $attempt = $head['state']['attempts'][$receipt['token']] ?? null;
+        if ($attempt !== null) {
+            $candidate = $attempt['candidate'];
+            if ($attempt['tainted'] || !$candidate || $head['state']['overflow'] || count($head['state']['attempts']) !== 1
+                || !in_array($head['generation'], [$receipt['generation'], $receipt['generation'] + 1], true)
+                || $candidate['generation'] !== $head['generation'] || $candidate['epoch'] !== $receipt['epoch']
+                || self::candidateHash($candidate) !== $receipt['candidate']) {
+                throw new \RuntimeException('Inherited field receipt changed.');
+            }
+            if (!self::complete(['id' => $id, 'descriptor' => self::descriptorForKey($key), 'token' => $receipt['token'],
+                'generation' => $head['generation'], 'epoch' => $receipt['epoch'], 'stage' => 'candidate',
+                'ready' => false, 'connection' => self::connection(), 'db' => $DB])) {
+                throw new \RuntimeException('Inherited field receipt remains pending.');
+            }
+        }
+        $envelope = self::envelope($id, $key);
+        if ($envelope['origin'] !== $receipt['origin'] || $envelope['hash'] !== $receipt['value_hash']
+            || $envelope['meta'] !== $receipt['meta'] || $envelope['guard']['epoch'] !== $receipt['epoch']
+            || $envelope['guard']['history']['anchor'] !== $receipt['anchor']) {
+            throw new \RuntimeException('Inherited field evidence is no longer current.');
+        }
+        return $envelope;
+    }
+
+    private static function candidateHash(array $candidate): string
+    {
+        unset($candidate['generation'], $candidate['recoverable']);
+        return self::hash($candidate);
+    }
+
     /** Exact trusted scopes are process-local, never inferred from a username or queue suppression. */
     public static function withOrigin(int $id, string $key, string $beforeHash, string $afterHash, array $origin, callable $operation): mixed
     {
@@ -455,11 +563,12 @@ final class FieldEvidence
             && isset($head['state']['attempts'][$entry['token']]) && !$head['state']['attempts'][$entry['token']]['tainted'];
     }
 
-    private static function head(int $id, string $key): array
+    private static function head(int $id, string $key, bool $required = true): ?array
     {
         global $DB;
         if ($id < 1) { throw new \RuntimeException('Field capture identity unavailable.'); }
         $row = self::one('SELECT * FROM `' . self::TABLE . '` WHERE `computer_id`=' . $id . ' AND `field_key`=' . $DB->quote($key) . ' FOR UPDATE');
+        if (!$row && !$required) { return null; }
         if (!$row || strlen($row['evidence']) > 65536) { throw new \RuntimeException('Field capture head unavailable.'); }
         $state = json_decode($row['evidence'], true, 20, JSON_THROW_ON_ERROR);
         if (!is_array($state) || !is_array($state['attempts'] ?? null) || !is_bool($state['overflow'] ?? null)
@@ -539,7 +648,7 @@ final class FieldEvidence
             $row = $rows[0];
         }
         if (!array_key_exists($descriptor['column'], $row)) { throw new \RuntimeException('Field capture value unavailable.'); }
-        return ['hash' => self::valueHash($row[$descriptor['column']]),
+        return ['value' => $row[$descriptor['column']], 'hash' => self::valueHash($row[$descriptor['column']]),
             'row_identity' => self::rowIdentity($row, $descriptor),
             // Entity/deleted scope is authorization elsewhere, not the identity of an unchanged field.
             'meta' => self::hash([$descriptor, $id, (int) $row['id']])];

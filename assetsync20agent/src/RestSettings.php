@@ -49,6 +49,19 @@ final class RestSettings extends \CommonDBTM
     public static function decode(string $json, string $hash): array
     {
         $body = json_decode($json, true, 16, JSON_THROW_ON_ERROR);
+        if (is_array($body) && ($body['version'] ?? null) === 4) {
+            $legacy = $body;
+            if (($body['include_child_entities'] ?? null) !== false || ($body['asset_types'] ?? null) !== ['Computer']
+                || !in_array($body['mappings'] ?? null, [[], [['glpi_a_field' => 'name', 'glpi_b_field' => 'name', 'source_of_truth' => 'both']]], true)) {
+                throw new \RuntimeException('Unsupported Name Both scope.');
+            }
+            unset($legacy['include_child_entities'], $legacy['asset_types']);
+            $legacy['version'] = 2;
+            if ($legacy['mappings'] !== []) { $legacy['mappings'][0]['source_of_truth'] = 'glpi_a'; }
+            self::decode(json_encode($legacy, JSON_THROW_ON_ERROR), TaskExecutor::hash($legacy));
+            if (strlen($json) > 16384 || !hash_equals(TaskExecutor::hash($body), $hash)) { throw new \RuntimeException('Invalid Name Both settings hash.'); }
+            return $body;
+        }
         $keys = ['version', 'id', 'installation', 'registration', 'generation', 'connection_id',
             'route_id', 'source_entity', 'target_entity', 'itemtype', 'mappings'];
         if (($body['version'] ?? null) === 2) { $keys = array_merge($keys, ['revision', 'enabled']); }
@@ -92,7 +105,7 @@ final class RestSettings extends \CommonDBTM
         global $DB;
         $head = Outbox::one('SELECT * FROM `' . self::HEAD . '` WHERE `scope_key` = ' . $DB->quote(self::scope($body)));
         if (!$head) { return $body['version'] === 1 && !self::history($body); }
-        return $body['version'] === 2 && $body['enabled'] && $head['settings_id'] === $body['id']
+        return in_array($body['version'], [2, 4], true) && $body['enabled'] && $head['settings_id'] === $body['id']
             && (int) $head['revision'] === $body['revision'];
     }
 
@@ -102,7 +115,7 @@ final class RestSettings extends \CommonDBTM
         $where = [];
         foreach (['installation', 'registration', 'generation', 'connection_id'] as $key) { $where[] = '`' . $key . '` = ' . $DB->quote($body[$key]); }
         return Outbox::one('SELECT `id` FROM `' . self::getTable() . '` WHERE ' . implode(' AND ', $where)
-            . ' AND JSON_EXTRACT(`body`, \'$.version\') = 2 AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
+            . ' AND JSON_EXTRACT(`body`, \'$.version\') IN (2, 4) AND JSON_UNQUOTE(JSON_EXTRACT(`body`, \'$.route_id\')) = ' . $DB->quote($body['route_id']) . ' LIMIT 1') !== null;
     }
 
     public static function authorize(array $body): array
@@ -126,7 +139,7 @@ final class RestSettings extends \CommonDBTM
         $fields = ['settings_id' => $body['id'], 'hash' => $input['hash'], 'body' => $input['body'],
             'binding' => self::binding($settings, $body['version']), 'entities_id' => $body['target_entity']];
         foreach (['connection_id', 'registration', 'generation', 'installation'] as $key) { $fields[$key] = $body[$key]; }
-        if ($body['version'] === 2) { return $this->activate($body, $fields); }
+        if (in_array($body['version'], [2, 4], true)) { return $this->activate($body, $fields); }
         global $DB;
         $old = Outbox::one('SELECT * FROM `' . self::getTable() . '` WHERE `settings_id` = ' . $DB->quote($body['id']));
         if (!$old) {

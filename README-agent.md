@@ -1,5 +1,99 @@
 # GLPI B Agent
 
+## Original-Edit Name Both Checkpoint (Settings4 / Work11)
+
+Controller **0.9.4** and agent **0.8.4** add the first original-field Both
+checkpoint: an existing confirmed Computer pair, exact entity route, and one
+native Name-to-Name mapping. Update B, then A with the supported plugin Update
+and Enable lifecycle; quiesce saves/workers as described below. No new table is
+needed beyond the installed capture heads and existing settings/work/journal
+tables. Keep the pair explicitly selected in the existing v8 batch pair list.
+Choose Both in the existing mapping control; A publishes settings4 with a new
+durable revision. Old peers reject it, without a legacy/transport fallback.
+Settings3/Work10 remain reserved for the separately paused scope expansion.
+Protocols/settings1-9 retain their original schemas, bodies, hashes and replays.
+
+This is **Name-only, not complete Both support**. Broader supported native/custom
+scalars and references/dropdowns, different keys/containers, reverse conversions,
+field-specific conflict groups, fanout/first-copy and the remaining REST roadmap
+still require separate implementation and independent qualification. Legacy
+protocol6 Both is not original-browser-evidence qualification for the new flow.
+
+Newest **genuine mapped-field edit** wins, including a permitted newer blank.
+Values normalize null to blank without trimming/case folding; equal normalized
+values cause no model write, new origin or duplicate History. For unequal values,
+A wins only when A's original lower UTC bound is strictly greater than B's upper
+bound; B wins symmetrically. Missing, same-second/equal or overlapping evidence
+is a visible Name conflict, with no model mutation. Comparable installation
+clocks remain an assumption, not a claim that UTC establishes clock trust. No
+baseline, asset `date_mod`, fixed priority or guessed original time participates.
+
+Logical eligibility hashes normalized Name, original event identity/revision,
+technical field identity, current settings and confirmed asset identity. They
+exclude capture head-generation/epoch/History housekeeping. An unmapped Comments
+save can therefore advance the exact execution guard without publishing Name
+work. Both the scanner and queued-hook processing check this locally: zero
+per-asset/auth requests and no invented verified/link success. A local skip does
+not update the last probe time. Full immutable guards remain in prepared Work11
+and are rechecked before dispatch and under owned transaction locks. An unsent
+preparation with changed or unavailable source evidence makes zero HTTP/auth
+requests and retains its slot; its deferred turn does not block later batches.
+Already-sent work with a changed source is observation-only, not permission to
+replay the obsolete mutation. A midflight change may still hold work conservatively.
+
+A's ordinary bounded backfill scanner currently schedules an unchanged pair
+again after **60 seconds since its last completed reconciliation** to discover
+B-only edits. This is temporary **per-pair current-state probe overhead**, not
+shared polling, a production latency guarantee or the final diagram's request
+count. There is no required B daemon. Wave7's immutable changes GET/exact ACK
+delivery is not implemented by these probes. A normal eligible request uses a
+bounded POST then stored-result GET when ready; auth/settings, probes, failures,
+retries and metadata continuations are counted separately.
+
+Work11 batches contain at most **two** rows and49,152 request bytes. Each public
+row is bounded to31,000 native JSON bytes, so two rows plus punctuation stay
+under the unchanged64KiB response cap, including255-character supplementary
+Unicode/control/quote/backslash Name evidence. Collection lookup requires exact
+batch+compiler11, range at most two, `get_hateoas=0`, no debug. External
+body/hash/result remain exact; only private compiler fields are omitted. The
+existing v8 four-row/16,000-byte-row contract is unchanged.
+One monotonic five-second execution budget is shared by the admitted batch,
+not renewed per member. Admission and post-model checks prevent over-budget
+model commits. A synchronous official model call cannot be preempted, so this
+is not a hard HTTP response-latency guarantee; an overrun rolls back that member.
+
+Each local write uses the supported Computer model with fresh mapping, scope,
+identity, readonly/access and full-value guards. B retains its separate real
+service login; the exact inherited-origin scope is inside that authorized write,
+beneath the outer unknown-sync scope. A uses its established internal cron job
+boundary with fresh confirmed route/entity/ownership checks, not a fabricated
+interactive session; interactive callers still need native READ/UPDATE/entity
+access. Native field History and typed readback must corroborate the transition.
+
+Model+History+an exact inherited receipt commit atomically as `origin_pending`.
+That is **not verified completion**. B's public result stays empty until an
+idle metadata-only pass proves the inherited original event and fresh guards;
+A likewise leaves its queue/slot unfinished until its local evidence qualifies.
+If the process/reply is lost after commit, identical POST (including after work
+expiry) or the ordinary A job recovers only the persisted receipt, never reruns
+the asset mutation or mints a new time. GET only reads persisted state and checks
+fresh READ/guard evidence; it never settles or executes. An executing orphan
+without a committed receipt remains uncertain, not permission to replay.
+Only a validated terminal **no-write conflict** may retire its slot while retaining
+the immutable body/hash/result, letting a genuinely newer edit be reconsidered.
+Uncertain/executing/ambiguous work remains held; no blanket slot reset is provided.
+A later B edit can also fail the exact guard on terminal GET disclosure, leaving
+A unable to observe that immutable result and its slot held. This is a known
+finite checkpoint limitation, not automatic stale-slot recovery or full liveness.
+
+Host suites `agent-name-both*.php` exercise protocol/decision parity, response
+bounds, guards, committed fresh-process evidence recovery, model rollback,
+queued unmapped zero-RPC behavior and ordinary due scanning. These use SQL/model
+or HTTP doubles. Actual ordinary Chrome wins/blanks/no-op/conflicts, unmodified
+A CLI worker B-only reconciliation, native transaction/deadline/permission
+faults and protected old evidence are independent Debugger gates before this
+checkpoint can be called qualified. Name success never implies full-field Both.
+
 ## Local Browser Field Evidence (Capture Only)
 
 Controller **0.9.3** and agent **0.8.3** add independently packaged local field
@@ -133,7 +227,7 @@ is required in this mode. B fences adapter run, wake, send, pull and direct clai
 against fresh saved transport, including callers holding old adapter settings.
 Its retained adapter health/outbox remain inspectable as previous evidence.
 
-This slice supports only exact-entity Computer routes, one Name-to-Name mapping
+The original4a slice supports only exact-entity Computer routes, one Name-to-Name mapping
 with A authority and explicitly opted-in confirmed v8 pairs. Child-entity and
 mixed-type routes remain unsupported here. The selected v7 pair setting remains
 separate; a route governed by v2 is not silently downgraded to older settings.

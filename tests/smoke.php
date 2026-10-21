@@ -660,6 +660,11 @@ class Computer
 {
     public static bool $allowUpdate = true;
     public static bool $ignoreUpdate = false;
+    public static ?Closure $beforeModelUpdate = null;
+    public static ?Closure $afterModelUpdate = null;
+    public array|false $input = [];
+    public array $updates = [];
+    public array $oldvalues = [];
     /** @var array<string,mixed> */
     public array $fields = [];
 
@@ -668,6 +673,15 @@ class Computer
     public static function getTable(): string
     {
         return 'glpi_computers';
+    }
+
+    public function rawSearchOptions(): array
+    {
+        $options = [];
+        foreach (Search::getOptions('Computer') as $id => $option) {
+            if (($option['table'] ?? '') === self::getTable()) { $options[] = ['id' => $id] + $option; }
+        }
+        return $options;
     }
 
     public function getFromDB($id): bool
@@ -690,6 +704,10 @@ class Computer
     public function update(array $input): bool
     {
         global $DB;
+        $this->input = $input;
+        $this->updates = array_keys(array_diff_key($input, ['id' => true]));
+        $this->oldvalues = array_intersect_key($this->fields, array_flip($this->updates));
+        if (self::$beforeModelUpdate) { (self::$beforeModelUpdate)($this); }
         if (self::$ignoreUpdate) { return true; }
 
         $id = (int) ($input['id'] ?? 0);
@@ -699,7 +717,9 @@ class Computer
             return false;
         }
 
-        return $DB->update(self::getTable(), $input, ['id' => $id]);
+        $ok = $DB->update(self::getTable(), $input, ['id' => $id]);
+        if ($ok && self::$afterModelUpdate) { (self::$afterModelUpdate)($this); }
+        return $ok;
     }
 }
 
@@ -1534,7 +1554,7 @@ $metadata = plugin_version_assetsync20();
 $expectations = [
     'id' => 'assetsync20',
     'name' => 'AssetSync2.0',
-    'version' => '0.9.3',
+    'version' => '0.9.4',
 ];
 
 foreach ($expectations as $key => $expected) {

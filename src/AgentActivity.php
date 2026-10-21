@@ -78,7 +78,7 @@ final class AgentActivity
             $state = $task['state'] === 'finalizing' ? 'executing' : $task['state'];
             $label = in_array($state, AgentTask::OUTCOMES, true) ? $state : 'unknown';
             $context = json_decode($task['context'], true);
-            if (in_array($body['version'] ?? 0, [7, 8], true)) { $label = self::restLabel($task, $body, $context ?? []); }
+            if (in_array($body['version'] ?? 0, [7, 8, 11], true)) { $label = self::restLabel($task, $body, $context ?? []); }
             if (($body['version'] ?? 0) === 9) { $label = $state === 'observed' ? 'REST inspection received; confirmation remains separate' : 'REST inspection ' . $state; }
             if ($state === 'blocked' && isset($context['field_conflict'])) {
                 $label = 'Field conflict: values differ, but the newer change cannot be verified. No values were changed. A later verified edit or a mapping correction is needed.';
@@ -125,6 +125,8 @@ final class AgentActivity
 
     private static function restLabel(array $task, array $body, array $context): string
     {
+        if ($task['state'] === 'origin_pending' || ($context['rest_state'] ?? '') === 'origin_pending') { return 'REST model committed; original field evidence pending qualification'; }
+        if ($task['state'] === 'conflict') { return 'REST Name conflict; no mutation, original intervals need review'; }
         $result = json_decode($task['result'], true);
         if (in_array($task['state'], ['verified', 'unchanged'], true)) { return 'REST ' . $task['state']; }
         if (in_array($task['state'], ['accepted', 'finalizing'], true)

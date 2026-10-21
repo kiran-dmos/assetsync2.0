@@ -6,7 +6,11 @@ require __DIR__ . '/agent-prototype.php';
 if (!defined('READ')) { define('READ', 1); }
 class Session
 {
-    public static function haveAccessToEntity($entity): bool { return true; }
+    public static bool $entityAccess = true;
+    public static function haveAccessToEntity($entity): bool { return self::$entityAccess; }
+    public static function getLoginUserID(bool $human = true): int { return 7; }
+    public static function isCron(): bool { return isset($_SESSION['glpicronuserrunning']); }
+    public static function isInventory(): bool { return false; }
 }
 class AgentSearchOptions extends Search
 {

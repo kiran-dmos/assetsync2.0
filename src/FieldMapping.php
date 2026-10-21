@@ -215,10 +215,10 @@ final class FieldMapping
         }
         $rows = self::rowsFromScope($rowInput ? ['version' => 2, 'rows' => $fieldMappings] : $fieldMappings);
         if ((GlpiBConnection::find($connectionId)['agent_transport'] ?? 'adapter') === 'rest_records') {
-            if (count($rows) > 1) { throw new \RuntimeException('REST records supports one native Name mapping with A authority only.'); }
+            if (count($rows) > 1) { throw new \RuntimeException('REST records currently supports one native Name mapping.'); }
             foreach ($rows as $row) {
                 if (!in_array($row['glpi_a_field_key'] ?? '', ['name', 'Computer.name'], true) || !in_array($row['glpi_b_field_key'] ?? '', ['name', 'Computer.name'], true)
-                    || ($row['source_of_truth'] ?? '') !== 'glpi_a' || $itemtype !== 'Computer') { throw new \RuntimeException('REST records supports Computer Name with A authority only.'); }
+                    || !in_array($row['source_of_truth'] ?? '', ['glpi_a', 'both'], true) || $itemtype !== 'Computer') { throw new \RuntimeException('REST records currently supports Computer Name with A authority or qualified original-field Both.'); }
             }
         }
         if (GlpiBConnection::isAgentConnection($connectionId)) {
