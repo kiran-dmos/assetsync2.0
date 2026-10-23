@@ -256,10 +256,21 @@ final class AgentInbox
                 return self::ack($event);
             }
             $pair = self::pair($registration, $id);
-            if ($event['lifecycle'] !== 'present' || $revision < (int) $receipt['received_revision'] || $pair === null) {
+            if ($event['lifecycle'] !== 'present' || $revision < (int) $receipt['received_revision']) {
                 self::written($DB->update(self::RECEIPTS, ['outcome' => 'blocked', 'outcome_at' => time()], $where));
                 self::sql('COMMIT');
                 return ['status' => 409, 'outcome' => 'blocked'];
+            }
+            // A new B Computer has no link yet.  Persist its current revision and
+            // acknowledge it only after commit; the worker will read, validate,
+            // create and verify the A-side asset.  Never create from this HTTP
+            // request, which must remain small, repeatable and idempotent.
+            if ($pair === null) {
+                self::written($DB->update(self::RECEIPTS, ['admitted_revision' => $revision,
+                    'queue_id' => null, 'work_generation' => 0, 'outcome' => 'pending_create',
+                    'outcome_at' => time()], $where));
+                self::sql('COMMIT');
+                return self::ack($event);
             }
             $local = (int) $pair['items_id'];
             $conn = $DB->quote($registration['connection_id']);
@@ -289,6 +300,207 @@ final class AgentInbox
     {
         return ['status' => 200, 'accepted' => true, 'registration' => $event['registration'],
             'generation' => $event['generation'], 'computer_id' => $event['computer_id'], 'revision' => $event['revision']];
+    }
+
+    /**
+     * Creates GLPI A Computers for valid, unlinked B notifications.  This is
+     * deliberately invoked by the normal A worker, never by the callback.
+     */
+    public static function processPendingCreations(int $limit = 5): int
+    {
+        global $DB;
+        $processed = 0;
+        $rows = $DB->request(['FROM' => self::RECEIPTS, 'WHERE' => ['outcome' => 'pending_create', 'lifecycle' => 'present'],
+            'ORDER' => ['received_at ASC', 'id ASC'], 'LIMIT' => max(1, $limit)]);
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+            try {
+                self::processPendingCreation($row);
+            } catch (\Throwable $error) {
+                // A transient local/database/create exception must remain due;
+                // a later worker cycle can then recover without a second B save.
+                self::setCreationOutcome($row, 'pending_create');
+            }
+            $processed++;
+        }
+        return $processed;
+    }
+
+    private static function processPendingCreation(array $receipt): void
+    {
+        global $DB;
+        self::sql('START TRANSACTION');
+        try {
+            $current = self::one('SELECT * FROM `' . self::RECEIPTS . '` WHERE `id` = ' . (int) $receipt['id'] . ' FOR UPDATE');
+            if (!$current || $current['outcome'] !== 'pending_create' || $current['lifecycle'] !== 'present') {
+                self::sql('COMMIT');
+                return;
+            }
+            $registration = self::one('SELECT * FROM `' . self::REGISTRATIONS . '` WHERE `id` = '
+                . $DB->quote($current['registration_id']) . ' FOR UPDATE');
+            $connection = $registration ? self::connection($registration['connection_id']) : null;
+            if (!$registration || !$registration['active'] || !$connection
+                || self::identity($connection) !== $registration['connection_identity']) {
+                self::setCreationOutcome($current, 'blocked');
+                self::sql('COMMIT');
+                return;
+            }
+            self::sql('COMMIT');
+        } catch (\Throwable $error) {
+            $DB->doQuery('ROLLBACK');
+            throw $error;
+        }
+
+        GlpiBConnection::beginOrdinaryAttempt(hrtime(true) + 15_000_000_000);
+        try {
+            $remoteResult = GlpiBConnection::getItem($connection, 'Computer', (int) $receipt['computer_id'], false);
+        } finally {
+            GlpiBConnection::endOrdinaryAttempt();
+        }
+        $remote = is_array($remoteResult['item'] ?? null) ? $remoteResult['item'] : [];
+        if (empty($remoteResult['success']) || (int) ($remote['id'] ?? 0) !== (int) $receipt['computer_id']) {
+            // Keep transient failures pending so the next worker cycle retries
+            // the same durable notification without requiring another B save.
+            self::setCreationOutcome($receipt, !empty($remoteResult['transient']) ? 'pending_create' : 'blocked');
+            return;
+        }
+        if (!empty($remote['is_deleted']) || !empty($remote['is_template']) || trim((string) ($remote['serial'] ?? '')) === '') {
+            self::setCreationOutcome($receipt, 'blocked');
+            return;
+        }
+        $route = self::creationRoute($registration, (int) ($remote['entities_id'] ?? -1));
+        if ($route === null) {
+            self::setCreationOutcome($receipt, 'blocked');
+            return;
+        }
+        $serial = trim((string) $remote['serial']);
+        $remoteId = (int) $receipt['computer_id'];
+        $existingLinks = iterator_to_array($DB->request(['FROM' => AssetSyncLink::TABLE, 'WHERE' => [
+            'itemtype' => 'Computer', 'glpi_b_connection_id' => $connection['id'], 'remote_items_id' => $remoteId], 'LIMIT' => 2]));
+        if (count($existingLinks) > 1) {
+            self::setCreationOutcome($receipt, 'blocked');
+            return;
+        }
+        $localId = count($existingLinks) === 1 ? (int) $existingLinks[0]['items_id'] : self::uniqueLocalSerial($serial, (int) $route['glpi_a_source_entity_id']);
+        if ($localId === -1) {
+            self::setCreationOutcome($receipt, 'blocked');
+            return;
+        }
+        if ($localId > 0) {
+            $localLink = AssetSyncLink::find('Computer', $localId, $connection['id']);
+            if ($localLink !== null && (int) ($localLink['remote_items_id'] ?? 0) !== $remoteId) {
+                // One local Computer cannot silently be relinked to another B
+                // Computer, even when the serial happens to be identical.
+                self::setCreationOutcome($receipt, 'blocked');
+                return;
+            }
+        }
+        if ($localId === 0) {
+            $input = self::creationInput($connection, $route, $remote);
+            $localId = InternalGlpiExecutor::run(static function () use ($input): int {
+                $computer = new \Computer();
+                $id = (int) $computer->add($input);
+                if ($id <= 0 || !$computer->getFromDB($id)
+                    || trim((string) ($computer->fields['serial'] ?? '')) !== trim((string) $input['serial'])
+                    || (int) ($computer->fields['entities_id'] ?? -1) !== (int) $input['entities_id']) {
+                    throw new \RuntimeException('GLPI A did not verify the created Computer.');
+                }
+                return $id;
+            });
+        }
+        $local = self::one('SELECT * FROM `glpi_computers` WHERE `id` = ' . $localId);
+        if (!$local || !empty($local['is_deleted']) || !empty($local['is_template']) || trim((string) $local['serial']) !== $serial
+            || (int) $local['entities_id'] !== (int) $route['glpi_a_source_entity_id']) {
+            self::setCreationOutcome($receipt, 'blocked');
+            return;
+        }
+        if (!AssetSyncLink::save(['itemtype' => 'Computer', 'items_id' => $localId,
+            'glpi_b_connection_id' => $connection['id'], 'route_id' => $route['id'], 'remote_items_id' => $remoteId,
+            'status' => AssetSyncLink::STATUS_SYNCED, 'last_error' => '', 'confirmed_remote_id' => $remoteId,
+            'confirmed_entity_id' => (int) $route['glpi_b_target_entity_id'], 'confirmed_identity' => self::identity($connection)])) {
+            throw new \RuntimeException('Could not save the verified B-to-A asset link.');
+        }
+        self::setCreationOutcome($receipt, 'created');
+    }
+
+    private static function creationRoute(array $registration, int $remoteEntityId): ?array
+    {
+        $approved = json_decode($registration['routes'], true, 32, JSON_THROW_ON_ERROR);
+        $matches = [];
+        foreach (EntitySyncRoute::loadAll(true) as $route) {
+            if ($route['active'] && $route['glpi_b_connection_id'] === $registration['connection_id']
+                && in_array('Computer', $route['asset_types'], true) && (int) $route['glpi_b_target_entity_id'] === $remoteEntityId
+                && ($approved[$route['id']]['fingerprint'] ?? '') === self::routeIdentity($route)) {
+                $matches[] = $route;
+            }
+        }
+        return count($matches) === 1 ? $matches[0] : null;
+    }
+
+    /** Returns 0 for no local match, -1 for ambiguous/unsafe, otherwise the local Computer id. */
+    private static function uniqueLocalSerial(string $serial, int $entityId): int
+    {
+        global $DB;
+        $rows = iterator_to_array($DB->request(['FROM' => 'glpi_computers', 'WHERE' => ['serial' => $serial,
+            'is_deleted' => 0, 'is_template' => 0], 'LIMIT' => 2]));
+        if (count($rows) === 0) {
+            return 0;
+        }
+        if (count($rows) !== 1 || (int) $rows[0]['entities_id'] !== $entityId) {
+            return -1;
+        }
+        return (int) $rows[0]['id'];
+    }
+
+    /** Bootstrap from B once, translating dropdown labels instead of copying foreign ids. */
+    private static function creationInput(array $connection, array $route, array $remote): array
+    {
+        $mappings = FieldMapping::syncMappings($connection['id'], 'Computer');
+        $keys = [];
+        foreach ($mappings as $mapping) {
+            if (!FieldsText::isCustom($mapping['glpi_a_field']) && !FieldsText::isCustom($mapping['glpi_b_field'])
+                && $mapping['glpi_a_field'] !== 'uuid' && $mapping['glpi_b_field'] !== 'uuid') {
+                $keys[] = $mapping['glpi_b_field'];
+            }
+        }
+        $context = GlpiBConnection::nativeMappingContext($connection, 'Computer', $keys, (int) $route['glpi_b_target_entity_id']);
+        if (empty($context['success'])) {
+            throw new \RuntimeException((string) ($context['message'] ?? 'Unable to read GLPI B field metadata.'));
+        }
+        $input = ['entities_id' => (int) $route['glpi_a_source_entity_id'], 'serial' => trim((string) $remote['serial'])];
+        foreach ($mappings as $mapping) {
+            $a = $mapping['glpi_a_field']; $b = $mapping['glpi_b_field'];
+            if (FieldsText::isCustom($a) || FieldsText::isCustom($b) || $a === 'serial' || $a === 'uuid' || $b === 'uuid' || !array_key_exists($b, $remote)) {
+                continue;
+            }
+            $remoteDescriptor = $context['fields'][$b] ?? null;
+            $localDescriptor = NativeField::local('Computer', $a);
+            if (!is_array($remoteDescriptor) || $remoteDescriptor['type'] !== $localDescriptor['type']) {
+                throw new \RuntimeException('Mapped native field type changed: ' . $a . '.');
+            }
+            $value = $remote[$b];
+            if ($localDescriptor['type'] === 'dropdown') {
+                $label = NativeField::labelForId($context['catalogs'][$b] ?? [], $value);
+                $catalog = NativeField::localCatalog($localDescriptor, (int) $route['glpi_a_source_entity_id'], [], [$label]);
+                $value = NativeField::idForLabel($catalog, $label);
+            } else {
+                $value = FieldsText::normalizeValue($localDescriptor['type'], $value);
+            }
+            $input[$a] = $value;
+        }
+        return $input;
+    }
+
+    private static function setCreationOutcome(array $receipt, string $outcome): void
+    {
+        global $DB;
+        $fields = ['outcome' => $outcome, 'outcome_at' => time()];
+        if (in_array($outcome, ['created', 'blocked'], true)) {
+            $fields['completed_revision'] = (int) $receipt['admitted_revision'];
+        }
+        $DB->update(self::RECEIPTS, $fields, ['id' => (int) $receipt['id']]);
     }
 
     /** Exactly one confirmed reverse link, still on an enabled approved route. */

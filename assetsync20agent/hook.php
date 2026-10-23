@@ -6,13 +6,12 @@ require_once __DIR__ . '/src/autoload.php';
 
 function plugin_assetsync20agent_install(): bool
 {
-    return \GlpiPlugin\Assetsync20agent\Outbox::install();
+    // No callback outbox is needed. GLPI A polls linked GLPI B assets.
+    return true;
 }
 
 function plugin_assetsync20agent_uninstall(): bool
 {
-    // Watermarks and unacknowledged work survive uninstall. Reinstall requires new credentials.
-    \Config::deleteConfigurationValues('plugin:assetsync20agent', ['endpoint', 'registration', 'generation', 'token']);
     \GlpiPlugin\Assetsync20agent\ExecutionSettings::clear();
     return true;
 }

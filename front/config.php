@@ -98,7 +98,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'app_token'  => $_POST['app_token'] ?? '',
             'user_token' => $_POST['user_token'] ?? '',
             'agent_endpoint' => $_POST['agent_endpoint'] ?? '',
-            'agent_token' => $_POST['agent_token'] ?? '',
             'agent_allow_lab_http' => $_POST['agent_allow_lab_http'] ?? '',
             'active'     => $_POST['active'] ?? '',
         ]);
@@ -345,8 +344,7 @@ echo '<td>' . ($connection['user_token'] !== '' ? 'Yes' : 'No') . '</td></tr>';
 
 echo '<tr><th colspan="2">Optional: Agent B execution (recommended for writes)</th></tr>';
 echo '<tr><td><label for="agent_endpoint">Agent B command URL</label></td><td><input type="url" id="agent_endpoint" name="agent_endpoint" value="' . $html($connection['agent_endpoint'] ?? '') . '" size="60" placeholder="https://glpi-b.example/plugins/assetsync20agent/front/agent-command.php"><br><small>When configured, Computer Comment updates are executed and verified by Agent B.</small></td></tr>';
-echo '<tr><td><label for="agent_token">Agent B command token</label></td><td><input type="password" id="agent_token" name="agent_token" value="" size="60" autocomplete="new-password"></td></tr>';
-echo '<tr><td>Saved Agent B command token</td><td>' . (($connection['agent_token'] ?? '') !== '' ? 'Yes' : 'No') . '</td></tr>';
+echo '<tr><td>Agent B authentication</td><td>Uses the App Token and User Token above. The User Token must belong to the dedicated <code>assetsync-agent-b</code> service account.</td></tr>';
 echo '<tr><td><label for="agent_allow_lab_http">Allow local-lab HTTP</label></td><td><input type="checkbox" id="agent_allow_lab_http" name="agent_allow_lab_http" value="1"' . (!empty($connection['agent_allow_lab_http']) ? ' checked' : '') . '> Local Docker only; never production.</td></tr>';
 
 echo '<tr><td><label for="active">Active</label></td>';

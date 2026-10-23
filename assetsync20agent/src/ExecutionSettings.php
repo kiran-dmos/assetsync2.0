@@ -11,18 +11,14 @@ final class ExecutionSettings
 
     public static function load(): array
     {
-        $values = \Config::getConfigurationValues(self::CONTEXT);
-        $values['command_token'] = (new \GLPIKey())->decrypt($values['command_token'] ?? '') ?? '';
-        return $values + ['service_user_id' => '0'];
+        return \Config::getConfigurationValues(self::CONTEXT) + ['service_user_id' => '0'];
     }
 
     public static function save(array $input): void
     {
-        $old = self::load();
         $serviceUserId = (int) ($input['service_user_id'] ?? 0);
-        $commandToken = trim((string) ($input['command_token'] ?? '')) ?: (string) $old['command_token'];
-        if ($serviceUserId <= 0 || !preg_match('/^[a-f0-9]{64}$/D', $commandToken)) {
-            throw new \RuntimeException('Enter the assetsync-agent-b GLPI user ID and a 64-character command token.');
+        if ($serviceUserId <= 0) {
+            throw new \RuntimeException('Enter the assetsync-agent-b GLPI user ID.');
         }
         $user = new \User();
         if (!$user->getFromDB($serviceUserId) || !empty($user->fields['is_deleted'])) {
@@ -30,7 +26,6 @@ final class ExecutionSettings
         }
         \Config::setConfigurationValues(self::CONTEXT, [
             'service_user_id' => (string) $serviceUserId,
-            'command_token'   => (new \GLPIKey())->encrypt($commandToken),
         ]);
     }
 

@@ -11,6 +11,12 @@ if (!defined('GLPI_ROOT')) {
 }
 include GLPI_ROOT . '/inc/includes.php';
 require_once __DIR__ . '/../src/autoload.php';
+Html::header('AssetSync2.0', $_SERVER['PHP_SELF'], 'config', 'Plugin');
+echo '<h2>Agent registration retired</h2>';
+echo '<p>GLPI A now polls confirmed GLPI B asset links. '
+    . 'No B registration, callback URL, notification token, or Agent B worker is required.</p>';
+Html::footer();
+exit;
 global $DB;
 try {
     SyncActivity::checkAccess();

@@ -23,16 +23,16 @@ function plugin_init_assetsync20(): void
     global $PLUGIN_HOOKS;
 
     $PLUGIN_HOOKS['csrf_compliant'][Plugin::KEY] = true;
-    if (class_exists(\Glpi\Http\SessionManager::class)) {
-        // This single machine endpoint authenticates its own bearer credential, without cookies.
-        \Glpi\Http\SessionManager::registerPluginStatelessPath(Plugin::KEY, '#^/front/agent-notify\\.php$#D');
-        \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(Plugin::KEY, '#^/front/agent-notify\\.php$#D',
-            \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
-    }
     $PLUGIN_HOOKS['config_page'][Plugin::KEY] = 'front/config.php';
     $PLUGIN_HOOKS['add_css'][Plugin::KEY] = 'css/assetsync20.css';
     $PLUGIN_HOOKS['menu_toadd'][Plugin::KEY] = [
         'config' => Menu::class,
+    ];
+    // GLPI's Transfer List moves an asset between entities without using the
+    // ordinary item_update hook. Queue the post-transfer asset separately.
+    $PLUGIN_HOOKS['item_transfer'][Plugin::KEY] = [
+        AssetChangeHook::class,
+        'onTransfer',
     ];
 
     foreach (array_keys(FieldMapping::assetTypes()) as $itemtype) {
@@ -85,21 +85,9 @@ function plugin_assetsync20_check_prerequisites(): bool
         echo 'This plugin requires PHP ' . PLUGIN_ASSETSYNC20_MIN_PHP_VERSION . ' or newer.';
         return false;
     }
-
-    if (!defined('GLPI_VERSION')) {
-        echo 'This plugin must be loaded from GLPI.';
-        return false;
-    }
-
-    if (
-        version_compare(GLPI_VERSION, PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION, '<')
-        || version_compare(GLPI_VERSION, PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION, '>=')
-    ) {
-        echo 'This plugin requires GLPI >= ' . PLUGIN_ASSETSYNC20_MIN_GLPI_VERSION
-            . ' and < ' . PLUGIN_ASSETSYNC20_MAX_GLPI_VERSION . '.';
-        return false;
-    }
-
+    // GLPI validates its own version through the `requirements` entry returned
+    // by plugin_version_assetsync20(). GLPI 11 does not expose GLPI_VERSION
+    // during every plugin lifecycle check.
     return true;
 }
 

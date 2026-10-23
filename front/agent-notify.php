@@ -9,6 +9,13 @@ if (!defined('GLPI_ROOT')) {
 }
 include GLPI_ROOT . '/inc/includes.php';
 require_once __DIR__ . '/../src/autoload.php';
+http_response_code(410);
+header('Content-Type: application/json; charset=utf-8');
+echo json_encode([
+    'success' => false,
+    'message' => 'Agent B callback notifications are no longer used.',
+]);
+exit;
 
 header('Content-Type: application/json');
 header('Cache-Control: no-store');

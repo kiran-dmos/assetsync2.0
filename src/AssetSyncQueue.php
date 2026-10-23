@@ -13,6 +13,8 @@ final class AssetSyncQueue
     public const STATUS_RETRY = 'retry';
     public const STATUS_DONE = 'done';
     public const STATUS_BLOCKED = 'blocked';
+    // Reclaim an abandoned job quickly after a worker restart/interruption.
+    private const RUNNING_LEASE_SECONDS = 120;
 
     public static function install(): bool
     {
@@ -564,10 +566,10 @@ SQL;
             if ($startedAt <= 0) {
                 $modifiedAt = (int) ($row['modified_epoch'] ?? 0);
 
-                return $modifiedAt > 0 && $modifiedAt <= $now - 1800;
+                return $modifiedAt > 0 && $modifiedAt <= $now - self::RUNNING_LEASE_SECONDS;
             }
 
-            return $startedAt <= $now - 1800 || $startedAt > $now + 60;
+            return $startedAt <= $now - self::RUNNING_LEASE_SECONDS || $startedAt > $now + 60;
         }
 
         return false;
@@ -581,7 +583,7 @@ SQL;
         $started = 'COALESCE(UNIX_TIMESTAMP(`started_at`), 0)';
         $modified = 'COALESCE(UNIX_TIMESTAMP(`date_mod`), 0)';
         $legacyFuture = $now + 60;
-        $staleBefore = $now - 1800;
+        $staleBefore = $now - self::RUNNING_LEASE_SECONDS;
 
         return <<<SQL
 (

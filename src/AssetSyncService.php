@@ -16,7 +16,10 @@ final class AssetSyncService
     private const MAX_VISIT_CANDIDATES = 5;
     private const SCAN_SECONDS = 2;
     private const MAX_ROUTE_ENTITY_IDS = 1000;
-    private const INBOUND_RECHECK_SECONDS = 3600;
+    // GLPI A is the controller. Every worker cycle reconciles B-owned mapped
+    // fields for existing confirmed pairs; GLPI B does not need to push a
+    // callback or maintain a separate registration.
+    private const INBOUND_RECHECK_SECONDS = 10;
     private const DATE_MOD_TIMEZONE_KEY = 'date_mod_timezone';
 
     /** @var object|string */
@@ -96,6 +99,9 @@ final class AssetSyncService
             FieldMapping::beginRunCache();
             BillingFieldConfig::beginRunCache();
             FieldsText::beginRunCache();
+            // B-originated new assets are created only by this durable worker.
+            // Existing linked B notifications continue through the ordinary queue.
+            $inboundCreated = AgentInbox::processPendingCreations(min(5, $batchSize));
             $uuidAvailable = false;
             $uuidDue = false;
             $uuidOutcome = 'upgrade_required';
@@ -129,7 +135,7 @@ final class AssetSyncService
             // The first class gets one attempt and preserves the remaining local scan allowance.
             $remainingNs = max(0, $this->runDeadlineNs - hrtime(true));
             $this->phaseDeadlineNs = $this->runDeadlineNs - min($this->scanBudgetNs, max(0, $remainingNs - GlpiBConnection::HTTP_CLEANUP_RESERVE_NS));
-            $processed = 0;
+            $processed = $inboundCreated;
             if (hrtime(true) + GlpiBConnection::HTTP_CLEANUP_RESERVE_NS + 1_000_000 <= $this->phaseDeadlineNs) {
                 if ($bothDue) {
                     \Config::setConfigurationValues(self::SCAN_CONTEXT, [self::NEXT_PRIORITY_KEY => $uuidFirst ? 'ordinary' : 'uuid']);
@@ -670,8 +676,12 @@ final class AssetSyncService
         $customKeys = array_keys($customTypes);
         $needsDateModTimezone = in_array('both', array_column($mappings, 'source_of_truth'), true);
         $link = AssetSyncLink::find($itemtype, $itemsId, $connectionId);
-        if (!$agentWork && $checkUnchanged && !$this->payloadNeedsWork($link, $route, $payloadHash, $mappings)) {
-            $this->recordJobOutcome('skipped', AssetSyncQueue::finish($job, 'Asset payload is unchanged.'));
+        // A missing remote asset must continue into match/create even when
+        // its payload matches an older out-of-scope attempt.
+        if (!$agentWork && $checkUnchanged
+            && (int) ($link['remote_items_id'] ?? 0) > 0
+            && (string) ($link['status'] ?? '') === AssetSyncLink::STATUS_SYNCED
+            && !$this->payloadNeedsWork($link, $route, $payloadHash, $mappings)) {
             return;
         }
         $nativeKeys = array_values(array_filter(array_column($mappings, 'glpi_b_field'), static fn (string $key): bool => !FieldsText::isCustom($key)));
@@ -1383,14 +1393,19 @@ final class AssetSyncService
         $table = $this->assetTable($itemtype);
         if ($db !== null && method_exists($db, 'request') && $table !== '') {
             $rows = $db->request([
-                'SELECT' => [new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`date_mod`)', 'date_mod_epoch')],
+                // GLPI object hydration can omit nullable empty fields, such as Comment.
+                // The sync snapshot must retain them so an empty value remains valid.
+                'SELECT' => ['*', new \Glpi\DBAL\QueryExpression('UNIX_TIMESTAMP(`date_mod`)', 'date_mod_epoch')],
                 'FROM' => $table,
                 'WHERE' => ['id' => $itemsId],
                 'LIMIT' => 1,
             ]);
             foreach ($rows as $row) {
-                if (is_array($row) && is_numeric($row['date_mod_epoch'] ?? null)) {
-                    $fields['_date_mod_epoch'] = (int) $row['date_mod_epoch'];
+                if (is_array($row)) {
+                    $fields = array_replace($fields, $row);
+                    if (is_numeric($row['date_mod_epoch'] ?? null)) {
+                        $fields['_date_mod_epoch'] = (int) $row['date_mod_epoch'];
+                    }
                 }
                 break;
             }

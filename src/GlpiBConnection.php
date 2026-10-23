@@ -161,9 +161,6 @@ final class GlpiBConnection
         if ($userToken === '') {
             $userToken = $current['user_token'];
         }
-        $agentToken = trim((string) ($input['agent_token'] ?? ''));
-        if ($agentToken === '') { $agentToken = $current['agent_token'] ?? ''; }
-
         return [
             'id'         => self::connectionId((string) ($input['id'] ?? '')),
             'name'       => trim((string) ($input['name'] ?? '')),
@@ -171,7 +168,6 @@ final class GlpiBConnection
             'app_token'  => $appToken,
             'user_token' => $userToken,
             'agent_endpoint' => rtrim(trim((string) ($input['agent_endpoint'] ?? ($current['agent_endpoint'] ?? ''))), '/'),
-            'agent_token' => $agentToken,
             'agent_allow_lab_http' => !empty($input['agent_allow_lab_http']),
             'active'     => !empty($input['active']),
         ];
@@ -285,6 +281,25 @@ final class GlpiBConnection
             // initSession already authenticated the app and service user. Some GLPI
             // versions/profiles reject getFullSession even after a valid login.
             return ['success' => true, 'message' => 'Connection to GLPI B succeeded.'];
+        });
+    }
+
+    /**
+     * Sends a narrow Agent B command using a standard GLPI REST session.
+     * The REST session authenticates the App Token and User Token only; the
+     * receiving Agent performs the asset create/update locally through GLPI.
+     *
+     * @param array{id?:string,name?:string,base_url:string,app_token:string,user_token:string,active?:bool} $connection
+     * @param array<string,mixed> $command
+     * @return array{success:bool,message:string,body:array,status_code:int,transient:bool}
+     */
+    public static function executeAgentCommand(array $connection, string $endpoint, array $command): array
+    {
+        return self::withSession($connection, static function (string $sessionToken) use ($connection, $endpoint, $command): array {
+            return self::request('POST', $endpoint, [
+                'App-Token: ' . $connection['app_token'],
+                'Session-Token: ' . $sessionToken,
+            ], $command);
         });
     }
 
@@ -1450,7 +1465,6 @@ final class GlpiBConnection
             'app_token'  => '',
             'user_token' => '',
             'agent_endpoint' => '',
-            'agent_token' => '',
             'agent_allow_lab_http' => false,
             'active'     => false,
         ];
@@ -1517,7 +1531,6 @@ final class GlpiBConnection
                 'app_token'  => self::decryptToken((string) ($savedConnection['app_token'] ?? '')),
                 'user_token' => self::decryptToken((string) ($savedConnection['user_token'] ?? '')),
             'agent_endpoint' => (string) ($savedConnection['agent_endpoint'] ?? ''),
-            'agent_token' => self::decryptToken((string) ($savedConnection['agent_token'] ?? '')),
             'agent_allow_lab_http' => !empty($savedConnection['agent_allow_lab_http']),
                 'active'     => !empty($savedConnection['active']),
             ];
@@ -1542,7 +1555,6 @@ final class GlpiBConnection
                 'app_token'  => self::encryptToken($connection['app_token']),
                 'user_token' => self::encryptToken($connection['user_token']),
                 'agent_endpoint' => rtrim((string) ($connection['agent_endpoint'] ?? ''), '/'),
-                'agent_token' => self::encryptToken((string) ($connection['agent_token'] ?? '')),
                 'agent_allow_lab_http' => !empty($connection['agent_allow_lab_http']),
                 'active'     => $connection['active'],
             ];

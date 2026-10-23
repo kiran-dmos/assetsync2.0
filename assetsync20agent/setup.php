@@ -7,18 +7,24 @@ require_once __DIR__ . '/src/autoload.php';
 function plugin_init_assetsync20agent(): void
 {
     global $PLUGIN_HOOKS;
+
     $PLUGIN_HOOKS['csrf_compliant']['assetsync20agent'] = true;
     $PLUGIN_HOOKS['config_page']['assetsync20agent'] = 'front/config.php';
+
     if (class_exists(\Glpi\Http\SessionManager::class)) {
-        \Glpi\Http\SessionManager::registerPluginStatelessPath('assetsync20agent', '#^/front/agent-command\\.php$#D');
-        \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts('assetsync20agent', '#^/front/agent-command\\.php$#D', \Glpi\Http\Firewall::STRATEGY_NO_CHECK);
+        \Glpi\Http\SessionManager::registerPluginStatelessPath(
+            'assetsync20agent',
+            '#^/front/agent-command\\.php$#D'
+        );
+        \Glpi\Http\Firewall::addPluginStrategyForLegacyScripts(
+            'assetsync20agent',
+            '#^/front/agent-command\\.php$#D',
+            \Glpi\Http\Firewall::STRATEGY_NO_CHECK
+        );
     }
-    foreach (array_merge(['Computer'], \GlpiPlugin\Assetsync20agent\Snapshot::hookTypes()) as $type) {
-        foreach (['item_add', 'item_update', 'item_delete', 'item_restore', 'item_purge'] as $hook) {
-            $PLUGIN_HOOKS[$hook]['assetsync20agent'][$type] = [\GlpiPlugin\Assetsync20agent\ChangeHook::class,
-                $hook === 'item_purge' ? 'purge' : 'changed'];
-        }
-    }
+
+    // GLPI A polls linked GLPI B assets. Agent B does not use callback
+    // registrations, an outbox, or local asset-change hooks.
 }
 
 function plugin_version_assetsync20agent(): array
@@ -30,10 +36,8 @@ function plugin_version_assetsync20agent(): array
 
 function plugin_assetsync20agent_check_prerequisites(): bool
 {
-    return defined('GLPI_VERSION') && version_compare(GLPI_VERSION, '11.0.0', '>=')
-        && version_compare(GLPI_VERSION, '12.0.0', '<') && extension_loaded('curl');
+    return extension_loaded('curl');
 }
-
 function plugin_assetsync20agent_check_config(): bool
 {
     return true;

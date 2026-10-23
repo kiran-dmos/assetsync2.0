@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace GlpiPlugin\Assetsync20agent;
 
-/** Stateless, narrow command endpoint for approved Computer fields. */
+/** Narrow command endpoint for approved Computer fields. */
 final class CommandReceiver
 {
     public static function handle(): void
@@ -12,10 +12,8 @@ final class CommandReceiver
         header('Content-Type: application/json');
         if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') { self::reply(405, ['success' => false, 'message' => 'POST required.']); return; }
         $settings = ExecutionSettings::load();
-        $auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
-        if (!preg_match('/\ABearer ([a-f0-9]{64})\z/i', $auth, $match)
-            || !hash_equals((string) $settings['command_token'], strtolower($match[1]))) {
-            self::reply(401, ['success' => false, 'message' => 'Unauthorised command.']); return;
+        if (!ApiSessionAuthenticator::serviceUserIsAuthenticated((int) ($settings['service_user_id'] ?? 0))) {
+            self::reply(401, ['success' => false, 'message' => 'A valid GLPI B service-account API session is required.']); return;
         }
         try { $command = json_decode((string) file_get_contents('php://input'), true, 32, JSON_THROW_ON_ERROR); }
         catch (\Throwable) { self::reply(400, ['success' => false, 'message' => 'Invalid JSON command.']); return; }

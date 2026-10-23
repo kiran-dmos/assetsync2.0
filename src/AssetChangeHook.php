@@ -18,6 +18,46 @@ final class AssetChangeHook
         self::queueItem($item);
     }
 
+    /**
+     * GLPI invokes item_transfer with ['item' => object, 'options' => array].
+     * The item has moved between local entities, so reload it from the database
+     * before evaluating the destination entity route.
+     *
+     * @param array<string,mixed> $params
+     */
+    public static function onTransfer(array $params): void
+    {
+        $item = $params['item'] ?? null;
+        if (!is_object($item)) {
+            return;
+        }
+        self::approveTransferredAsset($item);
+        self::queueItem($item, true);
+    }
+    private static function approveTransferredAsset(object $item): void
+    {
+        $assetRef = self::assetRef($item);
+        if ($assetRef === null) {
+            return;
+        }
+
+        [$itemtype, $itemsId] = $assetRef;
+        $asset = self::parentFields($item, $itemtype, $itemsId, true);
+        if ($asset === null || !empty($asset['is_deleted'])) {
+            return;
+        }
+
+        $scope = EntitySyncRoute::matchAsset($itemtype, (string) ($asset['entities_id'] ?? ''));
+        $requestedBy = class_exists('\\Session') && method_exists('\\Session', 'getLoginUserID')
+            ? (int) \Session::getLoginUserID()
+            : 0;
+
+        foreach ($scope['matches'] as $match) {
+            $route = $match['route'];
+            TransferList::approve($itemtype, $itemsId, $route['id'], $requestedBy);
+        }
+    }
+
     public static function withoutQueue(callable $callback): bool
     {
         self::$suppressionDepth++;
@@ -144,7 +184,7 @@ final class AssetChangeHook
         return [$base, $base . 's'];
     }
 
-    private static function queueItem(object $item): void
+    private static function queueItem(object $item, bool $reloadAsset = false): void
     {
         if (self::$suppressionDepth > 0) {
             return;
@@ -157,7 +197,7 @@ final class AssetChangeHook
             }
 
             [$itemtype, $itemsId] = $assetRef;
-            $asset = self::parentFields($item, $itemtype, $itemsId);
+            $asset = self::parentFields($item, $itemtype, $itemsId, $reloadAsset);
             $active = [];
             foreach (GlpiBConnection::loadAll() as $connection) {
                 if (!empty($connection['active'])) {
@@ -190,10 +230,10 @@ final class AssetChangeHook
     }
 
     /** @return array<string,mixed>|null */
-    private static function parentFields(object $item, string $itemtype, int $itemsId): ?array
+    private static function parentFields(object $item, string $itemtype, int $itemsId, bool $reload = false): ?array
     {
         $fields = is_array($item->fields ?? null) ? $item->fields : [];
-        if (self::itemtype($item) === $itemtype && array_key_exists('entities_id', $fields) && array_key_exists('is_deleted', $fields)) {
+        if (!$reload && self::itemtype($item) === $itemtype && array_key_exists('entities_id', $fields) && array_key_exists('is_deleted', $fields)) {
             return ['id' => $itemsId, 'entities_id' => $fields['entities_id'], 'is_deleted' => $fields['is_deleted']];
         }
         global $DB;

@@ -156,7 +156,7 @@ final class InternalGlpiExecutor
         $_SESSION['glpiname'] = (string) ($user->fields['name'] ?? 'assetsync-agent-b');
         $_SESSION['glpifriendlyname'] = (string) $user->getFriendlyName();
         try {
-            $operation();
+            return $operation();
         } finally {
             foreach ($saved as $key => $value) {
                 if ($value === null) {
